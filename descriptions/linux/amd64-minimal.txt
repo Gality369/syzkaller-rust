@@ -1,0 +1,76 @@
+# Minimal linux/amd64 target description for the first Rust rewrite stage.
+# Syntax is intentionally small and parser-friendly; later iterations can grow
+# this toward actual syzlang coverage.
+
+resource fd[4] = -1, 0, 1, 2, 3, 4
+resource sock[fd] = -1, 0, 1, 2, 3, 4
+
+const O_RDONLY = 0
+const O_WRONLY = 1
+const O_RDWR = 2
+const O_CREAT = 0o100
+const O_TRUNC = 0o1000
+const O_NONBLOCK = 0o4000
+const O_CLOEXEC = 0o2000000
+
+const AT_FDCWD = -100
+
+const PROT_READ = 1
+const PROT_WRITE = 2
+const MAP_PRIVATE = 0x02
+const MAP_ANONYMOUS = 0x20
+
+const AF_INET = 2
+const AF_INET6 = 10
+const AF_UNIX = 1
+const SOCK_STREAM = 1
+const SOCK_DGRAM = 2
+
+const TIOCGPTN = 0x5401
+const TIOCSPTLCK = 0x5402
+const TIOCGPTPEER = 0x5441
+const FIONREAD = 0x541B
+
+constset at_fdcwd[8] = AT_FDCWD
+flagset open_flags[4] = O_RDONLY, O_WRONLY, O_RDWR, O_CREAT|O_RDWR, O_CREAT|O_WRONLY|O_TRUNC
+constset open_modes[4] = 0o666, 0o777, 0o644
+constset rw_sizes[8] = 16, 64, 128, 256
+flagset pipe2_flags[4] = 0, O_CLOEXEC, O_NONBLOCK
+flagset dup3_flags[4] = 0, O_CLOEXEC
+constset socket_families[4] = AF_INET, AF_INET6, AF_UNIX
+constset socket_types[4] = SOCK_STREAM, SOCK_DGRAM
+constset zero_4[4] = 0
+constset eventfd_initvals[4] = 0, 1
+flagset eventfd_flags[4] = 0, O_CLOEXEC, O_NONBLOCK
+constset mmap_lengths[8] = 4096, 8192, 16384
+flagset mmap_prot[4] = PROT_READ, PROT_WRITE, PROT_READ|PROT_WRITE
+flagset mmap_flags[4] = MAP_PRIVATE|MAP_ANONYMOUS
+constset minus_one_4[4] = -1
+constset zero_8[8] = 0
+constset fixed_page_addr[8] = 0x000020000000
+constset page_len_8[8] = 4096
+constset mkdir_modes[4] = 0o777, 0o755
+flagset unlinkat_flags[4] = 0, 0x200
+constset stat_buf_size[8] = 128
+constset ioctl_requests[8] = TIOCGPTN, TIOCSPTLCK, TIOCGPTPEER, FIONREAD
+
+syscall openat@4304 -> fd(const[at_fdcwd], filename, flags[open_flags], const[open_modes])
+syscall close@248 -> int(fd)
+syscall read@5186 -> int(fd, ptr[out; buffer[1:256]], const[rw_sizes])
+syscall write@7616 -> int(fd, ptr[in; buffer[1:256]], const[rw_sizes])
+syscall pipe2@4854 -> int(ptr[out; array[fd; 2]], flags[pipe2_flags])
+syscall dup3@301 -> fd(fd, fd, flags[dup3_flags])
+syscall socket@7181(domain const[socket_families], type const[socket_types], proto int32) sock
+syscall socketpair@7261(domain const[socket_families], type const[socket_types], proto int32, fds ptr[out, array[sock, 2]]) int
+syscall listen@4062(fd sock, backlog int32)
+syscall eventfd2@322 -> fd(const[eventfd_initvals], flags[eventfd_flags])
+syscall mmap@4170 -> int(const[zero_8], const[mmap_lengths], flags[mmap_prot], flags[mmap_flags], const[minus_one_4], const[zero_8])
+syscall munmap@4287 -> int(const[fixed_page_addr], const[page_len_8])
+syscall mprotect@4243 -> int(const[fixed_page_addr], const[page_len_8], flags[mmap_prot])
+syscall mkdirat@4152 -> int(const[at_fdcwd], filename, const[mkdir_modes])
+syscall unlinkat@7588 -> int(const[at_fdcwd], filename, flags[unlinkat_flags])
+syscall fstat@484 -> int(fd, ptr[out; buffer[144:144]])
+syscall getcwd@509 -> int(ptr[out; buffer[128:128]], const[stat_buf_size])
+syscall getpid@543 -> int()
+syscall getuid@862 -> int()
+syscall ioctl@960 -> int(fd, const[ioctl_requests], const[zero_8])

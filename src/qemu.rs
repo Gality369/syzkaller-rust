@@ -31,37 +31,45 @@ impl QemuInstance {
 
         // Build QEMU args
         let mut args: Vec<String> = vec![
-            "-m".into(), cfg.vm.mem.to_string(),
-            "-smp".into(), cfg.vm.cpu.to_string(),
-            "-display".into(), "none".into(),
-            "-serial".into(), "stdio".into(),
+            "-m".into(),
+            cfg.vm.mem.to_string(),
+            "-smp".into(),
+            cfg.vm.cpu.to_string(),
+            "-display".into(),
+            "none".into(),
+            "-serial".into(),
+            "stdio".into(),
             "-no-reboot".into(),
-            "-name".into(), format!("syzkaller-rust-VM-{}", index),
+            "-name".into(),
+            format!("syzkaller-rust-VM-{}", index),
             // Enable KVM
             "-enable-kvm".into(),
             // Networking with SSH port forward
-            "-device".into(), "e1000,netdev=net0".into(),
-            "-netdev".into(), format!(
+            "-device".into(),
+            "e1000,netdev=net0".into(),
+            "-netdev".into(),
+            format!(
                 "user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:{}-:22",
                 ssh_port
             ),
         ];
 
         // Disk image
-        args.extend_from_slice(&[
-            "-snapshot".into(),
-            "-hda".into(), cfg.image.clone(),
-        ]);
+        args.extend_from_slice(&["-snapshot".into(), "-hda".into(), cfg.image.clone()]);
 
         // Kernel boot
         args.extend_from_slice(&[
-            "-kernel".into(), cfg.vm.kernel.clone(),
-            "-append".into(), cfg.vm.cmdline.clone(),
+            "-kernel".into(),
+            cfg.vm.kernel.clone(),
+            "-append".into(),
+            cfg.vm.cmdline.clone(),
         ]);
 
         // Extra QEMU args from config
         if !cfg.vm.qemu_args.is_empty() {
-            let extra: Vec<String> = cfg.vm.qemu_args
+            let extra: Vec<String> = cfg
+                .vm
+                .qemu_args
                 .split_whitespace()
                 .map(|s| s.to_string())
                 .collect();
@@ -117,7 +125,13 @@ impl QemuInstance {
 
     /// Copy a file into the VM.
     pub fn scp(&self, cfg: &Config, local_path: &str, remote_path: &str) -> io::Result<()> {
-        ssh::scp_to_vm(&cfg.sshkey, &cfg.ssh_user, self.ssh_port, local_path, remote_path)
+        ssh::scp_to_vm(
+            &cfg.sshkey,
+            &cfg.ssh_user,
+            self.ssh_port,
+            local_path,
+            remote_path,
+        )
     }
 
     /// Run a command via SSH with reverse port forwarding.

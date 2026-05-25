@@ -1,10 +1,18 @@
 #![allow(dead_code, unused_imports)]
 
+mod avoidance;
 mod config;
 mod corpus;
 mod crash;
+mod description;
 mod exec;
-#[allow(unused_imports, dead_code, clippy::all, non_snake_case, non_camel_case_types)]
+#[allow(
+    unused_imports,
+    dead_code,
+    clippy::all,
+    non_snake_case,
+    non_camel_case_types
+)]
 mod flatrpc_generated;
 mod fuzzer;
 mod manager;

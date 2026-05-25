@@ -1,0 +1,22 @@
+include <linux/socket.h>
+
+resource fd[4] = -1, 0, 1, 2, 3, 4
+resource sock[fd]
+resource sock_in[sock]
+type sock_port int16be[20000:20004]
+type ipv4_addr const[INADDR_LOOPBACK, int32be]
+
+socket$inet(domain const[AF_INET], type flags[socket_type], proto int32) sock_in (automatic_helper)
+bind$inet(fd sock_in, addr ptr[in, sockaddr_in], addrlen len[addr])
+connect$inet(fd sock_in, addr ptr[in, sockaddr_in], addrlen len[addr])
+accept$inet(fd sock_in, peer ptr[out, sockaddr_in, opt], peerlen ptr[inout, len[peer, int32]]) sock_in
+listen(fd sock_in, backlog int32)
+close(fd fd)
+
+socket_type = SOCK_STREAM, SOCK_DGRAM
+
+sockaddr_in {
+    family const[AF_INET, int16]
+    port sock_port
+    addr ipv4_addr
+} [size[16]]

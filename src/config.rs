@@ -11,6 +11,9 @@ pub struct Config {
     #[serde(default = "default_ssh_user")]
     pub ssh_user: String,
     pub executor: String,
+    /// Optional syscall description override. May point to a single file or a directory of fragments.
+    #[serde(default)]
+    pub syscall_descriptions: Option<String>,
     #[serde(default = "default_procs")]
     pub procs: i32,
     #[serde(default = "default_sandbox")]
@@ -25,6 +28,9 @@ pub struct Config {
     pub program_timeout_ms: i32,
     #[serde(default = "default_slowdown")]
     pub slowdown: i32,
+    /// Optional execution budget for bounded fuzzing or end-to-end smoke tests.
+    #[serde(default)]
+    pub max_execs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -44,16 +50,36 @@ pub struct VmConfig {
     pub cmdline: String,
 }
 
-fn default_ssh_user() -> String { "root".into() }
-fn default_procs() -> i32 { 1 }
-fn default_sandbox() -> String { "none".into() }
-fn default_count() -> usize { 1 }
-fn default_cpu() -> usize { 2 }
-fn default_mem() -> usize { 2048 }
-fn default_qemu() -> String { "qemu-system-x86_64".into() }
-fn default_syscall_timeout_ms() -> i32 { 500 }
-fn default_program_timeout_ms() -> i32 { 5000 }
-fn default_slowdown() -> i32 { 1 }
+fn default_ssh_user() -> String {
+    "root".into()
+}
+fn default_procs() -> i32 {
+    1
+}
+fn default_sandbox() -> String {
+    "none".into()
+}
+fn default_count() -> usize {
+    1
+}
+fn default_cpu() -> usize {
+    2
+}
+fn default_mem() -> usize {
+    2048
+}
+fn default_qemu() -> String {
+    "qemu-system-x86_64".into()
+}
+fn default_syscall_timeout_ms() -> i32 {
+    500
+}
+fn default_program_timeout_ms() -> i32 {
+    5000
+}
+fn default_slowdown() -> i32 {
+    1
+}
 fn default_cmdline() -> String {
     "console=ttyS0 root=/dev/sda earlyprintk=serial net.ifnames=0".into()
 }

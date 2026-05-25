@@ -1,0 +1,4 @@
+include "socket-subset.txt"
+
+sendto$inet(fd sock_in, buf buffer[in], len len[buf, int32], f const[0], addr ptr[in, sockaddr_in, opt], addrlen len[addr])
+recvfrom$inet(fd sock_in, buf buffer[out], len bytesize[buf, int32], f const[0], addr ptr[out, sockaddr_in, opt], addrlen len[addr]) (no_generate)

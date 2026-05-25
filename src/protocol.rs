@@ -44,8 +44,14 @@ pub fn send_connect_reply(
     files: &[&str],
 ) -> io::Result<()> {
     let mut builder = FlatBufferBuilder::with_capacity(1024);
-    let leak_offsets: Vec<_> = leak_frames.iter().map(|s| builder.create_string(s)).collect();
-    let race_offsets: Vec<_> = race_frames.iter().map(|s| builder.create_string(s)).collect();
+    let leak_offsets: Vec<_> = leak_frames
+        .iter()
+        .map(|s| builder.create_string(s))
+        .collect();
+    let race_offsets: Vec<_> = race_frames
+        .iter()
+        .map(|s| builder.create_string(s))
+        .collect();
     let file_offsets: Vec<_> = files.iter().map(|s| builder.create_string(s)).collect();
     let leak_vec = builder.create_vector(&leak_offsets);
     let race_vec = builder.create_vector(&race_offsets);
@@ -337,12 +343,14 @@ pub fn recv_executor_message(stream: &mut TcpStream) -> io::Result<ExecutorMsg> 
                         calls.push(CallInfoData {
                             flags: c.flags().bits(),
                             error: c.error(),
-                            signal: c.signal().map(|s| {
-                                (0..s.len()).map(|j| s.get(j)).collect()
-                            }).unwrap_or_default(),
-                            cover: c.cover().map(|s| {
-                                (0..s.len()).map(|j| s.get(j)).collect()
-                            }).unwrap_or_default(),
+                            signal: c
+                                .signal()
+                                .map(|s| (0..s.len()).map(|j| s.get(j)).collect())
+                                .unwrap_or_default(),
+                            cover: c
+                                .cover()
+                                .map(|s| (0..s.len()).map(|j| s.get(j)).collect())
+                                .unwrap_or_default(),
                         });
                     }
                 }
@@ -384,9 +392,9 @@ pub fn recv_executor_message(stream: &mut TcpStream) -> io::Result<ExecutorMsg> 
             }))
         }
         ExecutorMessagesRaw::State => {
-            let st = msg.msg_as_state().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "missing State data")
-            })?;
+            let st = msg
+                .msg_as_state()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing State data"))?;
             Ok(ExecutorMsg::State(
                 st.data().map(|d| d.to_vec()).unwrap_or_default(),
             ))

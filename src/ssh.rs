@@ -5,14 +5,22 @@ use std::time::{Duration, Instant};
 /// Common SSH options for syzkaller VM connections.
 fn ssh_base_args(key: &str, port: u16) -> Vec<String> {
     vec![
-        "-p".into(), port.to_string(),
-        "-F".into(), "/dev/null".into(),
-        "-o".into(), "UserKnownHostsFile=/dev/null".into(),
-        "-o".into(), "IdentitiesOnly=yes".into(),
-        "-o".into(), "BatchMode=yes".into(),
-        "-o".into(), "StrictHostKeyChecking=no".into(),
-        "-o".into(), "ConnectTimeout=10".into(),
-        "-i".into(), key.into(),
+        "-p".into(),
+        port.to_string(),
+        "-F".into(),
+        "/dev/null".into(),
+        "-o".into(),
+        "UserKnownHostsFile=/dev/null".into(),
+        "-o".into(),
+        "IdentitiesOnly=yes".into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=no".into(),
+        "-o".into(),
+        "ConnectTimeout=10".into(),
+        "-i".into(),
+        key.into(),
     ]
 }
 
@@ -28,9 +36,11 @@ pub fn wait_for_ssh(key: &str, user: &str, port: u16, timeout: Duration) -> io::
         }
         let mut args = ssh_base_args(key, port);
         args.extend_from_slice(&[
-            "-o".into(), "ConnectTimeout=5".into(),
+            "-o".into(),
+            "ConnectTimeout=5".into(),
             format!("{}@localhost", user),
-            "echo".into(), "ok".into(),
+            "echo".into(),
+            "ok".into(),
         ]);
         let status = Command::new("ssh")
             .args(&args)
@@ -50,22 +60,34 @@ pub fn wait_for_ssh(key: &str, user: &str, port: u16, timeout: Duration) -> io::
 }
 
 /// Copy a file to the VM via SCP.
-pub fn scp_to_vm(key: &str, user: &str, port: u16, local_path: &str, remote_path: &str) -> io::Result<()> {
+pub fn scp_to_vm(
+    key: &str,
+    user: &str,
+    port: u16,
+    local_path: &str,
+    remote_path: &str,
+) -> io::Result<()> {
     let args = vec![
-        "-P".into(), port.to_string(),
-        "-F".into(), "/dev/null".into(),
-        "-o".into(), "UserKnownHostsFile=/dev/null".into(),
-        "-o".into(), "IdentitiesOnly=yes".into(),
-        "-o".into(), "BatchMode=yes".into(),
-        "-o".into(), "StrictHostKeyChecking=no".into(),
-        "-o".into(), "ConnectTimeout=10".into(),
-        "-i".into(), key.into(),
+        "-P".into(),
+        port.to_string(),
+        "-F".into(),
+        "/dev/null".into(),
+        "-o".into(),
+        "UserKnownHostsFile=/dev/null".into(),
+        "-o".into(),
+        "IdentitiesOnly=yes".into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=no".into(),
+        "-o".into(),
+        "ConnectTimeout=10".into(),
+        "-i".into(),
+        key.into(),
         local_path.into(),
         format!("{}@localhost:{}", user, remote_path),
     ];
-    let output = Command::new("scp")
-        .args(&args)
-        .output()?;
+    let output = Command::new("scp").args(&args).output()?;
     if !output.status.success() {
         return Err(io::Error::new(
             io::ErrorKind::Other,
@@ -91,8 +113,9 @@ pub fn ssh_run_with_forward(
     args.push(format!("{}@localhost", user));
     args.push(command.into());
 
-    log::info!("SSH command: ssh {} {} {}", 
-        args[..args.len()-2].join(" "),
+    log::info!(
+        "SSH command: ssh {} {} {}",
+        args[..args.len() - 2].join(" "),
         format!("{}@localhost", user),
         command
     );
