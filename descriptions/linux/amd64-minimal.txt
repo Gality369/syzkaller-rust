@@ -42,31 +42,74 @@ constset socket_types[4] = SOCK_STREAM, SOCK_DGRAM
 constset zero_4[4] = 0
 constset eventfd_initvals[4] = 0, 1
 flagset eventfd_flags[4] = 0, O_CLOEXEC, O_NONBLOCK
-constset mmap_lengths[8] = 4096, 8192, 16384
 flagset mmap_prot[4] = PROT_READ, PROT_WRITE, PROT_READ|PROT_WRITE
 flagset mmap_flags[4] = MAP_PRIVATE|MAP_ANONYMOUS
 constset minus_one_4[4] = -1
 constset zero_8[8] = 0
-constset fixed_page_addr[8] = 0x000020000000
-constset page_len_8[8] = 4096
 constset mkdir_modes[4] = 0o777, 0o755
 flagset unlinkat_flags[4] = 0, 0x200
 constset stat_buf_size[8] = 128
 constset ioctl_requests[8] = TIOCGPTN, TIOCSPTLCK, TIOCGPTPEER, FIONREAD
 
+type iovec {
+    base ptr[in; array[int8; 4:8]]
+    len len[base, intptr]
+} [size[16]]
+
+type iovec_out {
+    base ptr[out; array[int8; 4:8]]
+    len len[base, intptr]
+} [size[16]]
+
+type cmsghdr_like {
+    cmsg_len bytesize[parent, intptr]
+    cmsg_level const[zero_4]
+    cmsg_type const[zero_4]
+    data array[int8; 0:16]
+} [varlen, align[8]]
+
+type send_msghdr {
+    msg_name ptr[in, buffer[16:16], opt]
+    msg_namelen len[msg_name, int32]
+    msg_iov ptr[in, array[iovec; 1:2]]
+    msg_iovlen len[msg_iov, intptr]
+    msg_control ptr[in, array[cmsghdr_like; 1:2], opt]
+    msg_controllen bytesize[msg_control, intptr]
+    msg_flags const[zero_4]
+} [size[56]]
+
+type send_mmsghdr {
+    msg_hdr send_msghdr
+    msg_len const[zero_4]
+} [size[64]]
+
+type recv_msghdr {
+    msg_name ptr[out, buffer[16:16], opt]
+    msg_namelen len[msg_name, int32]
+    msg_iov ptr[in, array[iovec_out; 1:2]]
+    msg_iovlen len[msg_iov, intptr]
+    msg_control ptr[out, array[int8; 0:32], opt]
+    msg_controllen bytesize[msg_control, intptr]
+    msg_flags const[zero_4]
+} [size[56]]
+
 syscall openat@4304 -> fd(const[at_fdcwd], filename, flags[open_flags], const[open_modes])
 syscall close@248 -> int(fd)
 syscall read@5186 -> int(fd, ptr[out; buffer[1:256]], const[rw_sizes])
 syscall write@7616 -> int(fd, ptr[in; buffer[1:256]], const[rw_sizes])
+syscall writev@8027 -> int(fd fd, iov ptr[in; array[iovec; 1:2]], iovcnt len[iov, intptr])
+syscall sendmsg@5682 -> int(fd fd, msg ptr[in, send_msghdr], const[zero_4])
+syscall sendmmsg@5673 -> int(fd fd, msgvec ptr[in, array[send_mmsghdr; 1:2]], vlen len[msgvec, int32], const[zero_4])
+syscall recvmsg@5530 -> int(fd fd, msg ptr[inout, recv_msghdr], const[zero_4])
 syscall pipe2@4854 -> int(ptr[out; array[fd; 2]], flags[pipe2_flags])
 syscall dup3@301 -> fd(fd, fd, flags[dup3_flags])
 syscall socket@7181(domain const[socket_families], type const[socket_types], proto int32) sock
 syscall socketpair@7261(domain const[socket_families], type const[socket_types], proto int32, fds ptr[out, array[sock, 2]]) int
 syscall listen@4062(fd sock, backlog int32)
 syscall eventfd2@322 -> fd(const[eventfd_initvals], flags[eventfd_flags])
-syscall mmap@4170 -> int(const[zero_8], const[mmap_lengths], flags[mmap_prot], flags[mmap_flags], const[minus_one_4], const[zero_8])
-syscall munmap@4287 -> int(const[fixed_page_addr], const[page_len_8])
-syscall mprotect@4243 -> int(const[fixed_page_addr], const[page_len_8], flags[mmap_prot])
+syscall mmap@4170 -> int(addr vma[1:4], len len[addr], flags[mmap_prot], flags[mmap_flags], const[minus_one_4], const[zero_8])
+syscall munmap@4287 -> int(addr vma[1:4], len len[addr])
+syscall mprotect@4243 -> int(addr vma[1:4], len len[addr], flags[mmap_prot])
 syscall mkdirat@4152 -> int(const[at_fdcwd], filename, const[mkdir_modes])
 syscall unlinkat@7588 -> int(const[at_fdcwd], filename, flags[unlinkat_flags])
 syscall fstat@484 -> int(fd, ptr[out; buffer[144:144]])

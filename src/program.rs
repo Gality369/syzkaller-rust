@@ -19,19 +19,50 @@ pub enum ArgType {
     },
     /// Resource handle passed between calls.
     Resource(ResourceDesc),
-    /// Fixed-length array of a supported inner type.
-    Array { inner: Box<ArgType>, len: usize },
+    /// Array of a supported inner type, optionally ranged.
+    Array {
+        inner: Box<ArgType>,
+        min_len: usize,
+        max_len: usize,
+    },
     /// Pointer to another argument type.
     Ptr {
         inner: Box<ArgType>,
         dir: PtrDir,
         optional: bool,
     },
+    /// Zero-sized placeholder field used in some struct layouts.
+    Void,
     /// Fixed-size struct layout serialized into bytes.
-    Struct { fields: Vec<ArgType>, size: usize },
+    Struct {
+        type_name: Option<String>,
+        fields: Vec<ArgType>,
+        field_names: Vec<String>,
+        size: usize,
+        varlen: bool,
+        packed: bool,
+        align: Option<usize>,
+    },
+    /// Union layout serialized into bytes. Fixed unions use `size`, varlen unions
+    /// materialize one field-sized payload without padding.
+    Union {
+        type_name: Option<String>,
+        fields: Vec<ArgType>,
+        field_names: Vec<String>,
+        size: usize,
+        varlen: bool,
+        packed: bool,
+        align: Option<usize>,
+    },
+    /// Virtual memory area address with an associated mapped length.
+    Vma {
+        min_pages: usize,
+        max_pages: usize,
+        optional: bool,
+    },
     /// Length of another argument's materialized data.
     Len {
-        target: usize,
+        target: LengthTarget,
         size: usize,
         kind: LengthKind,
     },
@@ -40,6 +71,13 @@ pub enum ArgType {
         min_size: usize,
         max_size: usize,
         dir: BufferDir,
+    },
+    /// String-like data, optionally fixed-size and/or non-NUL-terminated.
+    String {
+        values: Vec<Vec<u8>>,
+        noz: bool,
+        fixed_len: Option<usize>,
+        filename: bool,
     },
     /// Filename string.
     Filename,
@@ -70,6 +108,21 @@ pub enum BufferDir {
 pub enum LengthKind {
     Auto,
     Bytes,
+    Offset,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LengthTarget {
+    pub root: LengthTargetRoot,
+    pub fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LengthTargetRoot {
+    Arg(String),
+    Current,
+    Parent(usize),
+    Type(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -84,6 +137,7 @@ pub struct SyscallAttrs {
 pub struct SyscallDesc {
     pub name: String,
     pub id: u64, // syzkaller internal ID (index into executor's syscalls[] table for linux/amd64)
+    pub arg_names: Vec<String>,
     pub args: Vec<ArgType>,
     pub ret: ReturnType,
     pub attrs: SyscallAttrs,
@@ -124,6 +178,12 @@ pub struct ResultRef {
     pub result_idx: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InlinePointerValue {
+    pub offset: usize,
+    pub value: Box<ArgValue>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceSource {
     ReturnValue,
@@ -146,7 +206,20 @@ pub enum ArgValue {
     Const(u64),
     ResultRef(ResultRef),
     Buffer(Vec<u8>),
+    Composite {
+        data: Vec<u8>,
+        pointers: Vec<InlinePointerValue>,
+    },
+    Array {
+        data: Vec<u8>,
+        pointers: Vec<InlinePointerValue>,
+        element_sizes: Vec<usize>,
+    },
     Filename(String),
+    Vma {
+        addr: u64,
+        size: u64,
+    },
     OutPtr,
     Null,
 }
@@ -186,7 +259,7 @@ pub struct ValidationError {
 }
 
 impl ValidationError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -215,6 +288,10 @@ impl Program {
 pub const DATA_OFFSET: u64 = 0x0000_2000_0000;
 /// Page size for argument allocation.
 pub const PAGE_SIZE: u64 = 4096;
+/// Number of available pages in the executor data mapping, matching syzkaller's default 16MB arena.
+pub const VMA_NUM_PAGES: u64 = (16 << 20) / PAGE_SIZE;
+pub const VMA_MAX_BYTES: u64 = VMA_NUM_PAGES * PAGE_SIZE;
+pub const VMA_RESERVED_START_PAGE: u64 = 256;
 
 const TIMEOUT_EDGE_PRIORITY_PENALTY: u32 = 8;
 const TIMEOUT_SYSCALL_PRIORITY_PENALTY: u32 = 4;
@@ -292,9 +369,13 @@ pub fn resource_consuming_syscalls(descs: &[SyscallDesc]) -> Vec<usize> {
 
 pub fn arg_type_is_timeout_prone(arg_type: &ArgType) -> bool {
     match arg_type {
-        ArgType::Ptr { .. } | ArgType::Buffer { .. } | ArgType::Filename => true,
+        ArgType::Ptr { .. }
+        | ArgType::Buffer { .. }
+        | ArgType::String { .. }
+        | ArgType::Filename => true,
         ArgType::Array { inner, .. } => arg_type_is_timeout_prone(inner),
         ArgType::Struct { fields, .. } => fields.iter().any(arg_type_is_timeout_prone),
+        ArgType::Union { fields, .. } => fields.iter().any(arg_type_is_timeout_prone),
         _ => false,
     }
 }
@@ -320,9 +401,21 @@ pub fn arg_type_fixed_size(arg_type: &ArgType) -> Option<usize> {
     match arg_type {
         ArgType::Const { size, .. } => Some(*size),
         ArgType::Resource(resource) => Some(resource.size),
-        ArgType::Array { inner, len } => arg_type_fixed_size(inner)?.checked_mul(*len),
-        ArgType::Struct { size, .. } => Some(*size),
+        ArgType::Array {
+            inner,
+            min_len,
+            max_len,
+        } if min_len == max_len => arg_type_fixed_size(inner)?.checked_mul(*min_len),
+        ArgType::Ptr { .. } => Some(8),
+        ArgType::Void => Some(0),
+        ArgType::Struct { size, varlen, .. } if !*varlen => Some(*size),
+        ArgType::Union { size, varlen, .. } if !*varlen => Some(*size),
+        ArgType::Vma { .. } => Some(8),
         ArgType::Len { size, .. } => Some(*size),
+        ArgType::String {
+            fixed_len: Some(fixed_len),
+            ..
+        } => Some(*fixed_len),
         ArgType::Buffer {
             min_size, max_size, ..
         } if min_size == max_size => Some(*max_size),
@@ -330,12 +423,111 @@ pub fn arg_type_fixed_size(arg_type: &ArgType) -> Option<usize> {
     }
 }
 
+pub fn arg_type_alignment(arg_type: &ArgType) -> Option<usize> {
+    match arg_type {
+        ArgType::Const { size, .. } => Some(*size),
+        ArgType::Resource(resource) => Some(resource.size),
+        ArgType::Array { inner, .. } => arg_type_alignment(inner),
+        ArgType::Ptr { .. } => Some(8),
+        ArgType::Void => Some(1),
+        ArgType::Struct {
+            fields,
+            packed,
+            align,
+            ..
+        } => struct_type_alignment(fields, *packed, *align).ok(),
+        ArgType::Union {
+            fields,
+            packed,
+            align,
+            ..
+        } => union_type_alignment(fields, *packed, *align).ok(),
+        ArgType::Vma { .. } => Some(8),
+        ArgType::Len { size, .. } => Some(*size),
+        ArgType::Buffer { .. } | ArgType::String { .. } | ArgType::Filename => Some(1),
+    }
+}
+
+fn align_up(value: usize, align: usize) -> Option<usize> {
+    if align <= 1 {
+        return Some(value);
+    }
+    if !align.is_power_of_two() {
+        return None;
+    }
+    let rounded = value.checked_add(align - 1)?;
+    Some(rounded & !(align - 1))
+}
+
+pub(crate) fn struct_type_alignment(
+    fields: &[ArgType],
+    packed: bool,
+    align: Option<usize>,
+) -> Result<usize, String> {
+    if let Some(align) = align {
+        return validate_alignment_value(align).map(|_| align);
+    }
+    if packed {
+        return Ok(1);
+    }
+    let mut struct_align = 1usize;
+    for field in fields {
+        let field_align = arg_type_alignment(field)
+            .ok_or_else(|| "struct fields must have a known alignment".to_string())?;
+        struct_align = struct_align.max(field_align);
+    }
+    Ok(struct_align)
+}
+
+pub(crate) fn union_type_alignment(
+    fields: &[ArgType],
+    packed: bool,
+    align: Option<usize>,
+) -> Result<usize, String> {
+    if let Some(align) = align {
+        return validate_alignment_value(align).map(|_| align);
+    }
+    if packed {
+        return Ok(1);
+    }
+    let mut union_align = 1usize;
+    for field in fields {
+        let field_align = arg_type_alignment(field)
+            .ok_or_else(|| "union fields must have a known alignment".to_string())?;
+        union_align = union_align.max(field_align);
+    }
+    Ok(union_align)
+}
+
+fn validate_alignment_value(align: usize) -> Result<(), String> {
+    if align == 0 || !align.is_power_of_two() {
+        Err(format!(
+            "alignment {} is invalid (must be a non-zero power of two)",
+            align
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 pub fn materialized_arg_size(arg_type: &ArgType, arg_value: &ArgValue) -> Option<usize> {
     match (arg_type, arg_value) {
         (ArgType::Ptr { inner: _, .. }, ArgValue::Buffer(data)) => Some(data.len()),
+        (ArgType::Ptr { inner: _, .. }, ArgValue::Composite { data, .. }) => Some(data.len()),
+        (ArgType::Ptr { inner: _, .. }, ArgValue::Array { data, .. }) => Some(data.len()),
         (ArgType::Ptr { inner, .. }, ArgValue::OutPtr) => arg_type_fixed_size(inner),
         (ArgType::Ptr { .. }, ArgValue::Null) => Some(0),
+        (ArgType::Vma { .. }, ArgValue::Vma { size, .. }) => usize::try_from(*size).ok(),
+        (ArgType::Vma { .. }, ArgValue::Null) => Some(0),
+        (ArgType::String { .. }, ArgValue::Buffer(data)) => Some(data.len()),
+        (ArgType::String { .. }, ArgValue::Composite { data, .. }) => Some(data.len()),
+        (ArgType::String { .. }, ArgValue::Array { data, .. }) => Some(data.len()),
         (ArgType::Buffer { .. }, ArgValue::Buffer(data)) => Some(data.len()),
+        (ArgType::Buffer { .. }, ArgValue::Composite { data, .. }) => Some(data.len()),
+        (ArgType::Buffer { .. }, ArgValue::Array { data, .. }) => Some(data.len()),
+        (ArgType::Array { .. }, ArgValue::Array { data, .. }) => Some(data.len()),
+        (ArgType::Array { .. }, ArgValue::Buffer(data)) => Some(data.len()),
+        (ArgType::Array { .. }, ArgValue::Composite { data, .. }) => Some(data.len()),
         (ArgType::Filename, ArgValue::Filename(name)) => Some(name.len() + 1),
         (arg_type, _) => arg_type_fixed_size(arg_type),
     }
@@ -348,22 +540,564 @@ pub fn derived_arg_length(
 ) -> Option<usize> {
     match kind {
         LengthKind::Bytes => materialized_arg_size(arg_type, arg_value),
+        LengthKind::Offset => None,
         LengthKind::Auto => match (arg_type, arg_value) {
-            (ArgType::Array { len, .. }, _) => Some(*len),
+            (ArgType::Array { .. }, ArgValue::Array { element_sizes, .. }) => {
+                Some(element_sizes.len())
+            }
+            (
+                ArgType::Array {
+                    min_len, max_len, ..
+                },
+                _,
+            ) if min_len == max_len => Some(*min_len),
             (ArgType::Ptr { inner, .. }, ArgValue::Buffer(data)) => match inner.as_ref() {
-                ArgType::Array { inner: _, len } => Some(*len),
+                ArgType::Array { inner, .. } => derive_array_len_from_bytes(inner, data),
+                _ => Some(data.len()),
+            },
+            (ArgType::Ptr { inner, .. }, ArgValue::Composite { data, .. }) => {
+                match inner.as_ref() {
+                    ArgType::Array { inner, .. } => derive_array_len_from_bytes(inner, data),
+                    _ => Some(data.len()),
+                }
+            }
+            (
+                ArgType::Ptr { inner, .. },
+                ArgValue::Array {
+                    data,
+                    element_sizes,
+                    ..
+                },
+            ) => match inner.as_ref() {
+                ArgType::Array { .. } => Some(element_sizes.len()),
                 _ => Some(data.len()),
             },
             (ArgType::Ptr { inner, .. }, ArgValue::OutPtr) => match inner.as_ref() {
-                ArgType::Array { inner: _, len } => Some(*len),
+                ArgType::Array {
+                    min_len, max_len, ..
+                } if min_len == max_len => Some(*min_len),
                 _ => arg_type_fixed_size(inner),
             },
             (ArgType::Ptr { .. }, ArgValue::Null) => Some(0),
+            (ArgType::Vma { .. }, ArgValue::Vma { size, .. }) => usize::try_from(*size).ok(),
+            (ArgType::Vma { .. }, ArgValue::Null) => Some(0),
+            (ArgType::String { .. }, ArgValue::Buffer(data)) => Some(data.len()),
+            (ArgType::String { .. }, ArgValue::Composite { data, .. }) => Some(data.len()),
+            (ArgType::String { .. }, ArgValue::Array { data, .. }) => Some(data.len()),
             (ArgType::Buffer { .. }, ArgValue::Buffer(data)) => Some(data.len()),
+            (ArgType::Buffer { .. }, ArgValue::Composite { data, .. }) => Some(data.len()),
+            (ArgType::Buffer { .. }, ArgValue::Array { data, .. }) => Some(data.len()),
             (ArgType::Filename, ArgValue::Filename(name)) => Some(name.len() + 1),
             (arg_type, _) => arg_type_fixed_size(arg_type),
         },
     }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct LengthTargetFrame<'a> {
+    pub type_name: Option<&'a str>,
+    pub fields: &'a [ArgType],
+    pub field_names: &'a [String],
+    pub size: usize,
+    pub is_union: bool,
+    pub varlen: bool,
+    pub packed: bool,
+    pub data: Option<&'a [u8]>,
+    pub pointers: Option<&'a [InlinePointerValue]>,
+    pub base_offset: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ResolvedLengthValue<'a> {
+    arg_type: &'a ArgType,
+    arg_value: Option<&'a ArgValue>,
+    data: Option<&'a [u8]>,
+    null_pointer: bool,
+}
+
+pub(crate) fn derive_target_length(
+    desc: &SyscallDesc,
+    args: &[ArgValue],
+    target: &LengthTarget,
+    kind: LengthKind,
+) -> Option<usize> {
+    if kind == LengthKind::Offset {
+        return derive_target_offset(desc, target);
+    }
+    let resolved = resolve_target_from_args(desc, args, target)?;
+    derive_resolved_length(resolved, kind)
+}
+
+pub(crate) fn derive_inline_target_length(
+    desc: Option<&SyscallDesc>,
+    args: Option<&[ArgValue]>,
+    frames: &[LengthTargetFrame<'_>],
+    target: &LengthTarget,
+    kind: LengthKind,
+) -> Option<usize> {
+    if kind == LengthKind::Offset {
+        return derive_inline_target_offset(desc, frames, target);
+    }
+    if target.fields.is_empty() {
+        if let Some(frame) = resolve_frame_root(frames, &target.root) {
+            return derive_frame_length(frame, kind);
+        }
+    }
+    let resolved = resolve_inline_target(desc, args, frames, target)?;
+    derive_resolved_length(resolved, kind)
+}
+
+fn derive_target_offset(desc: &SyscallDesc, target: &LengthTarget) -> Option<usize> {
+    match &target.root {
+        LengthTargetRoot::Arg(name) => {
+            let arg_idx = desc_arg_index(desc, name)?;
+            compute_path_offset(desc.args.get(arg_idx)?, &target.fields)
+        }
+        LengthTargetRoot::Current | LengthTargetRoot::Parent(_) | LengthTargetRoot::Type(_) => None,
+    }
+}
+
+fn derive_inline_target_offset(
+    desc: Option<&SyscallDesc>,
+    frames: &[LengthTargetFrame<'_>],
+    target: &LengthTarget,
+) -> Option<usize> {
+    match &target.root {
+        LengthTargetRoot::Arg(name) => {
+            let desc = desc?;
+            let arg_idx = desc_arg_index(desc, name)?;
+            compute_path_offset(desc.args.get(arg_idx)?, &target.fields)
+        }
+        LengthTargetRoot::Current | LengthTargetRoot::Parent(_) | LengthTargetRoot::Type(_) => {
+            let frame = resolve_frame_root(frames, &target.root)?;
+            compute_path_offset_in_container(
+                frame.fields,
+                frame.field_names,
+                frame.is_union,
+                frame.varlen,
+                frame.packed,
+                &target.fields,
+            )
+        }
+    }
+}
+
+fn resolve_target_from_args<'a>(
+    desc: &'a SyscallDesc,
+    args: &'a [ArgValue],
+    target: &LengthTarget,
+) -> Option<ResolvedLengthValue<'a>> {
+    let LengthTargetRoot::Arg(name) = &target.root else {
+        return None;
+    };
+    let arg_idx = desc_arg_index(desc, name)?;
+    let arg_type = desc.args.get(arg_idx)?;
+    let arg_value = args.get(arg_idx)?;
+    if target.fields.is_empty() {
+        return Some(ResolvedLengthValue {
+            arg_type,
+            arg_value: Some(arg_value),
+            data: arg_value_bytes(arg_value),
+            null_pointer: false,
+        });
+    }
+    let (root_type, root_data, root_pointers) = match (arg_type, arg_value) {
+        (ArgType::Ptr { inner, .. }, ArgValue::Buffer(data)) => {
+            (inner.as_ref(), Some(data.as_slice()), None)
+        }
+        (ArgType::Ptr { inner, .. }, ArgValue::Composite { data, pointers }) => (
+            inner.as_ref(),
+            Some(data.as_slice()),
+            Some(pointers.as_slice()),
+        ),
+        (ArgType::Ptr { inner, .. }, ArgValue::Array { data, pointers, .. }) => (
+            inner.as_ref(),
+            Some(data.as_slice()),
+            Some(pointers.as_slice()),
+        ),
+        (ArgType::Ptr { inner, .. }, ArgValue::OutPtr) => (inner.as_ref(), None, None),
+        (ArgType::Ptr { .. }, ArgValue::Null) => return None,
+        _ => (
+            arg_type,
+            arg_value_bytes(arg_value),
+            arg_value_pointers(arg_value),
+        ),
+    };
+    resolve_path_value(root_type, root_data, root_pointers, 0, &target.fields)
+}
+
+fn resolve_inline_target<'a>(
+    desc: Option<&'a SyscallDesc>,
+    args: Option<&'a [ArgValue]>,
+    frames: &[LengthTargetFrame<'a>],
+    target: &LengthTarget,
+) -> Option<ResolvedLengthValue<'a>> {
+    match &target.root {
+        LengthTargetRoot::Arg(_) => resolve_target_from_args(desc?, args?, target),
+        LengthTargetRoot::Current | LengthTargetRoot::Parent(_) | LengthTargetRoot::Type(_) => {
+            let frame = resolve_frame_root(frames, &target.root)?;
+            resolve_path_in_container(
+                frame.fields,
+                frame.field_names,
+                frame.is_union,
+                frame.varlen,
+                frame.packed,
+                frame.data,
+                frame.pointers,
+                frame.base_offset,
+                &target.fields,
+            )
+        }
+    }
+}
+
+fn resolve_frame_root<'a>(
+    frames: &[LengthTargetFrame<'a>],
+    root: &LengthTargetRoot,
+) -> Option<LengthTargetFrame<'a>> {
+    match root {
+        LengthTargetRoot::Current => frames.last().copied(),
+        LengthTargetRoot::Parent(hops) => {
+            if *hops == 0 || *hops > frames.len() {
+                None
+            } else {
+                frames.get(frames.len() - *hops).copied()
+            }
+        }
+        LengthTargetRoot::Type(type_name) => frames
+            .iter()
+            .rev()
+            .copied()
+            .find(|frame| frame.type_name == Some(type_name.as_str())),
+        LengthTargetRoot::Arg(_) => None,
+    }
+}
+
+fn resolve_path_in_container<'a>(
+    fields: &'a [ArgType],
+    field_names: &'a [String],
+    is_union: bool,
+    varlen: bool,
+    packed: bool,
+    data: Option<&'a [u8]>,
+    pointers: Option<&'a [InlinePointerValue]>,
+    base_offset: usize,
+    path: &[String],
+) -> Option<ResolvedLengthValue<'a>> {
+    let field_idx = find_field_index(field_names, &path[0])?;
+    let field = fields.get(field_idx)?;
+    let field_offset = if is_union {
+        0
+    } else {
+        compute_struct_field_offset(fields, field_idx, varlen, packed)?
+    };
+    let field_data = if is_union {
+        slice_union_field_data(field, data)?
+    } else {
+        slice_struct_field_data(fields, field_idx, varlen, packed, data)?
+    };
+    resolve_path_value(
+        field,
+        field_data,
+        pointers,
+        base_offset + field_offset,
+        &path[1..],
+    )
+}
+
+fn resolve_path_value<'a>(
+    arg_type: &'a ArgType,
+    data: Option<&'a [u8]>,
+    pointers: Option<&'a [InlinePointerValue]>,
+    base_offset: usize,
+    path: &[String],
+) -> Option<ResolvedLengthValue<'a>> {
+    if let ArgType::Ptr { inner, .. } = arg_type {
+        let pointer_value = inline_pointer_value_at_offset(pointers, base_offset);
+        if path.is_empty() {
+            let null_pointer = match pointer_value {
+                Some(ArgValue::Null) => true,
+                Some(_) => false,
+                None => {
+                    data.is_some_and(|bytes| bytes.len() == 8 && decode_scalar_bytes(bytes) == 0)
+                }
+            };
+            return Some(ResolvedLengthValue {
+                arg_type,
+                arg_value: pointer_value,
+                data: pointer_value.and_then(arg_value_bytes),
+                null_pointer,
+            });
+        }
+        let pointer_value = pointer_value?;
+        return match pointer_value {
+            ArgValue::Buffer(data) => {
+                resolve_path_value(inner, Some(data.as_slice()), None, 0, path)
+            }
+            ArgValue::Composite { data, pointers } => resolve_path_value(
+                inner,
+                Some(data.as_slice()),
+                Some(pointers.as_slice()),
+                0,
+                path,
+            ),
+            ArgValue::Array { data, pointers, .. } => resolve_path_value(
+                inner,
+                Some(data.as_slice()),
+                Some(pointers.as_slice()),
+                0,
+                path,
+            ),
+            _ => None,
+        };
+    }
+    if path.is_empty() {
+        return Some(ResolvedLengthValue {
+            arg_type,
+            arg_value: None,
+            data,
+            null_pointer: false,
+        });
+    }
+    match arg_type {
+        ArgType::Struct {
+            fields,
+            field_names,
+            varlen,
+            packed,
+            ..
+        } => {
+            let field_idx = find_field_index(field_names, &path[0])?;
+            let field = fields.get(field_idx)?;
+            let field_data = slice_struct_field_data(fields, field_idx, *varlen, *packed, data)?;
+            let field_offset = compute_struct_field_offset(fields, field_idx, *varlen, *packed)?;
+            resolve_path_value(
+                field,
+                field_data,
+                pointers,
+                base_offset + field_offset,
+                &path[1..],
+            )
+        }
+        ArgType::Union {
+            fields,
+            field_names,
+            ..
+        } => {
+            let field_idx = find_field_index(field_names, &path[0])?;
+            let field = fields.get(field_idx)?;
+            let field_data = slice_union_field_data(field, data)?;
+            resolve_path_value(field, field_data, pointers, base_offset, &path[1..])
+        }
+        _ => None,
+    }
+}
+
+fn inline_pointer_value_at_offset<'a>(
+    pointers: Option<&'a [InlinePointerValue]>,
+    offset: usize,
+) -> Option<&'a ArgValue> {
+    pointers?
+        .iter()
+        .find(|pointer| pointer.offset == offset)
+        .map(|pointer| pointer.value.as_ref())
+}
+
+fn compute_path_offset(arg_type: &ArgType, path: &[String]) -> Option<usize> {
+    if path.is_empty() {
+        return Some(0);
+    }
+    match arg_type {
+        ArgType::Ptr { inner, .. } => compute_path_offset(inner, path),
+        ArgType::Struct {
+            fields,
+            field_names,
+            varlen,
+            packed,
+            ..
+        } => {
+            let field_idx = find_field_index(field_names, &path[0])?;
+            Some(
+                compute_struct_field_offset(fields, field_idx, *varlen, *packed)?
+                    + compute_path_offset(fields.get(field_idx)?, &path[1..])?,
+            )
+        }
+        ArgType::Union {
+            fields,
+            field_names,
+            ..
+        } => {
+            let field_idx = find_field_index(field_names, &path[0])?;
+            compute_path_offset(fields.get(field_idx)?, &path[1..])
+        }
+        _ => None,
+    }
+}
+
+fn compute_path_offset_in_container(
+    fields: &[ArgType],
+    field_names: &[String],
+    is_union: bool,
+    varlen: bool,
+    packed: bool,
+    path: &[String],
+) -> Option<usize> {
+    let field_idx = find_field_index(field_names, &path[0])?;
+    let field_offset = if is_union {
+        0
+    } else {
+        compute_struct_field_offset(fields, field_idx, varlen, packed)?
+    };
+    Some(field_offset + compute_path_offset(fields.get(field_idx)?, &path[1..])?)
+}
+
+fn derive_resolved_length(resolved: ResolvedLengthValue<'_>, kind: LengthKind) -> Option<usize> {
+    if resolved.null_pointer {
+        return Some(0);
+    }
+    if let Some(arg_value) = resolved.arg_value {
+        return derived_arg_length(resolved.arg_type, arg_value, kind);
+    }
+    if let Some(data) = resolved.data {
+        return derive_inline_length(resolved.arg_type, data, kind);
+    }
+    derive_static_length(resolved.arg_type, kind)
+}
+
+fn derive_frame_length(frame: LengthTargetFrame<'_>, kind: LengthKind) -> Option<usize> {
+    match kind {
+        LengthKind::Bytes => frame.data.map(|data| data.len()).or(Some(frame.size)),
+        LengthKind::Offset => None,
+        LengthKind::Auto => Some(frame.size),
+    }
+}
+
+fn derive_inline_length(arg_type: &ArgType, data: &[u8], kind: LengthKind) -> Option<usize> {
+    match kind {
+        LengthKind::Bytes => Some(data.len()),
+        LengthKind::Offset => None,
+        LengthKind::Auto => match arg_type {
+            ArgType::Array { inner, .. } => derive_array_len_from_bytes(inner, data),
+            _ => Some(data.len()),
+        },
+    }
+}
+
+fn derive_static_length(arg_type: &ArgType, kind: LengthKind) -> Option<usize> {
+    match kind {
+        LengthKind::Bytes => arg_type_fixed_size(arg_type),
+        LengthKind::Offset => None,
+        LengthKind::Auto => match arg_type {
+            ArgType::Array {
+                min_len, max_len, ..
+            } if min_len == max_len => Some(*min_len),
+            _ => arg_type_fixed_size(arg_type),
+        },
+    }
+}
+
+fn derive_array_len_from_bytes(inner: &ArgType, data: &[u8]) -> Option<usize> {
+    let elem_size = arg_type_fixed_size(inner)?;
+    if elem_size == 0 {
+        return Some(0);
+    }
+    if data.len() % elem_size != 0 {
+        return None;
+    }
+    Some(data.len() / elem_size)
+}
+
+fn desc_arg_index(desc: &SyscallDesc, name: &str) -> Option<usize> {
+    desc.arg_names.iter().position(|arg_name| arg_name == name)
+}
+
+fn arg_value_bytes(arg_value: &ArgValue) -> Option<&[u8]> {
+    match arg_value {
+        ArgValue::Buffer(data) => Some(data.as_slice()),
+        ArgValue::Composite { data, .. } => Some(data.as_slice()),
+        ArgValue::Array { data, .. } => Some(data.as_slice()),
+        _ => None,
+    }
+}
+
+fn arg_value_pointers(arg_value: &ArgValue) -> Option<&[InlinePointerValue]> {
+    match arg_value {
+        ArgValue::Composite { pointers, .. } => Some(pointers.as_slice()),
+        ArgValue::Array { pointers, .. } => Some(pointers.as_slice()),
+        _ => None,
+    }
+}
+
+fn arg_type_type_name(arg_type: &ArgType) -> Option<&str> {
+    match arg_type {
+        ArgType::Struct { type_name, .. } | ArgType::Union { type_name, .. } => {
+            type_name.as_deref()
+        }
+        _ => None,
+    }
+}
+
+fn find_field_index(field_names: &[String], name: &str) -> Option<usize> {
+    field_names.iter().position(|field_name| field_name == name)
+}
+
+fn slice_struct_field_data<'a>(
+    fields: &[ArgType],
+    field_idx: usize,
+    varlen: bool,
+    packed: bool,
+    data: Option<&'a [u8]>,
+) -> Option<Option<&'a [u8]>> {
+    let data = match data {
+        Some(data) => data,
+        None => return Some(None),
+    };
+    let field = fields.get(field_idx)?;
+    let start = compute_struct_field_offset(fields, field_idx, varlen, packed)?;
+    let field_size = match arg_type_fixed_size(field) {
+        Some(field_size) => field_size,
+        None if varlen && field_idx + 1 == fields.len() => data.len().checked_sub(start)?,
+        None => return None,
+    };
+    let end = start.checked_add(field_size)?;
+    Some(Some(data.get(start..end)?))
+}
+
+pub(crate) fn compute_struct_field_offset(
+    fields: &[ArgType],
+    field_idx: usize,
+    varlen: bool,
+    packed: bool,
+) -> Option<usize> {
+    let mut offset = 0usize;
+    for (idx, field) in fields.iter().enumerate() {
+        let field_align = if packed {
+            1
+        } else {
+            arg_type_alignment(field)?
+        };
+        offset = align_up(offset, field_align)?;
+        if idx == field_idx {
+            return Some(offset);
+        }
+        match arg_type_fixed_size(field) {
+            Some(field_size) => {
+                offset = offset.checked_add(field_size)?;
+            }
+            None if varlen && idx + 1 == fields.len() => return None,
+            None => return None,
+        }
+    }
+    None
+}
+
+fn slice_union_field_data<'a>(field: &ArgType, data: Option<&'a [u8]>) -> Option<Option<&'a [u8]>> {
+    let data = match data {
+        Some(data) => data,
+        None => return Some(None),
+    };
+    let field_size = arg_type_fixed_size(field)?;
+    Some(Some(data.get(..field_size)?))
 }
 
 pub fn encode_scalar_bytes(size: usize, value: u64) -> Vec<u8> {
@@ -1017,11 +1751,15 @@ fn collect_pointer_resource_outputs_inner(
             });
             *next_element_idx += 1;
         }
-        ArgType::Array { inner, len } => {
+        ArgType::Array {
+            inner,
+            min_len,
+            max_len,
+        } if min_len == max_len => {
             let Some(element_size) = arg_type_fixed_size(inner) else {
                 return;
             };
-            for element_idx in 0..*len {
+            for element_idx in 0..*min_len {
                 collect_pointer_resource_outputs_inner(
                     inner,
                     arg_idx,
@@ -1033,7 +1771,7 @@ fn collect_pointer_resource_outputs_inner(
         }
         ArgType::Struct { fields, .. } => {
             let mut field_offset = base_offset;
-            for field in fields {
+            for (idx, field) in fields.iter().enumerate() {
                 collect_pointer_resource_outputs_inner(
                     field,
                     arg_idx,
@@ -1042,9 +1780,23 @@ fn collect_pointer_resource_outputs_inner(
                     outputs,
                 );
                 let Some(field_size) = arg_type_fixed_size(field) else {
+                    if idx + 1 == fields.len() {
+                        return;
+                    }
                     return;
                 };
                 field_offset += field_size;
+            }
+        }
+        ArgType::Union { fields, .. } => {
+            for field in fields {
+                collect_pointer_resource_outputs_inner(
+                    field,
+                    arg_idx,
+                    base_offset,
+                    next_element_idx,
+                    outputs,
+                );
             }
         }
         _ => {}
@@ -1068,6 +1820,11 @@ fn collect_input_resources(
                 collect_input_resources(field, seen, resources);
             }
         }
+        ArgType::Union { fields, .. } => {
+            for field in fields {
+                collect_input_resources(field, seen, resources);
+            }
+        }
         ArgType::Ptr {
             inner,
             dir: PtrDir::In | PtrDir::InOut,
@@ -1082,6 +1839,7 @@ fn arg_type_contains_resource_input(arg_type: &ArgType) -> bool {
         ArgType::Resource(_) => true,
         ArgType::Array { inner, .. } => arg_type_contains_resource_input(inner),
         ArgType::Struct { fields, .. } => fields.iter().any(arg_type_contains_resource_input),
+        ArgType::Union { fields, .. } => fields.iter().any(arg_type_contains_resource_input),
         ArgType::Ptr { inner, dir, .. } => {
             *dir != PtrDir::Out && arg_type_contains_resource_input(inner)
         }
@@ -1149,33 +1907,107 @@ fn validate_arg_type(arg_type: &ArgType) -> Result<(), String> {
     match arg_type {
         ArgType::Const { size, .. } => validate_native_size(*size, "const argument"),
         ArgType::Resource(resource) => validate_resource_desc(resource),
-        ArgType::Array { inner, len } => {
-            if *len == 0 {
-                return Err("array length must be greater than zero".to_string());
+        ArgType::Array {
+            inner,
+            min_len,
+            max_len,
+        } => {
+            if min_len > max_len {
+                return Err("array minimum length exceeds maximum length".to_string());
             }
-            validate_arg_type(inner)
+            validate_arg_type(inner)?;
+            Ok(())
         }
-        ArgType::Struct { fields, size } => {
+        ArgType::Void => Ok(()),
+        ArgType::Struct {
+            fields,
+            size,
+            varlen,
+            packed,
+            align,
+            ..
+        } => {
             if fields.is_empty() {
                 return Err("struct must have at least one field".to_string());
             }
-            let total = fields.iter().try_fold(0usize, |acc, field| {
+            for field in fields {
                 validate_arg_type(field)?;
-                let field_size = arg_type_fixed_size(field)
-                    .ok_or_else(|| "struct fields must be fixed-size".to_string())?;
-                acc.checked_add(field_size)
-                    .ok_or_else(|| "struct size overflow".to_string())
-            })?;
-            if total > *size {
+            }
+            validate_alignment_value(struct_type_alignment(fields, *packed, *align)?)?;
+            let (prefix_size, has_var_tail) = struct_layout_prefix_size(fields, *packed, *align)?;
+            if prefix_size > *size {
                 return Err(format!(
-                    "struct fields require {} bytes but declared size is {}",
-                    total, size
+                    "struct fields require at least {} bytes but declared size is {}",
+                    prefix_size, size
+                ));
+            }
+            if *varlen != has_var_tail {
+                return Err("struct varlen flag does not match field layout".to_string());
+            }
+            Ok(())
+        }
+        ArgType::Union {
+            fields,
+            size,
+            varlen,
+            packed,
+            align,
+            ..
+        } => {
+            if fields.is_empty() {
+                return Err("union must have at least one field".to_string());
+            }
+            let max_field_size = fields.iter().try_fold(0usize, |acc, field| {
+                validate_arg_type(field)?;
+                let field_size = match arg_type_fixed_size(field) {
+                    Some(field_size) => field_size,
+                    None if *varlen => 0,
+                    None => return Err("union fields must be fixed-size".to_string()),
+                };
+                Ok::<usize, String>(acc.max(field_size))
+            })?;
+            if *size < max_field_size {
+                return Err(format!(
+                    "union fields require up to {} bytes but declared size is {}",
+                    max_field_size, size
+                ));
+            }
+            if !*varlen && *size == 0 {
+                return Err("union size must be greater than zero".to_string());
+            }
+            let union_align = union_type_alignment(fields, *packed, *align)?;
+            if !*varlen && align_up(*size, union_align) != Some(*size) {
+                return Err(format!(
+                    "union declared size {} is not aligned to {}",
+                    size, union_align
+                ));
+            }
+            Ok(())
+        }
+        ArgType::Vma {
+            min_pages,
+            max_pages,
+            ..
+        } => {
+            if *min_pages == 0 || *max_pages == 0 {
+                return Err("vma page counts must be greater than zero".to_string());
+            }
+            if min_pages > max_pages {
+                return Err(format!(
+                    "vma minimum page count {} exceeds maximum {}",
+                    min_pages, max_pages
                 ));
             }
             Ok(())
         }
         ArgType::Ptr { inner, .. } => validate_arg_type(inner),
         ArgType::Len { size, .. } => validate_native_size(*size, "length argument"),
+        ArgType::String {
+            values,
+            noz,
+            fixed_len,
+            filename: _,
+        } => validate_string_type(values, *noz, *fixed_len),
         ArgType::Buffer {
             min_size, max_size, ..
         } => validate_buffer_range(*min_size, *max_size),
@@ -1195,8 +2027,50 @@ fn validate_arg_value(
     match (arg_type, arg_value) {
         (ArgType::Const { .. }, ArgValue::Const(_)) => Ok(()),
         (ArgType::Len { target, size, kind }, ArgValue::Const(value)) => {
-            validate_len_value(prog, call_idx, desc, arg_idx, *target, *size, *kind, *value)
+            validate_len_value(prog, call_idx, desc, arg_idx, target, *size, *kind, *value)
         }
+        (ArgType::Array { .. }, ArgValue::Buffer(data)) => validate_inline_buffer(
+            arg_type,
+            data,
+            Some(desc),
+            Some(&prog.calls[call_idx].args),
+            &[],
+        )
+        .map_err(|err| invalid_arg(call_idx, desc, arg_idx, err)),
+        (ArgType::Array { .. }, ArgValue::Composite { data, pointers }) => validate_inline_value(
+            arg_type,
+            data,
+            Some(pointers.as_slice()),
+            0,
+            Some(desc),
+            Some(&prog.calls[call_idx].args),
+            &[],
+        )
+        .map_err(|err| invalid_arg(call_idx, desc, arg_idx, err)),
+        (
+            ArgType::Array {
+                inner,
+                min_len,
+                max_len,
+            },
+            ArgValue::Array {
+                data,
+                pointers,
+                element_sizes,
+            },
+        ) => validate_array_value(
+            inner,
+            *min_len,
+            *max_len,
+            data,
+            Some(pointers.as_slice()),
+            element_sizes,
+            0,
+            Some(desc),
+            Some(&prog.calls[call_idx].args),
+            &[],
+        )
+        .map_err(|err| invalid_arg(call_idx, desc, arg_idx, err)),
         (ArgType::Resource(resource), ArgValue::Const(_)) => validate_resource_desc(resource)
             .map_err(|err| invalid_arg(call_idx, desc, arg_idx, err)),
         (ArgType::Resource(resource), ArgValue::Null) => validate_resource_desc(resource)
@@ -1210,20 +2084,156 @@ fn validate_arg_value(
                 dir,
                 optional: _,
             },
+            ArgValue::Array {
+                data,
+                pointers,
+                element_sizes,
+            },
+        ) => validate_pointer_array(
+            prog,
+            call_idx,
+            desc,
+            arg_idx,
+            inner,
+            *dir,
+            data,
+            pointers,
+            element_sizes,
+        ),
+        (
+            ArgType::Ptr {
+                inner,
+                dir,
+                optional: _,
+            },
             ArgValue::Buffer(data),
         ) => validate_pointer_buffer(prog, call_idx, desc, arg_idx, inner, *dir, data),
-        (ArgType::Struct { size, .. }, ArgValue::Buffer(data)) => {
-            if data.len() != *size {
-                Err(invalid_arg(
-                    call_idx,
-                    desc,
-                    arg_idx,
-                    format!("struct buffer has size {}, expected {}", data.len(), size),
-                ))
-            } else {
-                Ok(())
-            }
-        }
+        (
+            ArgType::Ptr {
+                inner,
+                dir,
+                optional: _,
+            },
+            ArgValue::Composite { data, pointers },
+        ) => validate_pointer_composite(prog, call_idx, desc, arg_idx, inner, *dir, data, pointers),
+        (
+            ArgType::Struct {
+                type_name,
+                fields,
+                field_names,
+                size,
+                varlen,
+                packed,
+                align,
+                ..
+            },
+            ArgValue::Buffer(data),
+        ) => validate_struct_buffer(
+            type_name.as_deref(),
+            fields,
+            field_names,
+            *size,
+            *varlen,
+            *packed,
+            *align,
+            data,
+            Some(desc),
+            Some(&prog.calls[call_idx].args),
+            &[],
+        )
+        .map_err(|err| invalid_arg(call_idx, desc, arg_idx, err)),
+        (
+            ArgType::Struct {
+                type_name,
+                fields,
+                field_names,
+                size,
+                varlen,
+                packed,
+                align,
+                ..
+            },
+            ArgValue::Composite { data, pointers },
+        ) => validate_struct_buffer_with_pointers(
+            type_name.as_deref(),
+            fields,
+            field_names,
+            *size,
+            *varlen,
+            *packed,
+            *align,
+            data,
+            Some(pointers.as_slice()),
+            0,
+            Some(desc),
+            Some(&prog.calls[call_idx].args),
+            &[],
+        )
+        .map_err(|err| invalid_arg(call_idx, desc, arg_idx, err)),
+        (
+            ArgType::Union {
+                type_name,
+                fields,
+                field_names,
+                size,
+                varlen,
+                packed,
+                align,
+                ..
+            },
+            ArgValue::Buffer(data),
+        ) => validate_union_buffer(
+            type_name.as_deref(),
+            fields,
+            field_names,
+            *size,
+            *varlen,
+            *packed,
+            *align,
+            data,
+            Some(desc),
+            Some(&prog.calls[call_idx].args),
+            &[],
+        )
+        .map_err(|err| invalid_arg(call_idx, desc, arg_idx, err)),
+        (
+            ArgType::Union {
+                type_name,
+                fields,
+                field_names,
+                size,
+                varlen,
+                packed,
+                align,
+                ..
+            },
+            ArgValue::Composite { data, pointers },
+        ) => validate_union_buffer_with_pointers(
+            type_name.as_deref(),
+            fields,
+            field_names,
+            *size,
+            *varlen,
+            *packed,
+            *align,
+            data,
+            Some(pointers.as_slice()),
+            0,
+            Some(desc),
+            Some(&prog.calls[call_idx].args),
+            &[],
+        )
+        .map_err(|err| invalid_arg(call_idx, desc, arg_idx, err)),
+        (
+            ArgType::Vma {
+                min_pages,
+                max_pages,
+                optional: _,
+            },
+            ArgValue::Vma { addr, size },
+        ) => validate_vma_value(*min_pages, *max_pages, *addr, *size)
+            .map_err(|err| invalid_arg(call_idx, desc, arg_idx, err)),
+        (ArgType::Vma { optional: true, .. }, ArgValue::Null) => Ok(()),
         (ArgType::Ptr { optional: true, .. }, ArgValue::Null) => Ok(()),
         (
             ArgType::Ptr {
@@ -1245,6 +2255,10 @@ fn validate_arg_value(
             arg_idx,
             "non-optional output pointer must reserve storage instead of using NULL",
         )),
+        (ArgType::String { noz, fixed_len, .. }, ArgValue::Buffer(data)) => {
+            validate_string_buffer(data, *noz, *fixed_len)
+                .map_err(|err| invalid_arg(call_idx, desc, arg_idx, err))
+        }
         (
             ArgType::Buffer {
                 min_size, max_size, ..
@@ -1358,35 +2372,20 @@ fn validate_len_value(
     call_idx: usize,
     desc: &SyscallDesc,
     arg_idx: usize,
-    target: usize,
+    target: &LengthTarget,
     size: usize,
     kind: LengthKind,
     value: u64,
 ) -> Result<(), ValidationError> {
     validate_native_size(size, "length argument")
         .map_err(|err| invalid_arg(call_idx, desc, arg_idx, err))?;
-    let Some(target_type) = desc.args.get(target) else {
+    let Some(expected) = derive_target_length(desc, &prog.calls[call_idx].args, target, kind)
+    else {
         return Err(invalid_arg(
             call_idx,
             desc,
             arg_idx,
-            format!("length argument targets missing argument {}", target),
-        ));
-    };
-    let Some(target_value) = prog.calls[call_idx].args.get(target) else {
-        return Err(invalid_arg(
-            call_idx,
-            desc,
-            arg_idx,
-            format!("length argument targets missing runtime value {}", target),
-        ));
-    };
-    let Some(expected) = derived_arg_length(target_type, target_value, kind) else {
-        return Err(invalid_arg(
-            call_idx,
-            desc,
-            arg_idx,
-            format!("cannot derive length from argument {}", target),
+            format!("cannot derive length from target {:?}", target),
         ));
     };
     if value != expected as u64 {
@@ -1395,7 +2394,7 @@ fn validate_len_value(
             desc,
             arg_idx,
             format!(
-                "expected derived length {} from argument {}, got {}",
+                "expected derived length {} from target {:?}, got {}",
                 expected, target, value
             ),
         ));
@@ -1412,6 +2411,88 @@ fn validate_pointer_buffer(
     dir: PtrDir,
     data: &[u8],
 ) -> Result<(), ValidationError> {
+    validate_pointer_bytes(prog, call_idx, desc, arg_idx, inner, dir, data, None)
+}
+
+fn validate_pointer_array(
+    prog: &Program,
+    call_idx: usize,
+    desc: &SyscallDesc,
+    arg_idx: usize,
+    inner: &ArgType,
+    dir: PtrDir,
+    data: &[u8],
+    pointers: &[InlinePointerValue],
+    element_sizes: &[usize],
+) -> Result<(), ValidationError> {
+    if dir == PtrDir::Out {
+        return Err(invalid_arg(
+            call_idx,
+            desc,
+            arg_idx,
+            "pure output pointers should reserve storage instead of supplying input bytes",
+        ));
+    }
+    let ArgType::Array {
+        inner: element_type,
+        min_len,
+        max_len,
+    } = inner
+    else {
+        return Err(invalid_arg(
+            call_idx,
+            desc,
+            arg_idx,
+            "array value can only be used with pointer-to-array arguments",
+        ));
+    };
+    validate_array_value(
+        element_type,
+        *min_len,
+        *max_len,
+        data,
+        Some(pointers),
+        element_sizes,
+        0,
+        Some(desc),
+        Some(&prog.calls[call_idx].args),
+        &[],
+    )
+    .map_err(|err| invalid_arg(call_idx, desc, arg_idx, err))
+}
+
+fn validate_pointer_composite(
+    prog: &Program,
+    call_idx: usize,
+    desc: &SyscallDesc,
+    arg_idx: usize,
+    inner: &ArgType,
+    dir: PtrDir,
+    data: &[u8],
+    pointers: &[InlinePointerValue],
+) -> Result<(), ValidationError> {
+    validate_pointer_bytes(
+        prog,
+        call_idx,
+        desc,
+        arg_idx,
+        inner,
+        dir,
+        data,
+        Some(pointers),
+    )
+}
+
+fn validate_pointer_bytes(
+    prog: &Program,
+    call_idx: usize,
+    desc: &SyscallDesc,
+    arg_idx: usize,
+    inner: &ArgType,
+    dir: PtrDir,
+    data: &[u8],
+    pointers: Option<&[InlinePointerValue]>,
+) -> Result<(), ValidationError> {
     if dir == PtrDir::Out {
         return Err(invalid_arg(
             call_idx,
@@ -1424,6 +2505,8 @@ fn validate_pointer_buffer(
         ArgType::Buffer {
             min_size, max_size, ..
         } => validate_buffer_size(data.len(), *min_size, *max_size)
+            .map_err(|err| invalid_arg(call_idx, desc, arg_idx, err)),
+        ArgType::String { noz, fixed_len, .. } => validate_string_buffer(data, *noz, *fixed_len)
             .map_err(|err| invalid_arg(call_idx, desc, arg_idx, err)),
         ArgType::Len { target, size, kind } => {
             if data.len() != *size {
@@ -1443,36 +2526,798 @@ fn validate_pointer_buffer(
                 call_idx,
                 desc,
                 arg_idx,
-                *target,
+                target,
                 *size,
                 *kind,
                 decode_scalar_bytes(data),
             )
         }
         _ => {
-            let Some(expected_size) = arg_type_fixed_size(inner) else {
-                return Err(invalid_arg(
-                    call_idx,
-                    desc,
-                    arg_idx,
-                    "pointer data requires a fixed-size inner type",
+            if let ArgType::Union {
+                type_name,
+                fields,
+                field_names,
+                size,
+                varlen,
+                packed,
+                align,
+                ..
+            } = inner
+            {
+                return validate_union_buffer_with_pointers(
+                    type_name.as_deref(),
+                    fields,
+                    field_names,
+                    *size,
+                    *varlen,
+                    *packed,
+                    *align,
+                    data,
+                    pointers,
+                    0,
+                    Some(desc),
+                    Some(&prog.calls[call_idx].args),
+                    &[],
+                )
+                .map_err(|err| invalid_arg(call_idx, desc, arg_idx, err));
+            }
+            validate_inline_value(
+                inner,
+                data,
+                pointers,
+                0,
+                Some(desc),
+                Some(&prog.calls[call_idx].args),
+                &[],
+            )
+            .map_err(|err| invalid_arg(call_idx, desc, arg_idx, err))
+        }
+    }
+}
+
+fn validate_inline_buffer(
+    arg_type: &ArgType,
+    data: &[u8],
+    desc: Option<&SyscallDesc>,
+    args: Option<&[ArgValue]>,
+    frames: &[LengthTargetFrame<'_>],
+) -> Result<(), String> {
+    validate_inline_value(arg_type, data, None, 0, desc, args, frames)
+}
+
+fn validate_array_value(
+    inner: &ArgType,
+    min_len: usize,
+    max_len: usize,
+    data: &[u8],
+    pointers: Option<&[InlinePointerValue]>,
+    element_sizes: &[usize],
+    base_offset: usize,
+    desc: Option<&SyscallDesc>,
+    args: Option<&[ArgValue]>,
+    frames: &[LengthTargetFrame<'_>],
+) -> Result<(), String> {
+    if element_sizes.len() < min_len || element_sizes.len() > max_len {
+        return Err(format!(
+            "array field has {} elements, expected {}..={}",
+            element_sizes.len(),
+            min_len,
+            max_len
+        ));
+    }
+    let mut offset = 0usize;
+    for &element_size in element_sizes {
+        let end = offset
+            .checked_add(element_size)
+            .ok_or_else(|| "array element size overflow".to_string())?;
+        let chunk = data
+            .get(offset..end)
+            .ok_or_else(|| "array element exceeds backing storage".to_string())?;
+        validate_inline_value(
+            inner,
+            chunk,
+            pointers,
+            base_offset + offset,
+            desc,
+            args,
+            frames,
+        )?;
+        offset = end;
+    }
+    if offset != data.len() {
+        return Err(format!(
+            "array backing storage has {} trailing bytes beyond {} elements",
+            data.len().saturating_sub(offset),
+            element_sizes.len()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_inline_value(
+    arg_type: &ArgType,
+    data: &[u8],
+    pointers: Option<&[InlinePointerValue]>,
+    base_offset: usize,
+    desc: Option<&SyscallDesc>,
+    args: Option<&[ArgValue]>,
+    frames: &[LengthTargetFrame<'_>],
+) -> Result<(), String> {
+    match arg_type {
+        ArgType::Const { size, .. } => validate_exact_inline_size(data.len(), *size, "const field"),
+        ArgType::Resource(resource) => {
+            validate_exact_inline_size(data.len(), resource.size, "resource field")
+        }
+        ArgType::Array {
+            inner,
+            min_len,
+            max_len,
+        } => {
+            let elem_size = arg_type_fixed_size(inner).ok_or_else(|| {
+                "variable-size inline arrays require explicit element boundaries".to_string()
+            })?;
+            if elem_size == 0 {
+                return validate_exact_inline_size(data.len(), 0, "array field");
+            }
+            if data.len() % elem_size != 0 {
+                return Err(format!(
+                    "array field size {} is not a multiple of element size {}",
+                    data.len(),
+                    elem_size
                 ));
-            };
-            if data.len() != expected_size {
-                return Err(invalid_arg(
-                    call_idx,
-                    desc,
-                    arg_idx,
-                    format!(
-                        "pointer data has size {}, expected fixed size {}",
-                        data.len(),
-                        expected_size
-                    ),
+            }
+            let actual_len = data.len() / elem_size;
+            if actual_len < *min_len || actual_len > *max_len {
+                return Err(format!(
+                    "array field has {} elements, expected {}..={}",
+                    actual_len, min_len, max_len
                 ));
+            }
+            for (element_idx, chunk) in data.chunks_exact(elem_size).enumerate() {
+                validate_inline_value(
+                    inner,
+                    chunk,
+                    pointers,
+                    base_offset + (element_idx * elem_size),
+                    desc,
+                    args,
+                    frames,
+                )?;
+            }
+            Ok(())
+        }
+        ArgType::Void => validate_exact_inline_size(data.len(), 0, "void field"),
+        ArgType::Ptr {
+            inner,
+            dir,
+            optional,
+        } => {
+            validate_exact_inline_size(data.len(), 8, "inline pointer field")?;
+            match inline_pointer_value_at_offset(pointers, base_offset) {
+                Some(ArgValue::Buffer(pointer_data)) => validate_pointer_value_for_inline_field(
+                    inner,
+                    *dir,
+                    pointer_data,
+                    None,
+                    desc,
+                    args,
+                ),
+                Some(ArgValue::Composite {
+                    data: pointer_data,
+                    pointers: pointer_pointers,
+                }) => validate_pointer_value_for_inline_field(
+                    inner,
+                    *dir,
+                    pointer_data,
+                    Some(pointer_pointers.as_slice()),
+                    desc,
+                    args,
+                ),
+                Some(ArgValue::Array {
+                    data: pointer_data,
+                    pointers: pointer_pointers,
+                    element_sizes,
+                }) => validate_pointer_array_value_for_inline_field(
+                    inner,
+                    *dir,
+                    pointer_data,
+                    Some(pointer_pointers.as_slice()),
+                    element_sizes,
+                    desc,
+                    args,
+                ),
+                Some(ArgValue::OutPtr) if matches!(dir, PtrDir::Out | PtrDir::InOut) => Ok(()),
+                Some(ArgValue::Null) if *optional => Ok(()),
+                Some(other) => Err(format!(
+                    "inline pointer field uses unsupported nested value {}",
+                    describe_arg_value(other)
+                )),
+                None if *optional && decode_scalar_bytes(data) == 0 => Ok(()),
+                None => Err("inline pointer field is missing nested storage".to_string()),
+            }
+        }
+        ArgType::Struct {
+            type_name,
+            fields,
+            field_names,
+            size,
+            varlen,
+            packed,
+            align,
+            ..
+        } => validate_struct_buffer_with_pointers(
+            type_name.as_deref(),
+            fields,
+            field_names,
+            *size,
+            *varlen,
+            *packed,
+            *align,
+            data,
+            pointers,
+            base_offset,
+            desc,
+            args,
+            frames,
+        ),
+        ArgType::Union {
+            type_name,
+            fields,
+            field_names,
+            size,
+            varlen,
+            packed,
+            align,
+            ..
+        } => validate_union_buffer_with_pointers(
+            type_name.as_deref(),
+            fields,
+            field_names,
+            *size,
+            *varlen,
+            *packed,
+            *align,
+            data,
+            pointers,
+            base_offset,
+            desc,
+            args,
+            frames,
+        ),
+        ArgType::Vma { .. } => validate_exact_inline_size(data.len(), 8, "vma field"),
+        ArgType::Len { target, size, kind } => {
+            validate_exact_inline_size(data.len(), *size, "length field")?;
+            let expected = derive_inline_target_length(desc, args, frames, target, *kind);
+            if let Some(expected) = expected {
+                let actual = decode_scalar_bytes(data);
+                if actual != expected as u64 {
+                    return Err(format!(
+                        "derived inline field has value {}, expected {}",
+                        actual, expected
+                    ));
+                }
+            }
+            Ok(())
+        }
+        ArgType::Buffer {
+            min_size, max_size, ..
+        } => validate_buffer_size(data.len(), *min_size, *max_size),
+        ArgType::String { noz, fixed_len, .. } => validate_string_buffer(data, *noz, *fixed_len),
+        ArgType::Filename => {
+            if data.is_empty() || data.last().copied() != Some(0) {
+                return Err("inline filename field must be NUL-terminated".to_string());
             }
             Ok(())
         }
     }
+}
+
+fn validate_pointer_value_for_inline_field(
+    inner: &ArgType,
+    dir: PtrDir,
+    data: &[u8],
+    pointers: Option<&[InlinePointerValue]>,
+    desc: Option<&SyscallDesc>,
+    args: Option<&[ArgValue]>,
+) -> Result<(), String> {
+    if dir == PtrDir::Out {
+        return Ok(());
+    }
+    match inner {
+        ArgType::Buffer {
+            min_size, max_size, ..
+        } => validate_buffer_size(data.len(), *min_size, *max_size),
+        ArgType::String { noz, fixed_len, .. } => validate_string_buffer(data, *noz, *fixed_len),
+        ArgType::Len { target, size, kind } => {
+            validate_exact_inline_size(data.len(), *size, "length pointer buffer")?;
+            let expected = derive_inline_target_length(desc, args, &[], target, *kind)
+                .ok_or_else(|| format!("cannot derive length from target {:?}", target))?;
+            let actual = decode_scalar_bytes(data) as usize;
+            if actual == expected {
+                Ok(())
+            } else {
+                Err(format!(
+                    "derived pointer field has value {}, expected {}",
+                    actual, expected
+                ))
+            }
+        }
+        ArgType::Union {
+            type_name,
+            fields,
+            field_names,
+            size,
+            varlen,
+            packed,
+            align,
+            ..
+        } => validate_union_buffer_with_pointers(
+            type_name.as_deref(),
+            fields,
+            field_names,
+            *size,
+            *varlen,
+            *packed,
+            *align,
+            data,
+            pointers,
+            0,
+            desc,
+            args,
+            &[],
+        ),
+        _ => validate_inline_value(inner, data, pointers, 0, desc, args, &[]),
+    }
+}
+
+fn validate_pointer_array_value_for_inline_field(
+    inner: &ArgType,
+    dir: PtrDir,
+    data: &[u8],
+    pointers: Option<&[InlinePointerValue]>,
+    element_sizes: &[usize],
+    desc: Option<&SyscallDesc>,
+    args: Option<&[ArgValue]>,
+) -> Result<(), String> {
+    if dir == PtrDir::Out {
+        return Ok(());
+    }
+    let ArgType::Array {
+        inner: element_type,
+        min_len,
+        max_len,
+    } = inner
+    else {
+        return Err("inline array value requires a pointer-to-array field".to_string());
+    };
+    validate_array_value(
+        element_type,
+        *min_len,
+        *max_len,
+        data,
+        pointers,
+        element_sizes,
+        0,
+        desc,
+        args,
+        &[],
+    )
+}
+
+fn validate_struct_buffer(
+    type_name: Option<&str>,
+    fields: &[ArgType],
+    field_names: &[String],
+    size: usize,
+    varlen: bool,
+    packed: bool,
+    align: Option<usize>,
+    data: &[u8],
+    desc: Option<&SyscallDesc>,
+    args: Option<&[ArgValue]>,
+    frames: &[LengthTargetFrame<'_>],
+) -> Result<(), String> {
+    validate_struct_buffer_with_pointers(
+        type_name,
+        fields,
+        field_names,
+        size,
+        varlen,
+        packed,
+        align,
+        data,
+        None,
+        0,
+        desc,
+        args,
+        frames,
+    )
+}
+
+fn validate_struct_buffer_with_pointers(
+    type_name: Option<&str>,
+    fields: &[ArgType],
+    field_names: &[String],
+    size: usize,
+    varlen: bool,
+    packed: bool,
+    align: Option<usize>,
+    data: &[u8],
+    pointers: Option<&[InlinePointerValue]>,
+    base_offset: usize,
+    desc: Option<&SyscallDesc>,
+    args: Option<&[ArgValue]>,
+    frames: &[LengthTargetFrame<'_>],
+) -> Result<(), String> {
+    let (prefix_size, has_var_tail) = struct_layout_prefix_size(fields, packed, align)?;
+    let struct_align = struct_type_alignment(fields, packed, align)?;
+    if !varlen && !has_var_tail {
+        validate_exact_inline_size(data.len(), size, "struct buffer")?;
+    } else if data.len() < prefix_size {
+        return Err(format!(
+            "struct buffer has size {}, expected at least {}",
+            data.len(),
+            prefix_size
+        ));
+    } else if struct_align > 1 && data.len() % struct_align != 0 {
+        return Err(format!(
+            "struct buffer has size {}, expected alignment {}",
+            data.len(),
+            struct_align
+        ));
+    }
+    let mut next_frames = frames.to_vec();
+    next_frames.push(LengthTargetFrame {
+        type_name,
+        fields,
+        field_names,
+        size: data.len(),
+        is_union: false,
+        varlen,
+        packed,
+        data: Some(data),
+        pointers,
+        base_offset,
+    });
+    for (idx, field) in fields.iter().enumerate() {
+        let offset = compute_struct_field_offset(fields, idx, varlen, packed)
+            .ok_or_else(|| "struct field offset overflow".to_string())?;
+        let field_size = if let Some(field_size) = arg_type_fixed_size(field) {
+            field_size
+        } else if idx + 1 == fields.len() {
+            data.len().saturating_sub(offset)
+        } else {
+            return Err("only trailing variable-sized struct fields are supported".to_string());
+        };
+        let end = offset
+            .checked_add(field_size)
+            .ok_or_else(|| "struct field offset overflow".to_string())?;
+        validate_inline_value(
+            field,
+            &data[offset..end],
+            pointers,
+            base_offset + offset,
+            desc,
+            args,
+            &next_frames,
+        )?;
+    }
+    Ok(())
+}
+
+fn compute_field_offsets(fields: &[ArgType], packed: bool) -> Result<Vec<usize>, String> {
+    let mut offsets = Vec::with_capacity(fields.len());
+    for idx in 0..fields.len() {
+        offsets.push(
+            compute_struct_field_offset(fields, idx, false, packed)
+                .ok_or_else(|| "field offset overflow".to_string())?,
+        );
+    }
+    Ok(offsets)
+}
+
+pub(crate) fn struct_layout_prefix_size(
+    fields: &[ArgType],
+    packed: bool,
+    align: Option<usize>,
+) -> Result<(usize, bool), String> {
+    let mut prefix_size = 0usize;
+    let mut saw_var_tail = false;
+    for (idx, field) in fields.iter().enumerate() {
+        let field_align = if packed {
+            1
+        } else {
+            arg_type_alignment(field)
+                .ok_or_else(|| "struct fields must have a known alignment".to_string())?
+        };
+        prefix_size =
+            align_up(prefix_size, field_align).ok_or_else(|| "struct size overflow".to_string())?;
+        match arg_type_fixed_size(field) {
+            Some(field_size) => {
+                prefix_size = prefix_size
+                    .checked_add(field_size)
+                    .ok_or_else(|| "struct size overflow".to_string())?;
+            }
+            None => {
+                if idx + 1 != fields.len() {
+                    return Err(
+                        "only trailing variable-sized struct fields are supported".to_string()
+                    );
+                }
+                saw_var_tail = true;
+            }
+        }
+    }
+    if !saw_var_tail {
+        let struct_align = struct_type_alignment(fields, packed, align)?;
+        prefix_size = align_up(prefix_size, struct_align)
+            .ok_or_else(|| "struct size overflow".to_string())?;
+    }
+    Ok((prefix_size, saw_var_tail))
+}
+
+fn validate_exact_inline_size(actual: usize, expected: usize, label: &str) -> Result<(), String> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!("{label} has size {actual}, expected {expected}"))
+    }
+}
+
+fn validate_union_buffer(
+    type_name: Option<&str>,
+    fields: &[ArgType],
+    field_names: &[String],
+    size: usize,
+    varlen: bool,
+    packed: bool,
+    align: Option<usize>,
+    data: &[u8],
+    desc: Option<&SyscallDesc>,
+    args: Option<&[ArgValue]>,
+    frames: &[LengthTargetFrame<'_>],
+) -> Result<(), String> {
+    validate_union_buffer_with_pointers(
+        type_name,
+        fields,
+        field_names,
+        size,
+        varlen,
+        packed,
+        align,
+        data,
+        None,
+        0,
+        desc,
+        args,
+        frames,
+    )
+}
+
+fn validate_union_buffer_with_pointers(
+    type_name: Option<&str>,
+    fields: &[ArgType],
+    field_names: &[String],
+    size: usize,
+    varlen: bool,
+    packed: bool,
+    align: Option<usize>,
+    data: &[u8],
+    pointers: Option<&[InlinePointerValue]>,
+    base_offset: usize,
+    desc: Option<&SyscallDesc>,
+    args: Option<&[ArgValue]>,
+    frames: &[LengthTargetFrame<'_>],
+) -> Result<(), String> {
+    let field_sizes = fields.iter().map(arg_type_fixed_size).collect::<Vec<_>>();
+    if !varlen && field_sizes.iter().any(|field_size| field_size.is_none()) {
+        return Err("union fields must be fixed-size".to_string());
+    }
+    let fixed_field_sizes = field_sizes.iter().copied().flatten().collect::<Vec<_>>();
+    if varlen
+        && !field_sizes.iter().any(|field_size| field_size.is_none())
+        && !fixed_field_sizes.contains(&data.len())
+    {
+        return Err(format!(
+            "varlen union buffer has size {}, expected one of {:?}",
+            data.len(),
+            fixed_field_sizes
+        ));
+    }
+    if !varlen && data.len() != size {
+        return Err(format!(
+            "union buffer has size {}, expected {}",
+            data.len(),
+            size
+        ));
+    }
+    let union_align = union_type_alignment(fields, packed, align)?;
+    if !varlen && data.len() % union_align != 0 {
+        return Err(format!(
+            "union buffer has size {}, expected alignment {}",
+            data.len(),
+            union_align
+        ));
+    }
+
+    let mut next_frames = frames.to_vec();
+    next_frames.push(LengthTargetFrame {
+        type_name,
+        fields,
+        field_names,
+        size,
+        is_union: true,
+        varlen,
+        packed,
+        data: Some(data),
+        pointers,
+        base_offset,
+    });
+
+    let mut matched = false;
+    for (field, field_size) in fields.iter().zip(field_sizes.iter().copied()) {
+        if varlen {
+            match field_size {
+                Some(field_size) if field_size != data.len() => continue,
+                Some(field_size) => {
+                    if let Some(field_data) = data.get(..field_size) {
+                        if validate_inline_value(
+                            field,
+                            field_data,
+                            pointers,
+                            base_offset,
+                            desc,
+                            args,
+                            &next_frames,
+                        )
+                        .is_ok()
+                        {
+                            matched = true;
+                            break;
+                        }
+                    }
+                }
+                None => {
+                    if validate_inline_value(
+                        field,
+                        data,
+                        pointers,
+                        base_offset,
+                        desc,
+                        args,
+                        &next_frames,
+                    )
+                    .is_ok()
+                    {
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        let field_size = field_size.ok_or_else(|| "union fields must be fixed-size".to_string())?;
+        if let Some(field_data) = data.get(..field_size) {
+            if validate_inline_value(
+                field,
+                field_data,
+                pointers,
+                base_offset,
+                desc,
+                args,
+                &next_frames,
+            )
+            .is_ok()
+            {
+                matched = true;
+                break;
+            }
+        }
+    }
+    if matched || fields.is_empty() {
+        Ok(())
+    } else if varlen && !fixed_field_sizes.is_empty() {
+        Err(format!(
+            "varlen union buffer has size {}, expected one of {:?} or a variable-sized field of {}",
+            data.len(),
+            fixed_field_sizes,
+            type_name.unwrap_or("<anonymous>")
+        ))
+    } else {
+        Err("union buffer does not match any field layout".to_string())
+    }
+}
+
+fn validate_vma_value(
+    min_pages: usize,
+    max_pages: usize,
+    addr: u64,
+    size: u64,
+) -> Result<(), String> {
+    if addr < DATA_OFFSET {
+        return Err(format!(
+            "vma address 0x{addr:x} is below data offset 0x{:x}",
+            DATA_OFFSET
+        ));
+    }
+    let relative = addr - DATA_OFFSET;
+    if relative % PAGE_SIZE != 0 {
+        return Err(format!(
+            "vma address 0x{addr:x} is not page-aligned to {}",
+            PAGE_SIZE
+        ));
+    }
+    if size == 0 || size % PAGE_SIZE != 0 {
+        return Err(format!(
+            "vma size 0x{size:x} must be a non-zero page multiple of {}",
+            PAGE_SIZE
+        ));
+    }
+    let page_count = size / PAGE_SIZE;
+    if page_count < min_pages as u64 || page_count > max_pages as u64 {
+        return Err(format!(
+            "vma size 0x{size:x} spans {page_count} pages, expected {}..={} pages",
+            min_pages, max_pages
+        ));
+    }
+    let end = relative
+        .checked_add(size)
+        .ok_or_else(|| "vma region overflows address space".to_string())?;
+    if end > VMA_MAX_BYTES {
+        return Err(format!(
+            "vma region 0x{addr:x}/0x{size:x} exceeds 0x{:x} byte arena",
+            VMA_MAX_BYTES
+        ));
+    }
+    Ok(())
+}
+
+fn validate_string_type(
+    values: &[Vec<u8>],
+    noz: bool,
+    fixed_len: Option<usize>,
+) -> Result<(), String> {
+    if let Some(fixed_len) = fixed_len {
+        if fixed_len == 0 {
+            return Err("string fixed length must be greater than zero".to_string());
+        }
+    }
+    for value in values {
+        if value.contains(&0) {
+            return Err("string literals may not contain embedded NUL bytes".to_string());
+        }
+        if let Some(fixed_len) = fixed_len {
+            let encoded_len = if noz { value.len() } else { value.len() + 1 };
+            if encoded_len > fixed_len {
+                return Err(format!(
+                    "string literal requires {} bytes but fixed size is {}",
+                    encoded_len, fixed_len
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_string_buffer(data: &[u8], noz: bool, fixed_len: Option<usize>) -> Result<(), String> {
+    if let Some(fixed_len) = fixed_len {
+        if data.len() != fixed_len {
+            return Err(format!(
+                "string buffer has size {}, expected fixed size {}",
+                data.len(),
+                fixed_len
+            ));
+        }
+    }
+    if !noz {
+        if data.is_empty() {
+            return Err("NUL-terminated string buffer may not be empty".to_string());
+        }
+        if data.last().copied() != Some(0) {
+            return Err("NUL-terminated string buffer must end with a NUL byte".to_string());
+        }
+    }
+    Ok(())
 }
 
 fn validate_resource_desc(resource: &ResourceDesc) -> Result<(), String> {
@@ -1544,9 +3389,13 @@ fn describe_arg_type(arg_type: &ArgType) -> &'static str {
         ArgType::Resource(_) => "resource",
         ArgType::Array { .. } => "array",
         ArgType::Struct { .. } => "struct",
+        ArgType::Union { .. } => "union",
+        ArgType::Vma { .. } => "vma",
         ArgType::Ptr { .. } => "pointer",
+        ArgType::String { .. } => "string",
         ArgType::Buffer { .. } => "buffer",
         ArgType::Filename => "filename",
+        ArgType::Void => "void",
     }
 }
 
@@ -1555,7 +3404,10 @@ fn describe_arg_value(arg_value: &ArgValue) -> &'static str {
         ArgValue::Const(_) => "const",
         ArgValue::ResultRef(_) => "result reference",
         ArgValue::Buffer(_) => "buffer",
+        ArgValue::Composite { .. } => "composite buffer",
+        ArgValue::Array { .. } => "array buffer",
         ArgValue::Filename(_) => "filename",
+        ArgValue::Vma { .. } => "vma",
         ArgValue::OutPtr => "out pointer",
         ArgValue::Null => "null",
     }
@@ -1564,6 +3416,13 @@ fn describe_arg_value(arg_value: &ArgValue) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn syscall_idx(descs: &[SyscallDesc], name: &str) -> usize {
+        descs
+            .iter()
+            .position(|desc| desc.name == name)
+            .unwrap_or_else(|| panic!("missing syscall {name}"))
+    }
 
     #[test]
     fn pipe2_exposes_two_resource_outputs() {
@@ -1656,6 +3515,8 @@ mod tests {
         let descs = get_syscall_descs();
         let socket = descs.iter().find(|desc| desc.name == "socket").unwrap();
         let close = descs.iter().find(|desc| desc.name == "close").unwrap();
+        let socket_idx = syscall_idx(&descs, "socket");
+        let eventfd2_idx = syscall_idx(&descs, "eventfd2");
 
         let fd_input = match &close.args[0] {
             ArgType::Resource(resource) => resource.clone(),
@@ -1669,9 +3530,9 @@ mod tests {
         let fd_ctors = resource_constructor_syscalls(&descs, &fd_input);
         let sock_ctors = resource_constructor_syscalls(&descs, &sock_output);
 
-        assert!(fd_ctors.contains(&6)); // socket -> sock can satisfy fd consumers
-        assert!(sock_ctors.contains(&6));
-        assert!(!sock_ctors.contains(&9)); // eventfd2 -> fd is not precise enough for sock
+        assert!(fd_ctors.contains(&socket_idx)); // socket -> sock can satisfy fd consumers
+        assert!(sock_ctors.contains(&socket_idx));
+        assert!(!sock_ctors.contains(&eventfd2_idx)); // eventfd2 -> fd is not precise enough for sock
     }
 
     #[test]
@@ -1966,17 +3827,19 @@ mod tests {
     #[test]
     fn rejects_forward_result_reference() {
         let descs = get_syscall_descs();
+        let close = syscall_idx(&descs, "close");
+        let eventfd2 = syscall_idx(&descs, "eventfd2");
         let prog = Program {
             calls: vec![
                 Call {
-                    syscall_idx: 1, // close(fd)
+                    syscall_idx: close,
                     args: vec![ArgValue::ResultRef(ResultRef {
                         call_idx: 1,
                         result_idx: 0,
                     })],
                 },
                 Call {
-                    syscall_idx: 9, // eventfd2 -> fd
+                    syscall_idx: eventfd2,
                     args: vec![ArgValue::Const(0), ArgValue::Const(0)],
                 },
             ],
@@ -1993,7 +3856,7 @@ mod tests {
         let descs = get_syscall_descs();
         let prog = Program {
             calls: vec![Call {
-                syscall_idx: 1, // close(fd)
+                syscall_idx: syscall_idx(&descs, "close"),
                 args: vec![ArgValue::Buffer(vec![0, 1, 2, 3])],
             }],
         };
@@ -2005,14 +3868,16 @@ mod tests {
     #[test]
     fn accepts_pointer_output_result_reference() {
         let descs = get_syscall_descs();
+        let pipe2 = syscall_idx(&descs, "pipe2");
+        let close = syscall_idx(&descs, "close");
         let prog = Program {
             calls: vec![
                 Call {
-                    syscall_idx: 4, // pipe2([fd, fd], flags)
+                    syscall_idx: pipe2,
                     args: vec![ArgValue::OutPtr, ArgValue::Const(0)],
                 },
                 Call {
-                    syscall_idx: 1, // close(fd)
+                    syscall_idx: close,
                     args: vec![ArgValue::ResultRef(ResultRef {
                         call_idx: 0,
                         result_idx: 1,
@@ -2060,6 +3925,173 @@ mod tests {
 
         prog.validate(&descs)
             .expect("derived lengths and optional null pointers should validate");
+    }
+
+    #[test]
+    fn validates_fixed_and_varlen_union_buffers() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                packet [
+                    short buffer[2:2]
+                    word buffer[4:4]
+                ]
+                flex_packet [
+                    short buffer[2:2]
+                    word buffer[4:4]
+                ] [varlen]
+                syscall take_value@1 -> int(arg packet)
+                syscall take_ptr@2 -> int(arg ptr[in, flex_packet])
+            "#,
+        )
+        .expect("test target should parse");
+
+        let valid = Program {
+            calls: vec![
+                Call {
+                    syscall_idx: 0,
+                    args: vec![ArgValue::Buffer(vec![0; 4])],
+                },
+                Call {
+                    syscall_idx: 1,
+                    args: vec![ArgValue::Buffer(vec![0; 2])],
+                },
+            ],
+        };
+        valid
+            .validate(&descs)
+            .expect("fixed and varlen union buffers should validate");
+
+        let invalid = Program {
+            calls: vec![Call {
+                syscall_idx: 1,
+                args: vec![ArgValue::Buffer(vec![0; 3])],
+            }],
+        };
+        let err = invalid
+            .validate(&descs)
+            .expect_err("invalid varlen union size must be rejected");
+        assert!(err.to_string().contains("expected one of [2, 4]"));
+    }
+
+    #[test]
+    fn validates_varlen_union_buffers_with_variable_fields() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                flex_packet [
+                    raw array[int8]
+                    word buffer[4:4]
+                ] [varlen]
+                syscall take_ptr@1 -> int(arg ptr[in, flex_packet])
+            "#,
+        )
+        .expect("test target should parse");
+
+        let valid = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![ArgValue::Buffer(vec![0; 3])],
+            }],
+        };
+        valid
+            .validate(&descs)
+            .expect("variable-sized varlen union buffer should validate");
+
+        let also_valid = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![ArgValue::Buffer(vec![0; 4])],
+            }],
+        };
+        also_valid
+            .validate(&descs)
+            .expect("fixed-sized varlen union alternative should still validate");
+    }
+
+    #[test]
+    fn validates_vma_values_and_derived_lengths() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                syscall map@1 -> int(addr vma[2:3], len len[addr], opt vma[opt], optlen len[opt])
+            "#,
+        )
+        .expect("test target should parse");
+        let prog = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![
+                    ArgValue::Vma {
+                        addr: DATA_OFFSET + 512 * PAGE_SIZE,
+                        size: 2 * PAGE_SIZE,
+                    },
+                    ArgValue::Const(2 * PAGE_SIZE),
+                    ArgValue::Null,
+                    ArgValue::Const(0),
+                ],
+            }],
+        };
+
+        prog.validate(&descs)
+            .expect("vma values and optional null lengths should validate");
+
+        let invalid = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![
+                    ArgValue::Vma {
+                        addr: DATA_OFFSET + 3,
+                        size: PAGE_SIZE,
+                    },
+                    ArgValue::Const(PAGE_SIZE),
+                    ArgValue::Null,
+                    ArgValue::Const(0),
+                ],
+            }],
+        };
+        let err = invalid
+            .validate(&descs)
+            .expect_err("unaligned vma must be rejected");
+        assert!(err.to_string().contains("not page-aligned"));
+    }
+
+    #[test]
+    fn validates_string_buffers_and_derived_lengths() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                path_values = "/dev/null"
+                syscall write_like@1 -> int(path ptr[in, string[path_values]], path_len len[path], word ptr[in, stringnoz["abc", 8]], word_len len[word])
+            "#,
+        )
+        .expect("test target should parse");
+        let valid = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![
+                    ArgValue::Buffer(b"/dev/null\0".to_vec()),
+                    ArgValue::Const(10),
+                    ArgValue::Buffer(vec![b'a', b'b', b'c', 0, 0, 0, 0, 0]),
+                    ArgValue::Const(8),
+                ],
+            }],
+        };
+        valid
+            .validate(&descs)
+            .expect("materialized string buffers and lengths should validate");
+
+        let invalid = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![
+                    ArgValue::Buffer(b"/dev/null".to_vec()),
+                    ArgValue::Const(9),
+                    ArgValue::Buffer(vec![b'a', b'b', b'c', 0, 0, 0, 0, 0]),
+                    ArgValue::Const(8),
+                ],
+            }],
+        };
+        let err = invalid
+            .validate(&descs)
+            .expect_err("missing NUL terminator must be rejected");
+        assert!(err.to_string().contains("must end with a NUL byte"));
     }
 
     #[test]
@@ -2116,14 +4148,16 @@ mod tests {
     #[test]
     fn accepts_socket_result_as_fd_argument() {
         let descs = get_syscall_descs();
+        let socket = syscall_idx(&descs, "socket");
+        let close = syscall_idx(&descs, "close");
         let prog = Program {
             calls: vec![
                 Call {
-                    syscall_idx: 6, // socket(...) -> sock
+                    syscall_idx: socket,
                     args: vec![ArgValue::Const(2), ArgValue::Const(1), ArgValue::Const(0)],
                 },
                 Call {
-                    syscall_idx: 1, // close(fd)
+                    syscall_idx: close,
                     args: vec![ArgValue::ResultRef(ResultRef {
                         call_idx: 0,
                         result_idx: 0,
@@ -2134,5 +4168,619 @@ mod tests {
 
         prog.validate(&descs)
             .expect("socket result should be usable where fd is expected");
+    }
+
+    #[test]
+    fn validates_parent_derived_inline_lengths() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type msg[PAYLOAD] {
+                    size bytesize[parent, int32]
+                    kind const[7, int32]
+                    payload PAYLOAD
+                } [packed]
+                syscall write_msg@1 -> int(fd const[1, int32], data ptr[in, msg[int32]], len len[data, int32])
+            "#,
+        )
+        .expect("test target should parse");
+
+        let valid = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![
+                    ArgValue::Const(1),
+                    ArgValue::Buffer(vec![12, 0, 0, 0, 7, 0, 0, 0, 0x34, 0x12, 0, 0]),
+                    ArgValue::Const(12),
+                ],
+            }],
+        };
+        valid
+            .validate(&descs)
+            .expect("parent-derived struct size field should validate");
+
+        let invalid = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![
+                    ArgValue::Const(1),
+                    ArgValue::Buffer(vec![8, 0, 0, 0, 7, 0, 0, 0, 0x34, 0x12, 0, 0]),
+                    ArgValue::Const(12),
+                ],
+            }],
+        };
+        let err = invalid
+            .validate(&descs)
+            .expect_err("wrong parent-derived struct size field must be rejected");
+        assert!(err
+            .to_string()
+            .contains("derived inline field has value 8, expected 12"));
+    }
+
+    #[test]
+    fn validates_offsetof_inline_fields() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type nlattr[PAYLOAD] {
+                    nla_len offsetof[end, int16]
+                    nla_type const[0xaa, int16]
+                    payload PAYLOAD
+                    end void
+                } [packed]
+                syscall send_attr@1 -> int(fd const[1, int32], data ptr[in, nlattr[int32]], len len[data, int32])
+            "#,
+        )
+        .expect("test target should parse");
+
+        let valid = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![
+                    ArgValue::Const(1),
+                    ArgValue::Buffer(vec![8, 0, 0xaa, 0x00, 0x34, 0x12, 0x00, 0x00]),
+                    ArgValue::Const(8),
+                ],
+            }],
+        };
+        valid
+            .validate(&descs)
+            .expect("offsetof-derived inline field should validate");
+
+        let invalid = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![
+                    ArgValue::Const(1),
+                    ArgValue::Buffer(vec![6, 0, 0xaa, 0x00, 0x34, 0x12, 0x00, 0x00]),
+                    ArgValue::Const(8),
+                ],
+            }],
+        };
+        let err = invalid
+            .validate(&descs)
+            .expect_err("wrong offsetof-derived inline field must be rejected");
+        assert!(err
+            .to_string()
+            .contains("derived inline field has value 6, expected 8"));
+    }
+
+    #[test]
+    fn validates_named_path_lengths_across_arg_type_and_parent_roots() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type path_inner {
+                    bytes array[int8, 6]
+                } [packed]
+                type path_outer {
+                    inner path_inner
+                    inner_len bytesize[path_outer:inner, int32]
+                    inner_len2 bytesize[inner, int32]
+                } [packed]
+                type parent_meta {
+                    payload_len bytesize[parent:parent:payload, int32]
+                } [packed]
+                helper_outer {
+                    payload array[int32, 4]
+                    meta parent_meta
+                    data_len bytesize[syscall:data, int32]
+                } [packed]
+                syscall send_paths@1 -> int(fd const[1, int32], data ptr[in, path_outer], ctx ptr[in, helper_outer], inner_len len[data:inner, int32])
+            "#,
+        )
+        .expect("test target should parse");
+
+        let valid = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![
+                    ArgValue::Const(1),
+                    ArgValue::Buffer(vec![
+                        1, 2, 3, 4, 5, 6, // inner.bytes
+                        6, 0, 0, 0, // inner_len
+                        6, 0, 0, 0, // inner_len2
+                    ]),
+                    ArgValue::Buffer(vec![
+                        1, 0, 0, 0, // payload[0]
+                        2, 0, 0, 0, // payload[1]
+                        3, 0, 0, 0, // payload[2]
+                        4, 0, 0, 0, // payload[3]
+                        16, 0, 0, 0, // meta.payload_len
+                        14, 0, 0, 0, // data_len
+                    ]),
+                    ArgValue::Const(6),
+                ],
+            }],
+        };
+        valid
+            .validate(&descs)
+            .expect("named-path derived lengths should validate");
+
+        let invalid = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![
+                    ArgValue::Const(1),
+                    ArgValue::Buffer(vec![
+                        1, 2, 3, 4, 5, 6, //
+                        6, 0, 0, 0, //
+                        5, 0, 0, 0, // wrong current-root bytesize
+                    ]),
+                    ArgValue::Buffer(vec![
+                        1, 0, 0, 0, //
+                        2, 0, 0, 0, //
+                        3, 0, 0, 0, //
+                        4, 0, 0, 0, //
+                        16, 0, 0, 0, //
+                        13, 0, 0, 0, // wrong syscall-root bytesize
+                    ]),
+                    ArgValue::Const(6),
+                ],
+            }],
+        };
+        let err = invalid
+            .validate(&descs)
+            .expect_err("wrong named-path derived lengths must be rejected");
+        let text = err.to_string();
+        assert!(
+            text.contains("derived inline field has value 5, expected 6")
+                || text.contains("derived inline field has value 13, expected 14"),
+            "unexpected validation error: {text}"
+        );
+    }
+
+    #[test]
+    fn validates_trailing_varlen_struct_arrays() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type qid {
+                    path int32
+                    version int32
+                } [packed]
+                type walk_msg {
+                    nwqid len[wqid, int16]
+                    wqid array[qid, 1:3]
+                } [packed]
+                syscall write_walk@1 -> int(fd const[1, int32], data ptr[in, walk_msg], size len[data, int32])
+            "#,
+        )
+        .expect("test target should parse");
+
+        let valid = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![
+                    ArgValue::Const(1),
+                    ArgValue::Buffer(vec![
+                        2, 0, // nwqid
+                        1, 0, 0, 0, 2, 0, 0, 0, // qid[0]
+                        3, 0, 0, 0, 4, 0, 0, 0, // qid[1]
+                    ]),
+                    ArgValue::Const(18),
+                ],
+            }],
+        };
+        valid
+            .validate(&descs)
+            .expect("trailing fixed-element array payload should validate");
+
+        let invalid = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![
+                    ArgValue::Const(1),
+                    ArgValue::Buffer(vec![
+                        3, 0, // claims 3 elements
+                        1, 0, 0, 0, 2, 0, 0, 0, // qid[0]
+                        3, 0, 0, 0, 4, 0, 0, 0, // qid[1]
+                    ]),
+                    ArgValue::Const(18),
+                ],
+            }],
+        };
+        let err = invalid
+            .validate(&descs)
+            .expect_err("wrong trailing array element count must be rejected");
+        assert!(err
+            .to_string()
+            .contains("derived inline field has value 3, expected 2"));
+    }
+
+    #[test]
+    fn validates_pointer_to_varlen_struct_array_lengths() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type iovec {
+                    base ptr[in, array[int8, 4:8]]
+                    len len[base, intptr]
+                } [size[16]]
+                type cmsghdr_like {
+                    cmsg_len bytesize[parent, intptr]
+                    cmsg_level const[0, int32]
+                    cmsg_type const[0, int32]
+                    data array[int8, 0:16]
+                } [varlen, align[8]]
+                type send_msghdr {
+                    msg_name ptr[in, buffer[16:16], opt]
+                    msg_namelen len[msg_name, int32]
+                    msg_iov ptr[in, array[iovec, 1:2]]
+                    msg_iovlen len[msg_iov, intptr]
+                    msg_control ptr[in, array[cmsghdr_like, 1:2], opt]
+                    msg_controllen bytesize[msg_control, intptr]
+                    msg_flags const[0, int32]
+                } [size[56]]
+                syscall sendmsg@1 -> int(fd const[1, int32], msg ptr[in, send_msghdr], flags const[0, int32])
+            "#,
+        )
+        .expect("test target should parse");
+
+        let control_data = vec![
+            24, 0, 0, 0, 0, 0, 0, 0, // cmsg_len = 24
+            0, 0, 0, 0, // cmsg_level
+            0, 0, 0, 0, // cmsg_type
+            1, 2, 3, 0, 0, 0, 0, 0, // padded data
+            16, 0, 0, 0, 0, 0, 0, 0, // cmsg_len = 16
+            0, 0, 0, 0, // cmsg_level
+            0, 0, 0, 0, // cmsg_type
+        ];
+        let control = ArgValue::Array {
+            data: control_data,
+            pointers: Vec::new(),
+            element_sizes: vec![24, 16],
+        };
+        let valid = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![
+                    ArgValue::Const(1),
+                    ArgValue::Composite {
+                        data: vec![0; 24]
+                            .into_iter()
+                            .chain(encode_scalar_bytes(8, 1))
+                            .chain(vec![0; 8])
+                            .chain(encode_scalar_bytes(8, 40))
+                            .chain(encode_scalar_bytes(4, 0))
+                            .chain(vec![0; 4])
+                            .collect(),
+                        pointers: vec![
+                            InlinePointerValue {
+                                offset: 16,
+                                value: Box::new(ArgValue::Composite {
+                                    data: vec![0; 8]
+                                        .into_iter()
+                                        .chain(encode_scalar_bytes(8, 5))
+                                        .collect(),
+                                    pointers: vec![InlinePointerValue {
+                                        offset: 0,
+                                        value: Box::new(ArgValue::Buffer(vec![1, 2, 3, 4, 5])),
+                                    }],
+                                }),
+                            },
+                            InlinePointerValue {
+                                offset: 32,
+                                value: Box::new(control.clone()),
+                            },
+                        ],
+                    },
+                    ArgValue::Const(0),
+                ],
+            }],
+        };
+        valid
+            .validate(&descs)
+            .expect("pointer to varlen struct array should validate");
+
+        let invalid = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![
+                    ArgValue::Const(1),
+                    ArgValue::Composite {
+                        data: vec![0; 24]
+                            .into_iter()
+                            .chain(encode_scalar_bytes(8, 1))
+                            .chain(vec![0; 8])
+                            .chain(encode_scalar_bytes(8, 32))
+                            .chain(encode_scalar_bytes(4, 0))
+                            .chain(vec![0; 4])
+                            .collect(),
+                        pointers: vec![
+                            InlinePointerValue {
+                                offset: 16,
+                                value: Box::new(ArgValue::Composite {
+                                    data: vec![0; 8]
+                                        .into_iter()
+                                        .chain(encode_scalar_bytes(8, 5))
+                                        .collect(),
+                                    pointers: vec![InlinePointerValue {
+                                        offset: 0,
+                                        value: Box::new(ArgValue::Buffer(vec![1, 2, 3, 4, 5])),
+                                    }],
+                                }),
+                            },
+                            InlinePointerValue {
+                                offset: 32,
+                                value: Box::new(control),
+                            },
+                        ],
+                    },
+                    ArgValue::Const(0),
+                ],
+            }],
+        };
+        let err = invalid
+            .validate(&descs)
+            .expect_err("wrong varlen control length must be rejected");
+        assert!(err
+            .to_string()
+            .contains("derived inline field has value 32, expected 40"));
+    }
+
+    #[test]
+    fn computes_native_and_packed_struct_layouts() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type natural_hdr {
+                    a int32
+                    b intptr
+                    c int16
+                }
+                type packed_hdr {
+                    a int32
+                    b intptr
+                    c int16
+                } [packed, align[8]]
+                syscall use_hdrs@1 -> int(n ptr[in, natural_hdr], p ptr[in, packed_hdr])
+            "#,
+        )
+        .expect("test target should parse");
+
+        let natural = match &descs[0].args[0] {
+            ArgType::Ptr { inner, .. } => inner.as_ref(),
+            other => panic!("unexpected natural hdr arg: {:?}", other),
+        };
+        let packed = match &descs[0].args[1] {
+            ArgType::Ptr { inner, .. } => inner.as_ref(),
+            other => panic!("unexpected packed hdr arg: {:?}", other),
+        };
+
+        match natural {
+            ArgType::Struct {
+                fields,
+                size,
+                packed,
+                align,
+                ..
+            } => {
+                assert!(!packed);
+                assert_eq!(*align, None);
+                assert_eq!(*size, 24);
+                assert_eq!(
+                    compute_struct_field_offset(fields, 0, false, *packed),
+                    Some(0)
+                );
+                assert_eq!(
+                    compute_struct_field_offset(fields, 1, false, *packed),
+                    Some(8)
+                );
+                assert_eq!(
+                    compute_struct_field_offset(fields, 2, false, *packed),
+                    Some(16)
+                );
+            }
+            other => panic!("unexpected natural hdr type: {:?}", other),
+        }
+
+        match packed {
+            ArgType::Struct {
+                fields,
+                size,
+                packed,
+                align,
+                ..
+            } => {
+                assert!(*packed);
+                assert_eq!(*align, Some(8));
+                assert_eq!(*size, 16);
+                assert_eq!(
+                    compute_struct_field_offset(fields, 0, false, *packed),
+                    Some(0)
+                );
+                assert_eq!(
+                    compute_struct_field_offset(fields, 1, false, *packed),
+                    Some(4)
+                );
+                assert_eq!(
+                    compute_struct_field_offset(fields, 2, false, *packed),
+                    Some(12)
+                );
+            }
+            other => panic!("unexpected packed hdr type: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn validates_inline_pointer_struct_lengths() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type iovec {
+                    base ptr[in, array[int8, 4:8]]
+                    len len[base, intptr]
+                } [size[16]]
+                syscall send_iov@1 -> int(fd const[1, int32], iov ptr[in, iovec], total len[iov:base, intptr])
+            "#,
+        )
+        .expect("test target should parse");
+
+        let valid = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![
+                    ArgValue::Const(1),
+                    ArgValue::Composite {
+                        data: vec![0; 8]
+                            .into_iter()
+                            .chain(encode_scalar_bytes(8, 6))
+                            .collect(),
+                        pointers: vec![InlinePointerValue {
+                            offset: 0,
+                            value: Box::new(ArgValue::Buffer(vec![1, 2, 3, 4, 5, 6])),
+                        }],
+                    },
+                    ArgValue::Const(6),
+                ],
+            }],
+        };
+        valid
+            .validate(&descs)
+            .expect("inline pointer struct should validate");
+
+        let invalid = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![
+                    ArgValue::Const(1),
+                    ArgValue::Composite {
+                        data: vec![0; 8]
+                            .into_iter()
+                            .chain(encode_scalar_bytes(8, 5))
+                            .collect(),
+                        pointers: vec![InlinePointerValue {
+                            offset: 0,
+                            value: Box::new(ArgValue::Buffer(vec![1, 2, 3, 4, 5, 6])),
+                        }],
+                    },
+                    ArgValue::Const(6),
+                ],
+            }],
+        };
+        let err = invalid
+            .validate(&descs)
+            .expect_err("wrong inline pointer length must be rejected");
+        assert!(err
+            .to_string()
+            .contains("derived inline field has value 5, expected 6"));
+    }
+
+    #[test]
+    fn validates_optional_inline_pointer_lengths_as_zero() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type iovec {
+                    base ptr[in, array[int8, 4:8]]
+                    len len[base, intptr]
+                } [size[16]]
+                type send_msghdr {
+                    msg_name ptr[in, buffer[16:16], opt]
+                    msg_namelen len[msg_name, int32]
+                    msg_iov ptr[in, array[iovec, 1:2]]
+                    msg_iovlen len[msg_iov, intptr]
+                    msg_control ptr[in, array[int8, 0:32], opt]
+                    msg_controllen bytesize[msg_control, intptr]
+                    msg_flags const[0, int32]
+                } [size[56]]
+                syscall sendmsg@1 -> int(fd const[1, int32], msg ptr[in, send_msghdr], flags const[0, int32])
+            "#,
+        )
+        .expect("test target should parse");
+
+        let valid = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![
+                    ArgValue::Const(1),
+                    ArgValue::Composite {
+                        data: vec![0; 8]
+                            .into_iter()
+                            .chain(encode_scalar_bytes(4, 0))
+                            .chain(vec![0; 4])
+                            .chain(vec![0; 8])
+                            .chain(encode_scalar_bytes(8, 1))
+                            .chain(vec![0; 8])
+                            .chain(encode_scalar_bytes(8, 0))
+                            .chain(encode_scalar_bytes(4, 0))
+                            .chain(vec![0; 4])
+                            .collect(),
+                        pointers: vec![InlinePointerValue {
+                            offset: 16,
+                            value: Box::new(ArgValue::Composite {
+                                data: vec![0; 8]
+                                    .into_iter()
+                                    .chain(encode_scalar_bytes(8, 5))
+                                    .collect(),
+                                pointers: vec![InlinePointerValue {
+                                    offset: 0,
+                                    value: Box::new(ArgValue::Buffer(vec![1, 2, 3, 4, 5])),
+                                }],
+                            }),
+                        }],
+                    },
+                    ArgValue::Const(0),
+                ],
+            }],
+        };
+        valid
+            .validate(&descs)
+            .expect("null optional inline pointers should derive zero lengths");
+
+        let invalid = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![
+                    ArgValue::Const(1),
+                    ArgValue::Composite {
+                        data: vec![0; 8]
+                            .into_iter()
+                            .chain(encode_scalar_bytes(4, 8))
+                            .chain(vec![0; 4])
+                            .chain(vec![0; 8])
+                            .chain(encode_scalar_bytes(8, 1))
+                            .chain(vec![0; 8])
+                            .chain(encode_scalar_bytes(8, 4))
+                            .chain(encode_scalar_bytes(4, 0))
+                            .chain(vec![0; 4])
+                            .collect(),
+                        pointers: vec![InlinePointerValue {
+                            offset: 16,
+                            value: Box::new(ArgValue::Composite {
+                                data: vec![0; 8]
+                                    .into_iter()
+                                    .chain(encode_scalar_bytes(8, 5))
+                                    .collect(),
+                                pointers: vec![InlinePointerValue {
+                                    offset: 0,
+                                    value: Box::new(ArgValue::Buffer(vec![1, 2, 3, 4, 5])),
+                                }],
+                            }),
+                        }],
+                    },
+                    ArgValue::Const(0),
+                ],
+            }],
+        };
+        let err = invalid
+            .validate(&descs)
+            .expect_err("null optional pointer lengths must validate as zero");
+        assert!(err
+            .to_string()
+            .contains("derived inline field has value 8, expected 0"));
     }
 }

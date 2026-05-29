@@ -136,7 +136,7 @@ uint64  EXEC_INSTR_EOF   // !0u64 end marker
 
 A minimal subset of ~20 syscalls for linux/amd64, covering filesystem operations, network sockets, and memory management:
 
-`openat`, `close`, `read`, `write`, `pipe2`, `dup3`, `socket`, `socketpair`, `listen`, `eventfd2`,  
+`openat`, `close`, `read`, `write`, `writev`, `sendmsg`, `sendmmsg`, `recvmsg`, `pipe2`, `dup3`, `socket`, `socketpair`, `listen`, `eventfd2`,  
 `mmap`, `munmap`, `mprotect`, `mkdirat`, `unlinkat`, `fstat`, `getcwd`,  
 `getpid`, `getuid`, `ioctl`
 
@@ -157,6 +157,51 @@ syzlang-oriented concepts:
 - endian-qualified scalar ranges via `int16be[min:max]`, `int32be[min:max]`, and `int64be[min:max]`
 - typed constants and flags via forms like `const[AF_INET, int16]` and `flags[socket_type, int16]`
 - fixed-size struct blocks like `sockaddr_in { ... } [size[16]]`
+- ranged fixed-element arrays via `array[int8, 4:8]`, `array[qid, 1:3]`, and
+  default short arrays like `array[int8]`
+- variable-sized array elements behind pointer or top-level array values, with
+  preserved per-element boundaries so `array[cmsghdr_like, 1:2]`-style message
+  batches can derive both total byte size and element count without collapsing
+  back to opaque flat buffers
+- trailing variable-sized struct fields when the final field is a fixed-element
+  array, so packed message shapes like `{ count bytesize[data]; data array[...] }`
+  can materialize and validate without falling back to raw buffers
+- inline pointer fields inside fixed-size structs, unions, and arrays of structs,
+  including `iovec`-style layouts where nested `len[...]` fields track pointed-to
+  payload sizes and executor serialization emits nested copyins
+- nested pointer-bearing containers like `msghdr` layouts, where optional inline
+  pointers derive zero lengths when absent and nested `array[iovec]` fields keep
+  per-element payload lengths and aggregate counts aligned
+- output-oriented nested containers like `recv_msghdr`, where inline `ptr[out]`
+  fields materialize zeroed reserved buffers with real capacities instead of
+  collapsing to opaque placeholder pointers
+- default C-style struct padding plus explicit `[packed]` / `align[N]` layout
+  semantics, so `msghdr`-style fixed headers and aligned trailing payload
+  containers derive real field offsets and total sizes instead of packed-byte
+  approximations
+- aligned control-message batches inside `send_msghdr`-style containers, where
+  `msg_control ptr[in, array[cmsghdr_like, ...]]` keeps element boundaries,
+  aligned `cmsg_len` values, and aggregate `msg_controllen` sizes consistent
+  through generation, validation, replay, and executor copyin
+- batched message vectors like `array[send_mmsghdr, 1:2]`, where each fixed-size
+  element embeds a full `msghdr` container plus its own per-message metadata,
+  so `sendmmsg`-style inputs keep nested lengths and optional pointers coherent
+  across multiple messages in one syscall
+- union blocks like `sockaddr_arg [ v4 sockaddr_in v6 buffer[28:28] ]`, including
+  fixed-size `[size[N]]` unions and `[varlen]` unions
+- virtual memory area arguments via `vma`, `vma[opt]`, `vma[N]`, and `vma[min:max]`
+- string arguments via `string`, `string["literal"]`, `string[set_name]`,
+  `string[filename]`, `string[..., N]`, and `stringnoz[...]`
+- top-level string-set definitions like `names = "foo", "bar"`
+- parameterized top-level `type` templates for aliases, structs, and unions, such as
+  `type wrap[PAYLOAD] { payload PAYLOAD }` and `type alias_wrap[PAYLOAD] wrap[PAYLOAD]`
+- parent-derived inline sizes inside fixed-size structs and struct templates via
+  `len[parent, intN]` and `bytesize[parent, intN]`
+- zero-sized `void` fields plus `offsetof[field, intN]` for fixed-size struct
+  layouts, which is enough for small `nlattr`-style headers
+- rooted named-path size targets via forms like `len[arg:field]`,
+  `bytesize[type_name:field]`, `bytesize[parent:parent:field]`,
+  `bytesize[syscall:arg]`, and nested `offsetof[type_name:field:subfield, intN]`
 - bare syzlang-style syscall declarations like `socket(...) sock` and variant names like `socket$inet(...) sock_in` for the currently bundled linux/amd64 syscall subset
 - basic syscall attributes via trailing groups like `(automatic_helper)`, `(no_generate)`, and `(disabled)`
 - derived length arguments via `len[target]` and `len[target, int32]`
@@ -164,7 +209,8 @@ syzlang-oriented concepts:
 - directional blob buffers via `buffer[in]`, `buffer[out]`, and `buffer[inout]`
 - optional pointers via `ptr[dir, inner, opt]`
 - syscall arguments built from `const[...]`, `flags[...]`, `filename`, `buffer[min:max]`,
-  `array[inner; len]`, and `ptr[in|out|inout; inner]`
+  `array[inner; len]` (including pointer-backed arrays of variable-sized
+  elements), and `ptr[in|out|inout; inner]`
 
 For a reusable smoke-test target that is closer to upstream `sys/linux/socket.txt`
 style than the builtin minimal file, see `descriptions/linux/socket-subset.txt`
@@ -184,7 +230,7 @@ the parser and serializer without defaulting into a blocking receive loop.
 - Only `sandbox=none` mode is supported
 - The builtin target is still a small curated linux/amd64 subset, not full syzkaller coverage
 - Copyout-backed result passing is implemented for resource returns and fixed-size output resources, but generic scalar/output modeling is still incomplete
-- The description DSL still lacks unions, templates, checksums, vmas, and most of the larger syzlang type system
+- The description DSL still lacks `self` relations, conditional fields, checksums, bitfields, and most of the larger syzlang type system
 - Bare syscall-name lookup only covers the currently bundled linux/amd64 syscall subset
 - No network sync with a syzkaller manager; runs standalone
 - Multi-VM / multi-proc fuzzing is still pending

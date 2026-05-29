@@ -365,6 +365,7 @@ fn run_instance(
                     &prog_desc,
                     None,
                     None,
+                    None,
                 );
                 crash::save_crash(
                     &cfg.workdir,
@@ -392,6 +393,7 @@ fn run_instance(
                     "crash",
                     &title,
                     &prog_desc,
+                    None,
                     None,
                     None,
                 );
@@ -539,6 +541,7 @@ fn run_instance(
                     "timeout",
                     "manager_request_timeout",
                     &prog_desc,
+                    Some(&prog),
                     Some(&prog_shape),
                     Some(&timeout_profile),
                 );
@@ -648,6 +651,7 @@ fn run_instance(
                             "timeout",
                             "executor_reported_hang",
                             &prog_desc,
+                            Some(&prog),
                             Some(&prog_shape),
                             Some(&timeout_profile),
                         );
@@ -784,6 +788,7 @@ fn run_instance(
                                 "crash",
                                 &title,
                                 &prog_desc,
+                                Some(&prog),
                                 Some(&prog_shape),
                                 Some(&timeout_profile),
                             );
@@ -996,6 +1001,7 @@ fn build_artifact_repro_info(
     artifact_type: &str,
     summary: &str,
     program_desc: &str,
+    program_ir: Option<&program::Program>,
     shape_desc: Option<&str>,
     profile_desc: Option<&str>,
 ) -> crash::ArtifactReproInfo {
@@ -1021,6 +1027,7 @@ fn build_artifact_repro_info(
         vm_image: cfg.image.clone(),
         vm_cmdline: cfg.vm.cmdline.clone(),
         program: program_desc.to_string(),
+        program_ir: program_ir.cloned(),
         shape: shape_desc.map(str::to_string),
         profile: profile_desc.map(str::to_string),
     }
@@ -1261,8 +1268,8 @@ mod tests {
     use crate::avoidance::AvoidanceState;
     use crate::config::{Config, VmConfig};
     use crate::program::{
-        ArgType, BufferDir, Call, LengthKind, Program, PtrDir, ResourceDesc, ReturnType,
-        ScalarEndian, SyscallAttrs, SyscallDesc,
+        ArgType, BufferDir, Call, LengthKind, LengthTarget, LengthTargetRoot, Program, PtrDir,
+        ResourceDesc, ReturnType, ScalarEndian, SyscallAttrs, SyscallDesc,
     };
     use std::collections::{HashMap, HashSet};
 
@@ -1371,6 +1378,7 @@ mod tests {
             SyscallDesc {
                 name: "close".into(),
                 id: 0,
+                arg_names: vec!["fd".into()],
                 args: vec![ArgType::Resource(fd.clone())],
                 ret: ReturnType::Int,
                 attrs: SyscallAttrs::default(),
@@ -1378,6 +1386,7 @@ mod tests {
             SyscallDesc {
                 name: "bind$inet".into(),
                 id: 1,
+                arg_names: vec!["fd".into(), "addr".into(), "addrlen".into()],
                 args: vec![
                     ArgType::Resource(fd.clone()),
                     ArgType::Ptr {
@@ -1390,7 +1399,10 @@ mod tests {
                         optional: false,
                     },
                     ArgType::Len {
-                        target: 1,
+                        target: LengthTarget {
+                            root: LengthTargetRoot::Arg("addr".into()),
+                            fields: Vec::new(),
+                        },
                         size: 4,
                         kind: LengthKind::Bytes,
                     },
@@ -1401,6 +1413,7 @@ mod tests {
             SyscallDesc {
                 name: "accept$inet".into(),
                 id: 2,
+                arg_names: vec!["fd".into(), "peer".into(), "peerlen".into()],
                 args: vec![
                     ArgType::Resource(fd),
                     ArgType::Ptr {
@@ -1414,7 +1427,10 @@ mod tests {
                     },
                     ArgType::Ptr {
                         inner: Box::new(ArgType::Len {
-                            target: 1,
+                            target: LengthTarget {
+                                root: LengthTargetRoot::Arg("peer".into()),
+                                fields: Vec::new(),
+                            },
                             size: 4,
                             kind: LengthKind::Bytes,
                         }),
@@ -1428,6 +1444,7 @@ mod tests {
             SyscallDesc {
                 name: "rename".into(),
                 id: 3,
+                arg_names: vec!["old".into(), "new".into()],
                 args: vec![ArgType::Filename, ArgType::Filename],
                 ret: ReturnType::Int,
                 attrs: SyscallAttrs::default(),
@@ -1435,6 +1452,7 @@ mod tests {
             SyscallDesc {
                 name: "pure_const".into(),
                 id: 4,
+                arg_names: vec!["value".into()],
                 args: vec![ArgType::Const {
                     size: 4,
                     values: vec![],

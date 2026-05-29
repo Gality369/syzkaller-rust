@@ -45,6 +45,7 @@ pub fn serialize_program(
                 (ArgType::Ptr { .. }, _) | (ArgType::Filename, _) => {
                     let addr = DATA_OFFSET + next_data_page * PAGE_SIZE;
                     data_addrs.push((arg_idx, addr));
+                    next_data_page += 1;
 
                     // Emit copyin for input data
                     match (arg_type, arg_val) {
@@ -55,24 +56,42 @@ pub fn serialize_program(
                                 ..
                             },
                             ArgValue::Buffer(data),
-                        ) => {
-                            w.write_val(EXEC_INSTR_COPYIN);
-                            w.write_val(addr - DATA_OFFSET);
-                            w.write_val(EXEC_ARG_DATA);
-                            w.write_val(data.len() as u64);
-                            w.write_data(data);
-                        }
+                        ) => emit_copyin_bytes(&mut w, addr, data),
+                        (
+                            ArgType::Ptr {
+                                inner: _,
+                                dir: PtrDir::In | PtrDir::InOut,
+                                ..
+                            },
+                            ArgValue::Composite { data, pointers },
+                        ) => emit_composite_copyin(
+                            &mut w,
+                            addr,
+                            data,
+                            pointers,
+                            &mut next_data_page,
+                        )?,
+                        (
+                            ArgType::Ptr {
+                                inner: _,
+                                dir: PtrDir::In | PtrDir::InOut,
+                                ..
+                            },
+                            ArgValue::Array { data, pointers, .. },
+                        ) => emit_composite_copyin(
+                            &mut w,
+                            addr,
+                            data,
+                            pointers,
+                            &mut next_data_page,
+                        )?,
                         (ArgType::Filename, ArgValue::Filename(name)) => {
                             let data = {
                                 let mut d = name.as_bytes().to_vec();
                                 d.push(0); // null terminator
                                 d
                             };
-                            w.write_val(EXEC_INSTR_COPYIN);
-                            w.write_val(addr - DATA_OFFSET);
-                            w.write_val(EXEC_ARG_DATA);
-                            w.write_val(data.len() as u64);
-                            w.write_data(&data);
+                            emit_copyin_bytes(&mut w, addr, &data);
                         }
                         (
                             ArgType::Ptr {
@@ -84,7 +103,6 @@ pub fn serialize_program(
                         }
                         _ => {}
                     }
-                    next_data_page += 1;
                 }
                 _ => {}
             }
@@ -123,6 +141,15 @@ pub fn serialize_program(
                     w.write_val(meta_const(*size, 0, 0, 0, 0));
                     w.write_val(*val);
                 }
+                (ArgType::Vma { .. }, ArgValue::Vma { addr, size: _ }) => {
+                    w.write_val(EXEC_ARG_ADDR64);
+                    w.write_val(*addr - DATA_OFFSET);
+                }
+                (ArgType::Vma { .. }, ArgValue::Null) => {
+                    w.write_val(EXEC_ARG_CONST);
+                    w.write_val(meta_const(8, 0, 0, 0, 0));
+                    w.write_val(0);
+                }
                 (ArgType::Resource(resource), ArgValue::Const(val)) => {
                     w.write_val(EXEC_ARG_CONST);
                     w.write_val(meta_const(resource.size, 0, 0, 0, 0));
@@ -147,6 +174,13 @@ pub fn serialize_program(
                     w.write_val(meta_const(resource.size, 0, 0, 0, 0));
                     w.write_val(resource.default_value());
                 }
+                (ArgType::Array { .. }, ArgValue::Buffer(data))
+                | (ArgType::Array { .. }, ArgValue::Composite { data, .. })
+                | (ArgType::Array { .. }, ArgValue::Array { data, .. }) => {
+                    w.write_val(EXEC_ARG_DATA);
+                    w.write_val(data.len() as u64);
+                    w.write_data(data);
+                }
                 (ArgType::Array { .. }, _) => {
                     w.write_val(EXEC_ARG_CONST);
                     w.write_val(meta_const(8, 0, 0, 0, 0));
@@ -168,6 +202,11 @@ pub fn serialize_program(
                         w.write_val(meta_const(8, 0, 0, 0, 0));
                         w.write_val(0);
                     }
+                }
+                (ArgType::String { .. }, ArgValue::Buffer(data)) => {
+                    w.write_val(EXEC_ARG_DATA);
+                    w.write_val(data.len() as u64);
+                    w.write_data(data);
                 }
                 (ArgType::Buffer { .. }, ArgValue::Buffer(data)) => {
                     w.write_val(EXEC_ARG_DATA);
@@ -212,6 +251,91 @@ pub fn serialize_program(
     // EOF
     w.write_val(EXEC_INSTR_EOF);
     Ok(w.buf)
+}
+
+fn emit_copyin_bytes(w: &mut ExecWriter, addr: u64, data: &[u8]) {
+    w.write_val(EXEC_INSTR_COPYIN);
+    w.write_val(addr - DATA_OFFSET);
+    w.write_val(EXEC_ARG_DATA);
+    w.write_val(data.len() as u64);
+    w.write_data(data);
+}
+
+fn emit_arg_value_copyin(
+    w: &mut ExecWriter,
+    addr: u64,
+    value: &ArgValue,
+    next_data_page: &mut u64,
+) -> Result<(), ValidationError> {
+    match value {
+        ArgValue::Buffer(data) => {
+            emit_copyin_bytes(w, addr, data);
+            Ok(())
+        }
+        ArgValue::Composite { data, pointers } => {
+            emit_composite_copyin(w, addr, data, pointers, next_data_page)
+        }
+        ArgValue::Array { data, pointers, .. } => {
+            emit_composite_copyin(w, addr, data, pointers, next_data_page)
+        }
+        ArgValue::Filename(name) => {
+            let mut data = name.as_bytes().to_vec();
+            data.push(0);
+            emit_copyin_bytes(w, addr, &data);
+            Ok(())
+        }
+        ArgValue::Null | ArgValue::OutPtr => Ok(()),
+        ArgValue::Const(value) => {
+            emit_copyin_bytes(w, addr, &encode_scalar_bytes(8, *value));
+            Ok(())
+        }
+        ArgValue::Vma {
+            addr: value_addr, ..
+        } => {
+            emit_copyin_bytes(w, addr, &encode_scalar_bytes(8, *value_addr));
+            Ok(())
+        }
+        ArgValue::ResultRef(_) => Err(ValidationError::new(
+            "inline pointer copyin does not support result references yet",
+        )),
+    }
+}
+
+fn emit_composite_copyin(
+    w: &mut ExecWriter,
+    addr: u64,
+    data: &[u8],
+    pointers: &[InlinePointerValue],
+    next_data_page: &mut u64,
+) -> Result<(), ValidationError> {
+    let mut patched = data.to_vec();
+    for pointer in pointers {
+        let end = pointer
+            .offset
+            .checked_add(8)
+            .ok_or_else(|| ValidationError::new("inline pointer offset overflow"))?;
+        let slot = patched.get_mut(pointer.offset..end).ok_or_else(|| {
+            ValidationError::new("inline pointer slot falls outside composite data")
+        })?;
+        match pointer.value.as_ref() {
+            ArgValue::Null => {
+                slot.copy_from_slice(&0u64.to_le_bytes());
+            }
+            ArgValue::OutPtr => {
+                let nested_addr = DATA_OFFSET + *next_data_page * PAGE_SIZE;
+                *next_data_page += 1;
+                slot.copy_from_slice(&nested_addr.to_le_bytes());
+            }
+            nested => {
+                let nested_addr = DATA_OFFSET + *next_data_page * PAGE_SIZE;
+                *next_data_page += 1;
+                slot.copy_from_slice(&nested_addr.to_le_bytes());
+                emit_arg_value_copyin(w, nested_addr, nested, next_data_page)?;
+            }
+        }
+    }
+    emit_copyin_bytes(w, addr, &patched);
+    Ok(())
 }
 
 /// Encode const metadata: size | (format << 8) | (bf_offset << 16) | (bf_len << 24) | (pid_stride << 32)
@@ -262,6 +386,13 @@ impl ExecWriter {
 mod tests {
     use super::*;
 
+    fn syscall_idx(descs: &[SyscallDesc], name: &str) -> usize {
+        descs
+            .iter()
+            .position(|desc| desc.name == name)
+            .unwrap_or_else(|| panic!("missing syscall {name}"))
+    }
+
     #[test]
     fn test_varint_encoding() {
         let mut w = ExecWriter::new();
@@ -276,7 +407,7 @@ mod tests {
         let descs = get_syscall_descs();
         let prog = Program {
             calls: vec![Call {
-                syscall_idx: 17, // getpid
+                syscall_idx: syscall_idx(&descs, "getpid"),
                 args: vec![],
             }],
         };
@@ -290,14 +421,16 @@ mod tests {
     #[test]
     fn test_resource_result_argument_encoding() {
         let descs = get_syscall_descs();
+        let eventfd2 = syscall_idx(&descs, "eventfd2");
+        let close = syscall_idx(&descs, "close");
         let prog = Program {
             calls: vec![
                 Call {
-                    syscall_idx: 9, // eventfd2
+                    syscall_idx: eventfd2,
                     args: vec![ArgValue::Const(0), ArgValue::Const(0)],
                 },
                 Call {
-                    syscall_idx: 1, // close
+                    syscall_idx: close,
                     args: vec![ArgValue::ResultRef(ResultRef {
                         call_idx: 0,
                         result_idx: 0,
@@ -336,17 +469,19 @@ mod tests {
     #[test]
     fn test_invalid_program_is_rejected_before_serialization() {
         let descs = get_syscall_descs();
+        let close = syscall_idx(&descs, "close");
+        let eventfd2 = syscall_idx(&descs, "eventfd2");
         let prog = Program {
             calls: vec![
                 Call {
-                    syscall_idx: 1, // close(fd)
+                    syscall_idx: close,
                     args: vec![ArgValue::ResultRef(ResultRef {
                         call_idx: 1,
                         result_idx: 0,
                     })],
                 },
                 Call {
-                    syscall_idx: 9, // eventfd2 -> fd
+                    syscall_idx: eventfd2,
                     args: vec![ArgValue::Const(0), ArgValue::Const(0)],
                 },
             ],
@@ -362,21 +497,23 @@ mod tests {
     #[test]
     fn test_pipe2_pointer_results_emit_copyout_instructions() {
         let descs = get_syscall_descs();
+        let pipe2 = syscall_idx(&descs, "pipe2");
+        let close = syscall_idx(&descs, "close");
         let prog = Program {
             calls: vec![
                 Call {
-                    syscall_idx: 4, // pipe2
+                    syscall_idx: pipe2,
                     args: vec![ArgValue::OutPtr, ArgValue::Const(0)],
                 },
                 Call {
-                    syscall_idx: 1, // close(fd)
+                    syscall_idx: close,
                     args: vec![ArgValue::ResultRef(ResultRef {
                         call_idx: 0,
                         result_idx: 0,
                     })],
                 },
                 Call {
-                    syscall_idx: 1, // close(fd)
+                    syscall_idx: close,
                     args: vec![ArgValue::ResultRef(ResultRef {
                         call_idx: 0,
                         result_idx: 1,
@@ -447,10 +584,73 @@ mod tests {
         assert!(addr_values.is_empty());
     }
 
+    #[test]
+    fn test_inline_pointer_struct_emits_nested_copyins() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type iovec {
+                    base ptr[in, array[int8, 4:8]]
+                    len len[base, intptr]
+                } [size[16]]
+                syscall writev@8027 -> int(fd const[1, int32], iov ptr[in, iovec], iovcnt const[1, int32])
+            "#,
+        )
+        .expect("iovec target should parse");
+        let payload = b"abcdef".to_vec();
+        let prog = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![
+                    ArgValue::Const(1),
+                    ArgValue::Composite {
+                        data: encode_scalar_bytes(8, 0)
+                            .into_iter()
+                            .chain(encode_scalar_bytes(8, payload.len() as u64))
+                            .collect(),
+                        pointers: vec![InlinePointerValue {
+                            offset: 0,
+                            value: Box::new(ArgValue::Buffer(payload.clone())),
+                        }],
+                    },
+                    ArgValue::Const(1),
+                ],
+            }],
+        };
+
+        let data = serialize_program(&prog, &descs).expect("composite iovec should serialize");
+        let events = parse_exec_events(&data);
+        let copyins: Vec<(u64, Vec<u8>)> = events
+            .iter()
+            .filter_map(|event| match event {
+                ParsedEvent::CopyinData { addr, data } => Some((*addr, data.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(copyins.len(), 2);
+
+        let nested_copyin = copyins
+            .iter()
+            .find(|(_, data)| data.as_slice() == payload.as_slice())
+            .expect("nested payload copyin should exist");
+        let root_copyin = copyins
+            .iter()
+            .find(|(_, data)| data.len() == 16)
+            .expect("root iovec copyin should exist");
+
+        assert_ne!(nested_copyin.0, root_copyin.0);
+        let nested_absolute_addr = DATA_OFFSET + nested_copyin.0;
+        assert_eq!(&root_copyin.1[0..8], &nested_absolute_addr.to_le_bytes());
+        assert_eq!(&root_copyin.1[8..16], &(payload.len() as u64).to_le_bytes());
+    }
+
     #[derive(Debug, PartialEq, Eq)]
     enum ParsedEvent {
         CallReturnCopyout {
             idx: u64,
+        },
+        CopyinData {
+            addr: u64,
+            data: Vec<u8>,
         },
         ConstArg {
             meta: u64,
@@ -480,8 +680,8 @@ mod tests {
             match opcode {
                 EXEC_INSTR_EOF => break,
                 EXEC_INSTR_COPYIN => {
-                    let _addr = read_exec_value(data, &mut index);
-                    parse_arg_payload(data, &mut index, &mut events);
+                    let addr = read_exec_value(data, &mut index);
+                    parse_arg_payload(data, &mut index, &mut events, Some(addr));
                 }
                 EXEC_INSTR_COPYOUT => {
                     let idx = read_exec_value(data, &mut index);
@@ -499,7 +699,7 @@ mod tests {
                     }
                     let num_args = read_exec_value(data, &mut index) as usize;
                     for _ in 0..num_args {
-                        parse_arg_payload(data, &mut index, &mut events);
+                        parse_arg_payload(data, &mut index, &mut events, None);
                     }
                 }
             }
@@ -508,7 +708,12 @@ mod tests {
         events
     }
 
-    fn parse_arg_payload(data: &[u8], index: &mut usize, events: &mut Vec<ParsedEvent>) {
+    fn parse_arg_payload(
+        data: &[u8],
+        index: &mut usize,
+        events: &mut Vec<ParsedEvent>,
+        copyin_addr: Option<u64>,
+    ) {
         let arg_kind = read_exec_value(data, index);
         match arg_kind {
             EXEC_ARG_CONST => {
@@ -534,7 +739,14 @@ mod tests {
             }
             EXEC_ARG_DATA => {
                 let size = read_exec_value(data, index) as usize;
+                let payload = data[*index..*index + size].to_vec();
                 *index += size;
+                if let Some(addr) = copyin_addr {
+                    events.push(ParsedEvent::CopyinData {
+                        addr,
+                        data: payload,
+                    });
+                }
             }
             other => panic!("unexpected exec arg kind in test parser: {}", other),
         }

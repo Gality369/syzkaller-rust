@@ -5,6 +5,45 @@ use std::collections::{HashMap, HashSet};
 const MAX_CALLS: usize = 10;
 const MIN_CALLS: usize = 1;
 
+#[derive(Default)]
+struct InlineObject {
+    data: Vec<u8>,
+    pointers: Vec<InlinePointerValue>,
+}
+
+impl InlineObject {
+    fn into_arg_value(self) -> ArgValue {
+        if self.pointers.is_empty() {
+            ArgValue::Buffer(self.data)
+        } else {
+            ArgValue::Composite {
+                data: self.data,
+                pointers: self.pointers,
+            }
+        }
+    }
+}
+
+fn array_inline_arg_value(elements: Vec<InlineObject>) -> ArgValue {
+    let mut data = Vec::new();
+    let mut pointers = Vec::new();
+    let mut element_sizes = Vec::with_capacity(elements.len());
+    for element in elements {
+        let base = data.len();
+        element_sizes.push(element.data.len());
+        data.extend_from_slice(&element.data);
+        pointers.extend(element.pointers.into_iter().map(|mut pointer| {
+            pointer.offset += base;
+            pointer
+        }));
+    }
+    ArgValue::Array {
+        data,
+        pointers,
+        element_sizes,
+    }
+}
+
 /// Generate a random program from scratch.
 pub fn generate(descs: &[SyscallDesc], rng: &mut impl Rng) -> Program {
     let choice_table = SyscallChoiceTable::build(descs, &[]);
@@ -167,7 +206,7 @@ fn generate_arg(
             }
         }
         ArgType::Len { target, kind, .. } => {
-            let value = derived_length_for_arg(desc, generated_args, *target, *kind).unwrap_or(0);
+            let value = derive_target_length(desc, generated_args, target, *kind).unwrap_or(0);
             ArgValue::Const(value as u64)
         }
         ArgType::Resource(resource) => {
@@ -202,10 +241,51 @@ fn generate_arg(
                 }
             }
         }
-        ArgType::Array { .. } => ArgValue::Null,
+        ArgType::Void => ArgValue::Buffer(Vec::new()),
+        ArgType::Array {
+            inner,
+            min_len,
+            max_len,
+        } if arg_type_fixed_size(inner).is_none() => {
+            generate_array_arg_value(inner, *min_len, *max_len, desc, generated_args, rng)
+                .unwrap_or_else(|| ArgValue::Array {
+                    data: Vec::new(),
+                    pointers: Vec::new(),
+                    element_sizes: Vec::new(),
+                })
+        }
+        ArgType::Array { .. } => generate_inline_arg_value(arg_type, desc, generated_args, rng)
+            .unwrap_or_else(|| ArgValue::Buffer(Vec::new())),
         ArgType::Struct { size, .. } => {
-            let bytes = generate_inline_bytes(arg_type, rng).unwrap_or_else(|| vec![0; *size]);
-            ArgValue::Buffer(bytes)
+            generate_inline_arg_value(arg_type, desc, generated_args, rng)
+                .unwrap_or_else(|| ArgValue::Buffer(vec![0; *size]))
+        }
+        ArgType::Union {
+            fields,
+            size,
+            varlen,
+            ..
+        } => generate_inline_arg_value(arg_type, desc, generated_args, rng).unwrap_or_else(|| {
+            ArgValue::Buffer(vec![0; union_fallback_size(fields, *size, *varlen)])
+        }),
+        ArgType::String {
+            values,
+            noz,
+            fixed_len,
+            filename,
+        } => ArgValue::Buffer(generate_string_bytes(
+            values, *noz, *fixed_len, *filename, rng,
+        )),
+        ArgType::Vma {
+            min_pages,
+            max_pages,
+            optional,
+        } => {
+            if *optional && rng.gen_bool(0.35) {
+                ArgValue::Null
+            } else {
+                generate_vma(*min_pages, *max_pages, rng)
+            }
         }
         ArgType::Buffer {
             min_size,
@@ -245,12 +325,41 @@ fn generate_pointer_arg_value(
         }
         ArgType::Len { target, size, kind } => {
             let value =
-                derived_length_for_arg(desc, generated_args, *target, *kind).unwrap_or(0) as u64;
+                derive_target_length(desc, generated_args, target, *kind).unwrap_or(0) as u64;
             ArgValue::Buffer(encode_scalar_bytes(*size, value))
         }
-        ArgType::Struct { size, .. } => generate_inline_bytes(inner, rng)
-            .map(ArgValue::Buffer)
+        ArgType::String {
+            values,
+            noz,
+            fixed_len,
+            filename,
+        } => ArgValue::Buffer(generate_string_bytes(
+            values, *noz, *fixed_len, *filename, rng,
+        )),
+        ArgType::Array {
+            inner: array_inner,
+            min_len,
+            max_len,
+        } if arg_type_fixed_size(array_inner).is_none() => {
+            generate_array_arg_value(array_inner, *min_len, *max_len, desc, generated_args, rng)
+                .unwrap_or_else(|| ArgValue::Array {
+                    data: Vec::new(),
+                    pointers: Vec::new(),
+                    element_sizes: Vec::new(),
+                })
+        }
+        ArgType::Array { .. } => generate_inline_arg_value(inner, desc, generated_args, rng)
+            .unwrap_or_else(|| ArgValue::Buffer(Vec::new())),
+        ArgType::Struct { size, .. } => generate_inline_arg_value(inner, desc, generated_args, rng)
             .unwrap_or_else(|| ArgValue::Buffer(vec![0; *size])),
+        ArgType::Union {
+            fields,
+            size,
+            varlen,
+            ..
+        } => generate_inline_arg_value(inner, desc, generated_args, rng).unwrap_or_else(|| {
+            ArgValue::Buffer(vec![0; union_fallback_size(fields, *size, *varlen)])
+        }),
         _ => {
             if let Some(size) = arg_type_fixed_size(inner) {
                 let mut data = vec![0u8; size];
@@ -265,18 +374,119 @@ fn generate_pointer_arg_value(
     }
 }
 
-fn derived_length_for_arg(
+fn generate_inline_arg_value(
+    arg_type: &ArgType,
     desc: &SyscallDesc,
     generated_args: &[ArgValue],
-    target: usize,
-    kind: LengthKind,
-) -> Option<usize> {
-    let target_type = desc.args.get(target)?;
-    let target_value = generated_args.get(target)?;
-    derived_arg_length(target_type, target_value, kind)
+    rng: &mut impl Rng,
+) -> Option<ArgValue> {
+    let object = generate_inline_object(arg_type, desc, generated_args, rng)?;
+    Some(object.into_arg_value())
 }
 
-fn generate_inline_bytes(arg_type: &ArgType, rng: &mut impl Rng) -> Option<Vec<u8>> {
+fn generate_array_arg_value(
+    inner: &ArgType,
+    min_len: usize,
+    max_len: usize,
+    desc: &SyscallDesc,
+    generated_args: &[ArgValue],
+    rng: &mut impl Rng,
+) -> Option<ArgValue> {
+    let len = if min_len == max_len {
+        min_len
+    } else {
+        rng.gen_range(min_len..=max_len)
+    };
+    let mut elements = Vec::with_capacity(len);
+    for _ in 0..len {
+        elements.push(generate_inline_object(inner, desc, generated_args, rng)?);
+    }
+    Some(array_inline_arg_value(elements))
+}
+
+fn generate_reserved_inline_arg_value(
+    arg_type: &ArgType,
+    desc: &SyscallDesc,
+    generated_args: &[ArgValue],
+    rng: &mut impl Rng,
+) -> Option<ArgValue> {
+    let mut object = generate_reserved_inline_object_raw(arg_type, desc, generated_args, rng)?;
+    patch_inline_len_fields(
+        arg_type,
+        Some(desc),
+        Some(generated_args),
+        &[],
+        &mut object.data,
+        object.pointers.as_slice(),
+        0,
+    )?;
+    Some(object.into_arg_value())
+}
+
+fn generate_reserved_array_arg_value(
+    inner: &ArgType,
+    min_len: usize,
+    max_len: usize,
+    desc: &SyscallDesc,
+    generated_args: &[ArgValue],
+    rng: &mut impl Rng,
+) -> Option<ArgValue> {
+    let len = if min_len == max_len {
+        min_len
+    } else {
+        rng.gen_range(min_len..=max_len)
+    };
+    let mut elements = Vec::with_capacity(len);
+    for _ in 0..len {
+        let mut object = generate_reserved_inline_object_raw(inner, desc, generated_args, rng)?;
+        patch_inline_len_fields(
+            inner,
+            Some(desc),
+            Some(generated_args),
+            &[],
+            &mut object.data,
+            object.pointers.as_slice(),
+            0,
+        )?;
+        elements.push(object);
+    }
+    Some(array_inline_arg_value(elements))
+}
+
+fn generate_inline_bytes(
+    arg_type: &ArgType,
+    desc: &SyscallDesc,
+    generated_args: &[ArgValue],
+    rng: &mut impl Rng,
+) -> Option<Vec<u8>> {
+    Some(generate_inline_object(arg_type, desc, generated_args, rng)?.data)
+}
+
+fn generate_inline_object(
+    arg_type: &ArgType,
+    desc: &SyscallDesc,
+    generated_args: &[ArgValue],
+    rng: &mut impl Rng,
+) -> Option<InlineObject> {
+    let mut object = generate_inline_object_raw(arg_type, desc, generated_args, rng)?;
+    patch_inline_len_fields(
+        arg_type,
+        Some(desc),
+        Some(generated_args),
+        &[],
+        &mut object.data,
+        object.pointers.as_slice(),
+        0,
+    )?;
+    Some(object)
+}
+
+fn generate_inline_object_raw(
+    arg_type: &ArgType,
+    desc: &SyscallDesc,
+    generated_args: &[ArgValue],
+    rng: &mut impl Rng,
+) -> Option<InlineObject> {
     match arg_type {
         ArgType::Const {
             size,
@@ -295,39 +505,649 @@ fn generate_inline_bytes(arg_type: &ArgType, rng: &mut impl Rng) -> Option<Vec<u
             } else {
                 random_value_for_size(*size, rng)
             };
-            Some(encode_scalar_bytes_endian(*size, value, *endian))
+            Some(InlineObject {
+                data: encode_scalar_bytes_endian(*size, value, *endian),
+                pointers: Vec::new(),
+            })
         }
-        ArgType::Resource(resource) => {
-            Some(encode_scalar_bytes(resource.size, resource.default_value()))
-        }
-        ArgType::Array { inner, len } => {
-            let mut out = Vec::new();
-            for _ in 0..*len {
-                out.extend(generate_inline_bytes(inner, rng)?);
+        ArgType::Resource(resource) => Some(InlineObject {
+            data: encode_scalar_bytes(resource.size, resource.default_value()),
+            pointers: Vec::new(),
+        }),
+        ArgType::Array {
+            inner,
+            min_len,
+            max_len,
+        } => {
+            let len = if min_len == max_len {
+                *min_len
+            } else {
+                rng.gen_range(*min_len..=*max_len)
+            };
+            let mut out = InlineObject::default();
+            for _ in 0..len {
+                let child = generate_inline_object_raw(inner, desc, generated_args, rng)?;
+                let base = out.data.len();
+                out.data.extend_from_slice(&child.data);
+                out.pointers
+                    .extend(child.pointers.into_iter().map(|mut pointer| {
+                        pointer.offset += base;
+                        pointer
+                    }));
             }
             Some(out)
         }
-        ArgType::Struct { fields, size } => {
-            let mut out = Vec::new();
-            for field in fields {
-                out.extend(generate_inline_bytes(field, rng)?);
+        ArgType::Void => Some(InlineObject::default()),
+        ArgType::Struct {
+            fields,
+            size,
+            varlen,
+            packed,
+            align,
+            ..
+        } => {
+            let mut out = InlineObject::default();
+            for (idx, field) in fields.iter().enumerate() {
+                let field_offset = compute_struct_field_offset(fields, idx, *varlen, *packed)?;
+                out.data.resize(field_offset, 0);
+                let child = generate_inline_object_raw(field, desc, generated_args, rng)?;
+                let base = field_offset;
+                out.data.extend_from_slice(&child.data);
+                out.pointers
+                    .extend(child.pointers.into_iter().map(|mut pointer| {
+                        pointer.offset += base;
+                        pointer
+                    }));
             }
-            out.resize(*size, 0);
+            if !*varlen {
+                out.data.resize(*size, 0);
+            } else {
+                let struct_align = struct_type_alignment(fields, *packed, *align).ok()?;
+                let final_size = if struct_align <= 1 {
+                    out.data.len()
+                } else {
+                    out.data
+                        .len()
+                        .checked_add(struct_align - 1)
+                        .map(|rounded| rounded & !(struct_align - 1))?
+                };
+                out.data.resize(final_size, 0);
+            }
             Some(out)
         }
+        ArgType::Union {
+            fields,
+            size,
+            varlen,
+            packed,
+            align,
+            ..
+        } => {
+            let field = fields.get(rng.gen_range(0..fields.len()))?;
+            let mut out = generate_inline_object_raw(field, desc, generated_args, rng)?;
+            if !*varlen {
+                out.data.resize(*size, 0);
+            } else {
+                let union_align = union_type_alignment(fields, *packed, *align).ok()?;
+                let final_size = if union_align <= 1 {
+                    out.data.len()
+                } else {
+                    out.data
+                        .len()
+                        .checked_add(union_align - 1)
+                        .map(|rounded| rounded & !(union_align - 1))?
+                };
+                out.data.resize(final_size, 0);
+            }
+            Some(out)
+        }
+        ArgType::String {
+            values,
+            noz,
+            fixed_len,
+            filename,
+        } => Some(InlineObject {
+            data: generate_string_bytes(values, *noz, *fixed_len, *filename, rng),
+            pointers: Vec::new(),
+        }),
         ArgType::Buffer {
             min_size,
             max_size,
             dir,
-        } if min_size == max_size => {
-            let mut data = vec![0u8; *max_size];
+        } => {
+            let size = if min_size == max_size {
+                *max_size
+            } else {
+                rng.gen_range(*min_size..=*max_size)
+            };
+            let mut data = vec![0u8; size];
             if *dir != BufferDir::Out {
                 rng.fill(&mut data[..]);
             }
-            Some(data)
+            Some(InlineObject {
+                data,
+                pointers: Vec::new(),
+            })
         }
-        ArgType::Len { size, .. } => Some(vec![0; *size]),
-        _ => None,
+        ArgType::Len { size, .. } => Some(InlineObject {
+            data: vec![0; *size],
+            pointers: Vec::new(),
+        }),
+        ArgType::Ptr {
+            inner,
+            dir,
+            optional,
+        } => {
+            let mut object = InlineObject {
+                data: vec![0; 8],
+                pointers: Vec::new(),
+            };
+            if *optional && rng.gen_bool(0.35) {
+                return Some(object);
+            }
+            let value = match dir {
+                PtrDir::Out => {
+                    generate_reserved_pointer_arg_value(inner, desc, generated_args, rng)
+                }
+                PtrDir::In | PtrDir::InOut => {
+                    generate_pointer_arg_value(desc, generated_args, inner, dir, rng)
+                }
+            };
+            object.pointers.push(InlinePointerValue {
+                offset: 0,
+                value: Box::new(value),
+            });
+            Some(object)
+        }
+        ArgType::Vma {
+            min_pages,
+            max_pages,
+            optional,
+        } => Some(InlineObject {
+            data: match generate_vma(*min_pages, *max_pages, rng) {
+                ArgValue::Vma { addr, .. } => encode_scalar_bytes(8, addr),
+                ArgValue::Null if *optional => encode_scalar_bytes(8, 0),
+                _ => encode_scalar_bytes(8, 0),
+            },
+            pointers: Vec::new(),
+        }),
+        ArgType::Filename => {
+            let mut data = random_filename(rng).into_bytes();
+            data.push(0);
+            Some(InlineObject {
+                data,
+                pointers: Vec::new(),
+            })
+        }
+    }
+}
+
+fn generate_reserved_pointer_arg_value(
+    inner: &ArgType,
+    desc: &SyscallDesc,
+    generated_args: &[ArgValue],
+    rng: &mut impl Rng,
+) -> ArgValue {
+    match inner {
+        ArgType::Const { size, .. } | ArgType::Len { size, .. } => ArgValue::Buffer(vec![0; *size]),
+        ArgType::Resource(resource) => ArgValue::Buffer(vec![0; resource.size]),
+        ArgType::String { fixed_len, .. } => ArgValue::Buffer(vec![0; fixed_len.unwrap_or(0)]),
+        ArgType::Buffer {
+            min_size, max_size, ..
+        } => {
+            let size = if min_size == max_size {
+                *max_size
+            } else {
+                rng.gen_range(*min_size..=*max_size)
+            };
+            ArgValue::Buffer(vec![0; size])
+        }
+        ArgType::Filename => ArgValue::Buffer(vec![0]),
+        ArgType::Void => ArgValue::Buffer(Vec::new()),
+        ArgType::Vma { .. } => ArgValue::Buffer(vec![0; 8]),
+        ArgType::Array {
+            inner,
+            min_len,
+            max_len,
+        } if arg_type_fixed_size(inner).is_none() => {
+            generate_reserved_array_arg_value(inner, *min_len, *max_len, desc, generated_args, rng)
+                .unwrap_or_else(|| ArgValue::Array {
+                    data: Vec::new(),
+                    pointers: Vec::new(),
+                    element_sizes: Vec::new(),
+                })
+        }
+        ArgType::Array { .. } | ArgType::Struct { .. } | ArgType::Union { .. } => {
+            generate_reserved_inline_arg_value(inner, desc, generated_args, rng).unwrap_or_else(
+                || ArgValue::Buffer(vec![0; arg_type_fixed_size(inner).unwrap_or(0)]),
+            )
+        }
+        ArgType::Ptr {
+            inner: nested_inner,
+            dir,
+            optional,
+        } => {
+            if *optional && rng.gen_bool(0.35) {
+                ArgValue::Null
+            } else {
+                match dir {
+                    PtrDir::Out => {
+                        generate_reserved_pointer_arg_value(nested_inner, desc, generated_args, rng)
+                    }
+                    PtrDir::In | PtrDir::InOut => {
+                        generate_pointer_arg_value(desc, generated_args, nested_inner, dir, rng)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn generate_reserved_inline_object_raw(
+    arg_type: &ArgType,
+    desc: &SyscallDesc,
+    generated_args: &[ArgValue],
+    rng: &mut impl Rng,
+) -> Option<InlineObject> {
+    match arg_type {
+        ArgType::Const { size, .. } | ArgType::Len { size, .. } => Some(InlineObject {
+            data: vec![0; *size],
+            pointers: Vec::new(),
+        }),
+        ArgType::Resource(resource) => Some(InlineObject {
+            data: vec![0; resource.size],
+            pointers: Vec::new(),
+        }),
+        ArgType::String { fixed_len, .. } => Some(InlineObject {
+            data: vec![0; fixed_len.unwrap_or(0)],
+            pointers: Vec::new(),
+        }),
+        ArgType::Buffer {
+            min_size, max_size, ..
+        } => {
+            let size = if min_size == max_size {
+                *max_size
+            } else {
+                rng.gen_range(*min_size..=*max_size)
+            };
+            Some(InlineObject {
+                data: vec![0; size],
+                pointers: Vec::new(),
+            })
+        }
+        ArgType::Filename => Some(InlineObject {
+            data: vec![0],
+            pointers: Vec::new(),
+        }),
+        ArgType::Void => Some(InlineObject::default()),
+        ArgType::Vma { .. } => Some(InlineObject {
+            data: vec![0; 8],
+            pointers: Vec::new(),
+        }),
+        ArgType::Array {
+            inner,
+            min_len,
+            max_len,
+        } => {
+            let len = if min_len == max_len {
+                *min_len
+            } else {
+                rng.gen_range(*min_len..=*max_len)
+            };
+            let mut out = InlineObject::default();
+            for _ in 0..len {
+                let child = generate_reserved_inline_object_raw(inner, desc, generated_args, rng)?;
+                let base = out.data.len();
+                out.data.extend_from_slice(&child.data);
+                out.pointers
+                    .extend(child.pointers.into_iter().map(|mut pointer| {
+                        pointer.offset += base;
+                        pointer
+                    }));
+            }
+            Some(out)
+        }
+        ArgType::Struct {
+            fields,
+            size,
+            varlen,
+            packed,
+            align,
+            ..
+        } => {
+            let mut out = InlineObject::default();
+            for (idx, field) in fields.iter().enumerate() {
+                let field_offset = compute_struct_field_offset(fields, idx, *varlen, *packed)?;
+                out.data.resize(field_offset, 0);
+                let child = generate_reserved_inline_object_raw(field, desc, generated_args, rng)?;
+                let base = field_offset;
+                out.data.extend_from_slice(&child.data);
+                out.pointers
+                    .extend(child.pointers.into_iter().map(|mut pointer| {
+                        pointer.offset += base;
+                        pointer
+                    }));
+            }
+            if !*varlen {
+                out.data.resize(*size, 0);
+            } else {
+                let struct_align = struct_type_alignment(fields, *packed, *align).ok()?;
+                let final_size = if struct_align <= 1 {
+                    out.data.len()
+                } else {
+                    out.data
+                        .len()
+                        .checked_add(struct_align - 1)
+                        .map(|rounded| rounded & !(struct_align - 1))?
+                };
+                out.data.resize(final_size, 0);
+            }
+            Some(out)
+        }
+        ArgType::Union {
+            fields,
+            size,
+            varlen,
+            packed,
+            align,
+            ..
+        } => {
+            let field = fields.get(rng.gen_range(0..fields.len()))?;
+            let mut out = generate_reserved_inline_object_raw(field, desc, generated_args, rng)?;
+            if !*varlen {
+                out.data.resize(*size, 0);
+            } else {
+                let union_align = union_type_alignment(fields, *packed, *align).ok()?;
+                let final_size = if union_align <= 1 {
+                    out.data.len()
+                } else {
+                    out.data
+                        .len()
+                        .checked_add(union_align - 1)
+                        .map(|rounded| rounded & !(union_align - 1))?
+                };
+                out.data.resize(final_size, 0);
+            }
+            Some(out)
+        }
+        ArgType::Ptr {
+            inner,
+            dir,
+            optional,
+        } => {
+            let mut object = InlineObject {
+                data: vec![0; 8],
+                pointers: Vec::new(),
+            };
+            if *optional && rng.gen_bool(0.35) {
+                return Some(object);
+            }
+            let value = match dir {
+                PtrDir::Out => {
+                    generate_reserved_pointer_arg_value(inner, desc, generated_args, rng)
+                }
+                PtrDir::In | PtrDir::InOut => {
+                    generate_pointer_arg_value(desc, generated_args, inner, dir, rng)
+                }
+            };
+            object.pointers.push(InlinePointerValue {
+                offset: 0,
+                value: Box::new(value),
+            });
+            Some(object)
+        }
+    }
+}
+
+fn patch_inline_len_fields(
+    arg_type: &ArgType,
+    desc: Option<&SyscallDesc>,
+    generated_args: Option<&[ArgValue]>,
+    frames: &[LengthTargetFrame<'_>],
+    data: &mut [u8],
+    pointers: &[InlinePointerValue],
+    base_offset: usize,
+) -> Option<()> {
+    match arg_type {
+        ArgType::Const { .. }
+        | ArgType::Resource(_)
+        | ArgType::Void
+        | ArgType::String { .. }
+        | ArgType::Buffer { .. }
+        | ArgType::Vma { .. }
+        | ArgType::Filename => Some(()),
+        ArgType::Len { target, size, kind } => {
+            let value = derive_inline_target_length(desc, generated_args, frames, target, *kind)
+                .unwrap_or(0);
+            let encoded = encode_scalar_bytes(*size, value as u64);
+            data.get_mut(..encoded.len())?.copy_from_slice(&encoded);
+            Some(())
+        }
+        ArgType::Array { inner, .. } => {
+            let elem_size = arg_type_fixed_size(inner)?;
+            if elem_size == 0 {
+                return Some(());
+            }
+            for (element_idx, chunk) in data.chunks_exact_mut(elem_size).enumerate() {
+                patch_inline_len_fields(
+                    inner,
+                    desc,
+                    generated_args,
+                    frames,
+                    chunk,
+                    pointers,
+                    base_offset + (element_idx * elem_size),
+                )?;
+            }
+            Some(())
+        }
+        ArgType::Struct {
+            type_name,
+            fields,
+            field_names,
+            varlen,
+            packed,
+            ..
+        } => {
+            for (idx, field) in fields.iter().enumerate() {
+                let offset = compute_struct_field_offset(fields, idx, *varlen, *packed)?;
+                let field_size = match arg_type_fixed_size(field) {
+                    Some(field_size) => field_size,
+                    None if *varlen && idx + 1 == fields.len() => data.len().checked_sub(offset)?,
+                    None => return None,
+                };
+                let end = offset.checked_add(field_size)?;
+                let snapshot = data.to_vec();
+                let mut next_frames = frames.to_vec();
+                next_frames.push(LengthTargetFrame {
+                    type_name: type_name.as_deref(),
+                    fields,
+                    field_names,
+                    size: snapshot.len(),
+                    is_union: false,
+                    varlen: *varlen,
+                    packed: *packed,
+                    data: Some(snapshot.as_slice()),
+                    pointers: Some(pointers),
+                    base_offset,
+                });
+                patch_inline_len_fields(
+                    field,
+                    desc,
+                    generated_args,
+                    &next_frames,
+                    data.get_mut(offset..end)?,
+                    pointers,
+                    base_offset + offset,
+                )?;
+            }
+            Some(())
+        }
+        ArgType::Union {
+            type_name,
+            fields,
+            field_names,
+            size,
+            varlen,
+            packed,
+            ..
+        } => {
+            for field in fields {
+                let Some(field_size) = arg_type_fixed_size(field) else {
+                    continue;
+                };
+                if *varlen && field_size != data.len() {
+                    continue;
+                }
+                if field_size > data.len() {
+                    continue;
+                }
+                let snapshot = data.to_vec();
+                let mut next_frames = frames.to_vec();
+                next_frames.push(LengthTargetFrame {
+                    type_name: type_name.as_deref(),
+                    fields,
+                    field_names,
+                    size: if *varlen { snapshot.len() } else { *size },
+                    is_union: true,
+                    varlen: *varlen,
+                    packed: *packed,
+                    data: Some(snapshot.as_slice()),
+                    pointers: Some(pointers),
+                    base_offset,
+                });
+                if patch_inline_len_fields(
+                    field,
+                    desc,
+                    generated_args,
+                    &next_frames,
+                    data.get_mut(..field_size)?,
+                    pointers,
+                    base_offset,
+                )
+                .is_some()
+                {
+                    break;
+                }
+            }
+            Some(())
+        }
+        ArgType::Ptr { .. } => Some(()),
+    }
+}
+
+fn union_fallback_size(fields: &[ArgType], size: usize, varlen: bool) -> usize {
+    if !varlen {
+        return size;
+    }
+    fields.first().and_then(arg_type_fixed_size).unwrap_or(size)
+}
+
+fn generate_string_bytes(
+    values: &[Vec<u8>],
+    noz: bool,
+    fixed_len: Option<usize>,
+    filename: bool,
+    rng: &mut impl Rng,
+) -> Vec<u8> {
+    let source = if filename {
+        choose_filename_source(fixed_len, rng).into_bytes()
+    } else if !values.is_empty() {
+        choose_string_source(values, fixed_len, noz, rng)
+    } else {
+        random_string_source(fixed_len, noz, rng)
+    };
+    materialize_string_bytes(source, noz, fixed_len)
+}
+
+fn choose_filename_source(fixed_len: Option<usize>, rng: &mut impl Rng) -> String {
+    let candidates = [
+        "./a",
+        "./b",
+        "./c",
+        "./file0",
+        "./file1",
+        "./dir0/file0",
+        "/tmp/syz0",
+        "/tmp/syz1",
+    ];
+    let fits = |candidate: &&str| {
+        let encoded_len = candidate.len() + 1;
+        fixed_len.is_none_or(|limit| encoded_len <= limit)
+    };
+    let matching = candidates.iter().copied().filter(fits).collect::<Vec<_>>();
+    if matching.is_empty() {
+        "./a".to_string()
+    } else {
+        matching[rng.gen_range(0..matching.len())].to_string()
+    }
+}
+
+fn choose_string_source(
+    values: &[Vec<u8>],
+    fixed_len: Option<usize>,
+    noz: bool,
+    rng: &mut impl Rng,
+) -> Vec<u8> {
+    let matching = values
+        .iter()
+        .filter(|value| string_source_fits(value, noz, fixed_len))
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        values[rng.gen_range(0..values.len())].clone()
+    } else {
+        matching[rng.gen_range(0..matching.len())].clone()
+    }
+}
+
+fn random_string_source(fixed_len: Option<usize>, noz: bool, rng: &mut impl Rng) -> Vec<u8> {
+    let max_len = fixed_len
+        .map(|len| len.saturating_sub(usize::from(!noz)))
+        .unwrap_or(16)
+        .max(1);
+    let len = rng.gen_range(1..=max_len);
+    (0..len)
+        .map(|_| b'a' + rng.gen_range(0..26) as u8)
+        .collect()
+}
+
+fn string_source_fits(value: &[u8], noz: bool, fixed_len: Option<usize>) -> bool {
+    fixed_len.is_none_or(|limit| value.len() + usize::from(!noz) <= limit)
+}
+
+fn materialize_string_bytes(mut source: Vec<u8>, noz: bool, fixed_len: Option<usize>) -> Vec<u8> {
+    if let Some(limit) = fixed_len {
+        let content_limit = if noz { limit } else { limit.saturating_sub(1) };
+        if source.len() > content_limit {
+            source.truncate(content_limit);
+        }
+    }
+    if !noz {
+        source.push(0);
+    }
+    if let Some(limit) = fixed_len {
+        source.resize(limit, 0);
+    }
+    source
+}
+
+fn generate_vma(min_pages: usize, max_pages: usize, rng: &mut impl Rng) -> ArgValue {
+    let pages = if min_pages >= max_pages {
+        min_pages as u64
+    } else {
+        rng.gen_range(min_pages as u64..=max_pages as u64)
+    };
+    let usable_pages = VMA_NUM_PAGES.saturating_sub(VMA_RESERVED_START_PAGE).max(1);
+    let clamped_pages = pages.min(usable_pages).max(1);
+    let max_start_page = VMA_NUM_PAGES.saturating_sub(clamped_pages);
+    let start_page = if max_start_page <= VMA_RESERVED_START_PAGE {
+        VMA_RESERVED_START_PAGE.min(max_start_page)
+    } else {
+        rng.gen_range(VMA_RESERVED_START_PAGE..=max_start_page)
+    };
+    ArgValue::Vma {
+        addr: DATA_OFFSET + start_page * PAGE_SIZE,
+        size: clamped_pages * PAGE_SIZE,
     }
 }
 
@@ -499,6 +1319,17 @@ fn mutate_integer(prog: &mut Program, descs: &[SyscallDesc], rng: &mut impl Rng)
             }
             _ => {}
         }
+    } else if let Some(ArgType::Vma {
+        min_pages,
+        max_pages,
+        optional,
+    }) = desc.args.get(arg_idx)
+    {
+        if *optional && rng.gen_bool(0.2) {
+            call.args[arg_idx] = ArgValue::Null;
+        } else {
+            call.args[arg_idx] = generate_vma(*min_pages, *max_pages, rng);
+        }
     }
 }
 
@@ -579,7 +1410,7 @@ pub fn describe_program(prog: &Program, descs: &[SyscallDesc]) -> String {
     for (i, call) in prog.calls.iter().enumerate() {
         let desc = &descs[call.syscall_idx];
         s.push_str(&format!("{}. {}(", i, desc.name));
-        for (j, arg) in call.args.iter().enumerate() {
+        for (j, (arg, arg_type)) in call.args.iter().zip(desc.args.iter()).enumerate() {
             if j > 0 {
                 s.push_str(", ");
             }
@@ -590,7 +1421,27 @@ pub fn describe_program(prog: &Program, descs: &[SyscallDesc]) -> String {
                     result_ref.call_idx, result_ref.result_idx
                 )),
                 ArgValue::Buffer(d) => s.push_str(&format!("buf[{}]", d.len())),
+                ArgValue::Composite { data, pointers } => {
+                    s.push_str(&format!("obj[{};+{}ptr]", data.len(), pointers.len()))
+                }
+                ArgValue::Array {
+                    data,
+                    pointers,
+                    element_sizes,
+                } => s.push_str(&format!(
+                    "arr[{};+{}ptr;{}elts]",
+                    data.len(),
+                    pointers.len(),
+                    element_sizes.len()
+                )),
                 ArgValue::Filename(f) => s.push_str(&format!("\"{}\"", f)),
+                ArgValue::Vma { addr, size } => {
+                    if matches!(arg_type, ArgType::Vma { .. }) {
+                        s.push_str(&format!("&(0x{:x}/0x{:x})", addr, size));
+                    } else {
+                        s.push_str(&format!("0x{:x}", addr));
+                    }
+                }
                 ArgValue::OutPtr => s.push_str("&out"),
                 ArgValue::Null => s.push_str("NULL"),
             }
@@ -809,6 +1660,13 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
 
+    fn syscall_idx(descs: &[SyscallDesc], name: &str) -> usize {
+        descs
+            .iter()
+            .position(|desc| desc.name == name)
+            .unwrap_or_else(|| panic!("missing syscall {name}"))
+    }
+
     #[test]
     fn generates_program_from_parsed_descriptions() {
         let descs = get_syscall_descs();
@@ -826,18 +1684,20 @@ mod tests {
     #[test]
     fn repair_result_refs_after_removal_retargets_to_previous_resource() {
         let descs = get_syscall_descs();
+        let eventfd2 = syscall_idx(&descs, "eventfd2");
+        let close = syscall_idx(&descs, "close");
         let mut prog = Program {
             calls: vec![
                 Call {
-                    syscall_idx: 9, // eventfd2 -> fd
+                    syscall_idx: eventfd2,
                     args: vec![ArgValue::Const(0), ArgValue::Const(0)],
                 },
                 Call {
-                    syscall_idx: 9, // eventfd2 -> fd
+                    syscall_idx: eventfd2,
                     args: vec![ArgValue::Const(1), ArgValue::Const(0)],
                 },
                 Call {
-                    syscall_idx: 1, // close(fd)
+                    syscall_idx: close,
                     args: vec![ArgValue::ResultRef(ResultRef {
                         call_idx: 1,
                         result_idx: 0,
@@ -860,6 +1720,159 @@ mod tests {
     }
 
     #[test]
+    fn generate_inline_bytes_materializes_union_sizes() {
+        let fixed_union = ArgType::Union {
+            type_name: None,
+            fields: vec![
+                ArgType::Buffer {
+                    min_size: 2,
+                    max_size: 2,
+                    dir: BufferDir::Plain,
+                },
+                ArgType::Buffer {
+                    min_size: 4,
+                    max_size: 4,
+                    dir: BufferDir::Plain,
+                },
+            ],
+            field_names: vec!["a".into(), "b".into()],
+            size: 8,
+            varlen: false,
+            packed: false,
+            align: None,
+        };
+        let varlen_union = ArgType::Union {
+            type_name: None,
+            fields: vec![
+                ArgType::Buffer {
+                    min_size: 2,
+                    max_size: 2,
+                    dir: BufferDir::Plain,
+                },
+                ArgType::Buffer {
+                    min_size: 4,
+                    max_size: 4,
+                    dir: BufferDir::Plain,
+                },
+            ],
+            field_names: vec!["a".into(), "b".into()],
+            size: 4,
+            varlen: true,
+            packed: false,
+            align: None,
+        };
+        let desc = SyscallDesc {
+            name: "inline".into(),
+            id: 0,
+            arg_names: Vec::new(),
+            args: Vec::new(),
+            ret: ReturnType::Int,
+            attrs: SyscallAttrs::default(),
+        };
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x1234_ffff);
+
+        for _ in 0..16 {
+            assert_eq!(
+                generate_inline_bytes(&fixed_union, &desc, &[], &mut rng)
+                    .unwrap()
+                    .len(),
+                8
+            );
+            let len = generate_inline_bytes(&varlen_union, &desc, &[], &mut rng)
+                .unwrap()
+                .len();
+            assert!(matches!(len, 2 | 4));
+        }
+    }
+
+    #[test]
+    fn generates_vma_lengths_from_selected_mapping_size() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                syscall map@1 -> int(addr vma[2:3], len len[addr])
+            "#,
+        )
+        .expect("test target should parse");
+        let desc = &descs[0];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xbeef_1234);
+
+        for _ in 0..16 {
+            let args = generate_args(desc, &HashMap::new(), &mut rng);
+            let (addr, size) = match &args[0] {
+                ArgValue::Vma { addr, size } => (*addr, *size),
+                other => panic!("unexpected vma arg: {:?}", other),
+            };
+            assert!(addr >= DATA_OFFSET);
+            assert_eq!(addr % PAGE_SIZE, 0);
+            assert!(matches!(size / PAGE_SIZE, 2 | 3));
+            assert_eq!(args[1], ArgValue::Const(size));
+        }
+    }
+
+    #[test]
+    fn generates_string_lengths_from_materialized_pointer_strings() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                path_values = "/dev/null", "/dev/zero"
+                syscall write_like@1 -> int(path ptr[in, string[path_values]], path_len len[path], word ptr[in, stringnoz["abc", 8]], word_len len[word])
+            "#,
+        )
+        .expect("test target should parse");
+        let desc = &descs[0];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xc0de_1234);
+
+        for _ in 0..16 {
+            let args = generate_args(desc, &HashMap::new(), &mut rng);
+            let path_len = match &args[0] {
+                ArgValue::Buffer(data) => {
+                    assert!(data.ends_with(&[0]));
+                    data.len() as u64
+                }
+                other => panic!("unexpected path arg: {:?}", other),
+            };
+            assert_eq!(args[1], ArgValue::Const(path_len));
+
+            match &args[2] {
+                ArgValue::Buffer(data) => {
+                    assert_eq!(data.len(), 8);
+                    assert_eq!(&data[..3], b"abc");
+                }
+                other => panic!("unexpected stringnoz arg: {:?}", other),
+            }
+            assert_eq!(args[3], ArgValue::Const(8));
+        }
+    }
+
+    #[test]
+    fn generates_lengths_for_template_instantiated_payloads() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                payloads = "syz", "hello"
+                type wrap[PAYLOAD] {
+                    payload PAYLOAD
+                }
+                type alias_wrap[PAYLOAD] wrap[PAYLOAD]
+                syscall write_wrap@1 -> int(fd const[1, int32], data ptr[in, alias_wrap[stringnoz[payloads, 8]]], size len[data])
+            "#,
+        )
+        .expect("template target should parse");
+        let desc = &descs[0];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x4444_2222);
+
+        for _ in 0..16 {
+            let args = generate_args(desc, &HashMap::new(), &mut rng);
+            match &args[1] {
+                ArgValue::Buffer(data) => {
+                    assert_eq!(data.len(), 8);
+                    assert!(data.starts_with(b"syz") || data.starts_with(b"hello"));
+                }
+                other => panic!("unexpected templated payload arg: {:?}", other),
+            }
+            assert_eq!(args[2], ArgValue::Const(8));
+        }
+    }
+
+    #[test]
     fn mutated_programs_remain_valid() {
         let descs = get_syscall_descs();
         let mut rng = rand::rngs::StdRng::seed_from_u64(0xfacefeed);
@@ -878,6 +1891,7 @@ mod tests {
         let desc = SyscallDesc {
             name: "const_only".into(),
             id: 1,
+            arg_names: vec!["value".into()],
             args: vec![ArgType::Const {
                 size: 8,
                 values: vec![],
@@ -1228,6 +2242,552 @@ mod tests {
         for _ in 0..32 {
             let choice = choice_table.choose_subset(&[1, 2], Some(0), &mut rng);
             assert_eq!(choice, 1);
+        }
+    }
+
+    #[test]
+    fn generates_parent_derived_inline_lengths_for_struct_templates() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                payload_words = "syz", "hello"
+                type msg[PAYLOAD] {
+                    size bytesize[parent, int32]
+                    kind const[7, int32]
+                    payload PAYLOAD
+                } [packed]
+                syscall write_msg@1 -> int(fd const[1, int32], data ptr[in, msg[stringnoz[payload_words, 8]]], len len[data, int32])
+            "#,
+        )
+        .expect("test target should parse");
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x0ddc_0ffe);
+
+        for _ in 0..8 {
+            let prog = generate(&descs, &mut rng);
+            let data = match &prog.calls[0].args[1] {
+                ArgValue::Buffer(data) => data,
+                other => panic!("unexpected generated data arg: {:?}", other),
+            };
+            assert_eq!(data.len(), 16);
+            assert_eq!(decode_scalar_bytes(&data[..4]), 16);
+            assert_eq!(decode_scalar_bytes(&data[4..8]), 7);
+            assert_eq!(prog.calls[0].args[2], ArgValue::Const(16));
+        }
+    }
+
+    #[test]
+    fn generates_offsetof_inline_fields_for_structs() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type nlattr[PAYLOAD] {
+                    nla_len offsetof[end, int16]
+                    nla_type const[0xaa, int16]
+                    payload PAYLOAD
+                    end void
+                } [packed]
+                syscall send_attr@1 -> int(fd const[1, int32], data ptr[in, nlattr[int32]], len len[data, int32])
+            "#,
+        )
+        .expect("test target should parse");
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x55aa_0ff5);
+
+        for _ in 0..8 {
+            let prog = generate(&descs, &mut rng);
+            let data = match &prog.calls[0].args[1] {
+                ArgValue::Buffer(data) => data,
+                other => panic!("unexpected generated data arg: {:?}", other),
+            };
+            assert_eq!(data.len(), 8);
+            assert_eq!(decode_scalar_bytes(&data[..2]), 8);
+            assert_eq!(decode_scalar_bytes(&data[2..4]), 0xaa);
+            assert_eq!(prog.calls[0].args[2], ArgValue::Const(8));
+        }
+    }
+
+    #[test]
+    fn generates_named_path_lengths_across_arg_type_and_parent_roots() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type path_inner {
+                    bytes array[int8, 6]
+                } [packed]
+                type path_outer {
+                    inner path_inner
+                    inner_len bytesize[path_outer:inner, int32]
+                    inner_len2 bytesize[inner, int32]
+                } [packed]
+                type parent_meta {
+                    payload_len bytesize[parent:parent:payload, int32]
+                } [packed]
+                helper_outer {
+                    payload array[int32, 4]
+                    meta parent_meta
+                    data_len bytesize[syscall:data, int32]
+                } [packed]
+                syscall send_paths@1 -> int(fd const[1, int32], data ptr[in, path_outer], ctx ptr[in, helper_outer], inner_len len[data:inner, int32])
+            "#,
+        )
+        .expect("test target should parse");
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x77aa_5511);
+
+        for _ in 0..8 {
+            let prog = generate(&descs, &mut rng);
+            let data = match &prog.calls[0].args[1] {
+                ArgValue::Buffer(data) => data,
+                other => panic!("unexpected generated data arg: {:?}", other),
+            };
+            assert_eq!(data.len(), 14);
+            assert_eq!(decode_scalar_bytes(&data[6..10]), 6);
+            assert_eq!(decode_scalar_bytes(&data[10..14]), 6);
+
+            let ctx = match &prog.calls[0].args[2] {
+                ArgValue::Buffer(data) => data,
+                other => panic!("unexpected generated ctx arg: {:?}", other),
+            };
+            assert_eq!(ctx.len(), 24);
+            assert_eq!(decode_scalar_bytes(&ctx[16..20]), 16);
+            assert_eq!(decode_scalar_bytes(&ctx[20..24]), 14);
+
+            assert_eq!(prog.calls[0].args[3], ArgValue::Const(6));
+        }
+    }
+
+    #[test]
+    fn generates_trailing_byte_arrays_with_inline_sizes() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type blob_msg {
+                    count bytesize[data, int32]
+                    data array[int8, 4:8]
+                } [packed]
+                syscall write_blob@1 -> int(fd const[1, int32], data ptr[in, blob_msg], size len[data, int32])
+            "#,
+        )
+        .expect("test target should parse");
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x1bad_b002);
+
+        for _ in 0..8 {
+            let prog = generate(&descs, &mut rng);
+            let data = match &prog.calls[0].args[1] {
+                ArgValue::Buffer(data) => data,
+                other => panic!("unexpected generated blob arg: {:?}", other),
+            };
+            assert!((8..=12).contains(&data.len()));
+            let payload_len = data.len() - 4;
+            assert!((4..=8).contains(&payload_len));
+            assert_eq!(decode_scalar_bytes(&data[..4]) as usize, payload_len);
+            assert_eq!(prog.calls[0].args[2], ArgValue::Const(data.len() as u64));
+        }
+    }
+
+    #[test]
+    fn generates_fixed_element_array_counts_inside_varlen_structs() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type qid {
+                    path int32
+                    version int32
+                } [packed]
+                type walk_msg {
+                    nwqid len[wqid, int16]
+                    wqid array[qid, 1:3]
+                } [packed]
+                syscall write_walk@1 -> int(fd const[1, int32], data ptr[in, walk_msg], size len[data, int32])
+            "#,
+        )
+        .expect("test target should parse");
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x77aa_cc11);
+
+        for _ in 0..8 {
+            let prog = generate(&descs, &mut rng);
+            let data = match &prog.calls[0].args[1] {
+                ArgValue::Buffer(data) => data,
+                other => panic!("unexpected generated walk arg: {:?}", other),
+            };
+            assert!(data.len() >= 10);
+            assert_eq!((data.len() - 2) % 8, 0);
+            let element_count = (data.len() - 2) / 8;
+            assert!((1..=3).contains(&element_count));
+            assert_eq!(decode_scalar_bytes(&data[..2]) as usize, element_count);
+            assert_eq!(prog.calls[0].args[2], ArgValue::Const(data.len() as u64));
+        }
+    }
+
+    #[test]
+    fn generates_inline_pointer_structs_with_matching_lengths() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type iovec {
+                    base ptr[in, array[int8, 4:8]]
+                    len len[base, intptr]
+                } [size[16]]
+                syscall send_iov@1 -> int(fd const[1, int32], iov ptr[in, iovec], total len[iov:base, intptr])
+            "#,
+        )
+        .expect("test target should parse");
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5eed_1ace);
+
+        for _ in 0..8 {
+            let prog = generate(&descs, &mut rng);
+            match &prog.calls[0].args[1] {
+                ArgValue::Composite { data, pointers } => {
+                    assert_eq!(data.len(), 16);
+                    assert_eq!(pointers.len(), 1);
+                    assert_eq!(pointers[0].offset, 0);
+                    let payload = match pointers[0].value.as_ref() {
+                        ArgValue::Buffer(data) => data,
+                        other => panic!("unexpected inline pointer payload: {:?}", other),
+                    };
+                    assert!((4..=8).contains(&payload.len()));
+                    assert_eq!(decode_scalar_bytes(&data[8..16]) as usize, payload.len());
+                    assert_eq!(prog.calls[0].args[2], ArgValue::Const(payload.len() as u64));
+                }
+                other => panic!("unexpected generated iovec arg: {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn generates_msghdr_with_nested_iovec_and_optional_lengths() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type iovec {
+                    base ptr[in, array[int8, 4:8]]
+                    len len[base, intptr]
+                } [size[16]]
+                type cmsghdr_like {
+                    cmsg_len bytesize[parent, intptr]
+                    cmsg_level const[0, int32]
+                    cmsg_type const[0, int32]
+                    data array[int8, 0:16]
+                } [varlen, align[8]]
+                type send_msghdr {
+                    msg_name ptr[in, buffer[16:16], opt]
+                    msg_namelen len[msg_name, int32]
+                    msg_iov ptr[in, array[iovec, 1:2]]
+                    msg_iovlen len[msg_iov, intptr]
+                    msg_control ptr[in, array[cmsghdr_like, 1:2], opt]
+                    msg_controllen bytesize[msg_control, intptr]
+                    msg_flags const[0, int32]
+                } [size[56]]
+                syscall sendmsg@1 -> int(fd const[1, int32], msg ptr[in, send_msghdr], flags const[0, int32])
+            "#,
+        )
+        .expect("test target should parse");
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5eed_baad);
+
+        for _ in 0..8 {
+            let prog = generate(&descs, &mut rng);
+            let ArgValue::Composite { data, pointers } = &prog.calls[0].args[1] else {
+                panic!(
+                    "unexpected generated msghdr arg: {:?}",
+                    prog.calls[0].args[1]
+                );
+            };
+            assert_eq!(data.len(), 56);
+            assert_eq!(decode_scalar_bytes(&data[48..52]), 0);
+
+            let name_ptr = pointers.iter().find(|pointer| pointer.offset == 0);
+            let name_len = decode_scalar_bytes(&data[8..12]) as usize;
+            match name_ptr.map(|pointer| pointer.value.as_ref()) {
+                Some(ArgValue::Buffer(name)) => {
+                    assert_eq!(name.len(), 16);
+                    assert_eq!(name_len, 16);
+                }
+                Some(other) => panic!("unexpected msg_name payload: {:?}", other),
+                None => assert_eq!(name_len, 0),
+            }
+
+            let iov_ptr = pointers
+                .iter()
+                .find(|pointer| pointer.offset == 16)
+                .expect("msg_iov pointer should always be present");
+            let ArgValue::Composite {
+                data: iov_data,
+                pointers: iov_pointers,
+            } = iov_ptr.value.as_ref()
+            else {
+                panic!("unexpected msg_iov payload: {:?}", iov_ptr.value);
+            };
+            let iov_len = decode_scalar_bytes(&data[24..32]) as usize;
+            assert!((1..=2).contains(&iov_len));
+            assert_eq!(iov_data.len(), iov_len * 16);
+            assert_eq!(iov_pointers.len(), iov_len);
+            for (idx, pointer) in iov_pointers.iter().enumerate() {
+                assert_eq!(pointer.offset, idx * 16);
+                let ArgValue::Buffer(payload) = pointer.value.as_ref() else {
+                    panic!("unexpected iovec base payload: {:?}", pointer.value);
+                };
+                assert!((4..=8).contains(&payload.len()));
+                let len_offset = idx * 16 + 8;
+                assert_eq!(
+                    decode_scalar_bytes(&iov_data[len_offset..len_offset + 8]) as usize,
+                    payload.len()
+                );
+            }
+
+            let control_ptr = pointers.iter().find(|pointer| pointer.offset == 32);
+            let control_len = decode_scalar_bytes(&data[40..48]) as usize;
+            match control_ptr.map(|pointer| pointer.value.as_ref()) {
+                Some(ArgValue::Array {
+                    data: control,
+                    element_sizes,
+                    ..
+                }) => {
+                    assert!((1..=2).contains(&element_sizes.len()));
+                    assert_eq!(control_len, control.len());
+                    let mut offset = 0usize;
+                    for &element_size in element_sizes {
+                        assert!(element_size >= 16);
+                        assert_eq!(element_size % 8, 0);
+                        let end = offset + element_size;
+                        let element = &control[offset..end];
+                        assert_eq!(decode_scalar_bytes(&element[..8]) as usize, element_size);
+                        assert_eq!(decode_scalar_bytes(&element[8..12]), 0);
+                        assert_eq!(decode_scalar_bytes(&element[12..16]), 0);
+                        offset = end;
+                    }
+                    assert_eq!(offset, control.len());
+                }
+                Some(other) => panic!("unexpected msg_control payload: {:?}", other),
+                None => assert_eq!(control_len, 0),
+            }
+        }
+    }
+
+    #[test]
+    fn generates_sendmmsg_with_batched_msghdrs() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type iovec {
+                    base ptr[in, array[int8, 4:8]]
+                    len len[base, intptr]
+                } [size[16]]
+                type cmsghdr_like {
+                    cmsg_len bytesize[parent, intptr]
+                    cmsg_level const[0, int32]
+                    cmsg_type const[0, int32]
+                    data array[int8, 0:16]
+                } [varlen, align[8]]
+                type send_msghdr {
+                    msg_name ptr[in, buffer[16:16], opt]
+                    msg_namelen len[msg_name, int32]
+                    msg_iov ptr[in, array[iovec, 1:2]]
+                    msg_iovlen len[msg_iov, intptr]
+                    msg_control ptr[in, array[cmsghdr_like, 1:2], opt]
+                    msg_controllen bytesize[msg_control, intptr]
+                    msg_flags const[0, int32]
+                } [size[56]]
+                type send_mmsghdr {
+                    msg_hdr send_msghdr
+                    msg_len const[0, int32]
+                } [size[64]]
+                syscall sendmmsg@1 -> int(fd const[1, int32], msgvec ptr[in, array[send_mmsghdr, 1:2]], vlen len[msgvec, int32], flags const[0, int32])
+            "#,
+        )
+        .expect("test target should parse");
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5eed_bad5);
+
+        for _ in 0..8 {
+            let prog = generate(&descs, &mut rng);
+            let ArgValue::Composite { data, pointers } = &prog.calls[0].args[1] else {
+                panic!(
+                    "unexpected generated msgvec arg: {:?}",
+                    prog.calls[0].args[1]
+                );
+            };
+            let vlen = match prog.calls[0].args[2] {
+                ArgValue::Const(value) => value as usize,
+                ref other => panic!("unexpected generated vlen arg: {:?}", other),
+            };
+            assert!((1..=2).contains(&vlen));
+            assert_eq!(data.len(), vlen * 64);
+
+            for element_idx in 0..vlen {
+                let base = element_idx * 64;
+                let element = &data[base..base + 64];
+                assert_eq!(decode_scalar_bytes(&element[56..60]), 0);
+                let name_ptr = pointers.iter().find(|pointer| pointer.offset == base);
+                let name_len = decode_scalar_bytes(&element[8..12]) as usize;
+                match name_ptr.map(|pointer| pointer.value.as_ref()) {
+                    Some(ArgValue::Buffer(name)) => {
+                        assert_eq!(name.len(), 16);
+                        assert_eq!(name_len, 16);
+                    }
+                    Some(other) => panic!("unexpected batched msg_name payload: {:?}", other),
+                    None => assert_eq!(name_len, 0),
+                }
+
+                let iov_ptr = pointers
+                    .iter()
+                    .find(|pointer| pointer.offset == base + 16)
+                    .expect("each mmsghdr element should have msg_iov");
+                let ArgValue::Composite {
+                    data: iov_data,
+                    pointers: iov_pointers,
+                } = iov_ptr.value.as_ref()
+                else {
+                    panic!("unexpected batched msg_iov payload: {:?}", iov_ptr.value);
+                };
+                let iov_len = decode_scalar_bytes(&element[24..32]) as usize;
+                assert!((1..=2).contains(&iov_len));
+                assert_eq!(iov_data.len(), iov_len * 16);
+                assert_eq!(iov_pointers.len(), iov_len);
+                for (iov_idx, pointer) in iov_pointers.iter().enumerate() {
+                    assert_eq!(pointer.offset, iov_idx * 16);
+                    let ArgValue::Buffer(payload) = pointer.value.as_ref() else {
+                        panic!("unexpected batched iovec payload: {:?}", pointer.value);
+                    };
+                    let len_offset = iov_idx * 16 + 8;
+                    assert_eq!(
+                        decode_scalar_bytes(&iov_data[len_offset..len_offset + 8]) as usize,
+                        payload.len()
+                    );
+                }
+
+                let control_ptr = pointers.iter().find(|pointer| pointer.offset == base + 32);
+                let control_len = decode_scalar_bytes(&element[40..48]) as usize;
+                match control_ptr.map(|pointer| pointer.value.as_ref()) {
+                    Some(ArgValue::Array {
+                        data: control,
+                        element_sizes,
+                        ..
+                    }) => {
+                        assert!((1..=2).contains(&element_sizes.len()));
+                        assert_eq!(control.len(), control_len);
+                        let mut offset = 0usize;
+                        for &element_size in element_sizes {
+                            assert!(element_size >= 16);
+                            assert_eq!(element_size % 8, 0);
+                            let end = offset + element_size;
+                            let cmsg = &control[offset..end];
+                            assert_eq!(decode_scalar_bytes(&cmsg[..8]) as usize, element_size);
+                            offset = end;
+                        }
+                        assert_eq!(offset, control.len());
+                    }
+                    Some(other) => panic!("unexpected batched msg_control payload: {:?}", other),
+                    None => assert_eq!(control_len, 0),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generates_recv_msghdr_with_reserved_output_buffers() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type iovec_out {
+                    base ptr[out, array[int8, 4:8]]
+                    len len[base, intptr]
+                } [size[16]]
+                type recv_msghdr {
+                    msg_name ptr[out, buffer[16:16], opt]
+                    msg_namelen len[msg_name, int32]
+                    msg_iov ptr[in, array[iovec_out, 1:2]]
+                    msg_iovlen len[msg_iov, intptr]
+                    msg_control ptr[out, array[int8, 0:32], opt]
+                    msg_controllen bytesize[msg_control, intptr]
+                    msg_flags const[0, int32]
+                } [size[56]]
+                syscall recvmsg@1 -> int(fd const[1, int32], msg ptr[inout, recv_msghdr], flags const[0, int32])
+            "#,
+        )
+        .expect("test target should parse");
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5eed_feed);
+
+        for _ in 0..8 {
+            let prog = generate(&descs, &mut rng);
+            let ArgValue::Composite { data, pointers } = &prog.calls[0].args[1] else {
+                panic!(
+                    "unexpected generated recv_msghdr arg: {:?}",
+                    prog.calls[0].args[1]
+                );
+            };
+            assert_eq!(data.len(), 56);
+            assert_eq!(decode_scalar_bytes(&data[48..52]), 0);
+
+            let name_ptr = pointers.iter().find(|pointer| pointer.offset == 0);
+            let name_len = decode_scalar_bytes(&data[8..12]) as usize;
+            match name_ptr.map(|pointer| pointer.value.as_ref()) {
+                Some(ArgValue::Buffer(name)) => {
+                    assert_eq!(name.len(), 16);
+                    assert_eq!(name_len, 16);
+                    assert!(name.iter().all(|byte| *byte == 0));
+                }
+                Some(other) => panic!("unexpected recv msg_name payload: {:?}", other),
+                None => assert_eq!(name_len, 0),
+            }
+
+            let iov_ptr = pointers
+                .iter()
+                .find(|pointer| pointer.offset == 16)
+                .expect("recv msg_iov pointer should always be present");
+            let ArgValue::Composite {
+                data: iov_data,
+                pointers: iov_pointers,
+            } = iov_ptr.value.as_ref()
+            else {
+                panic!("unexpected recv msg_iov payload: {:?}", iov_ptr.value);
+            };
+            let iov_len = decode_scalar_bytes(&data[24..32]) as usize;
+            assert!((1..=2).contains(&iov_len));
+            assert_eq!(iov_data.len(), iov_len * 16);
+            assert_eq!(iov_pointers.len(), iov_len);
+            for (idx, pointer) in iov_pointers.iter().enumerate() {
+                let ArgValue::Buffer(payload) = pointer.value.as_ref() else {
+                    panic!("unexpected recv iovec base payload: {:?}", pointer.value);
+                };
+                assert!((4..=8).contains(&payload.len()));
+                assert!(payload.iter().all(|byte| *byte == 0));
+                let len_offset = idx * 16 + 8;
+                assert_eq!(
+                    decode_scalar_bytes(&iov_data[len_offset..len_offset + 8]) as usize,
+                    payload.len()
+                );
+            }
+
+            let control_ptr = pointers.iter().find(|pointer| pointer.offset == 32);
+            let control_len = decode_scalar_bytes(&data[40..48]) as usize;
+            match control_ptr.map(|pointer| pointer.value.as_ref()) {
+                Some(ArgValue::Buffer(control)) => {
+                    assert!(control.len() <= 32);
+                    assert_eq!(control_len, control.len());
+                    assert!(control.iter().all(|byte| *byte == 0));
+                }
+                Some(other) => panic!("unexpected recv msg_control payload: {:?}", other),
+                None => assert_eq!(control_len, 0),
+            }
+        }
+    }
+
+    #[test]
+    fn generates_aligned_varlen_struct_lengths_from_parent_size() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type cmsghdr_like {
+                    cmsg_len len[parent, intptr]
+                    cmsg_level int32
+                    cmsg_type int32
+                    data array[int8, 1:8]
+                } [align[8]]
+                syscall write_cmsg@1 -> int(fd const[1, int32], data ptr[in, cmsghdr_like], size len[data, intptr])
+            "#,
+        )
+        .expect("test target should parse");
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xc5c5_5eed);
+
+        for _ in 0..8 {
+            let prog = generate(&descs, &mut rng);
+            let ArgValue::Buffer(data) = &prog.calls[0].args[1] else {
+                panic!(
+                    "unexpected generated cmsghdr_like arg: {:?}",
+                    prog.calls[0].args[1]
+                );
+            };
+            assert!(data.len() >= 24);
+            assert_eq!(data.len() % 8, 0);
+            assert_eq!(decode_scalar_bytes(&data[..8]) as usize, data.len());
+            assert_eq!(prog.calls[0].args[2], ArgValue::Const(data.len() as u64));
         }
     }
 }

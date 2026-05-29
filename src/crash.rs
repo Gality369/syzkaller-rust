@@ -1,5 +1,6 @@
 /// Minimal crash detector for Linux kernel console output.
 /// Checks for common crash signatures in serial/console output.
+use crate::program;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,7 +130,7 @@ const CRASH_PATTERNS: &[CrashPattern] = &[
 
 const ARTIFACT_METADATA_VERSION: u32 = 2;
 const ARTIFACT_CATALOG_VERSION: u32 = 2;
-const ARTIFACT_REPRO_QUEUE_VERSION: u32 = 4;
+const ARTIFACT_REPRO_QUEUE_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ArtifactMetadata {
@@ -242,9 +243,31 @@ pub struct ArtifactReproQueueEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
+pub struct ArtifactReproQueueSummary {
+    pub total_entries: usize,
+    pub claimable_entries: usize,
+    pub leased_entries: usize,
+    pub backed_off_entries: usize,
+    pub failed_entries: usize,
+    pub timed_out_entries: usize,
+    pub succeeded_entries: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ArtifactReproQueueSnapshot {
+    pub version: u32,
+    pub updated_unix_secs: u64,
+    pub summary: ArtifactReproQueueSummary,
+    pub entries: Vec<ArtifactReproQueueEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
 struct ArtifactReproQueue {
     version: u32,
     updated_unix_secs: u64,
+    summary: ArtifactReproQueueSummary,
     entries: Vec<ArtifactReproQueueEntry>,
 }
 
@@ -279,6 +302,8 @@ pub struct ArtifactReproInfo {
     pub vm_image: String,
     pub vm_cmdline: String,
     pub program: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub program_ir: Option<program::Program>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shape: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -562,7 +587,7 @@ fn strip_bracket_prefix(line: &str) -> Option<&str> {
     }
 }
 
-fn normalize_summary(summary: &str) -> String {
+pub(crate) fn normalize_summary(summary: &str) -> String {
     summary
         .split_whitespace()
         .map(normalize_summary_token)
@@ -1006,6 +1031,7 @@ fn build_artifact_repro_queue(
     ArtifactReproQueue {
         version: ARTIFACT_REPRO_QUEUE_VERSION,
         updated_unix_secs: current_unix_secs(),
+        summary: summarize_artifact_repro_queue_entries(&entries, now),
         entries,
     }
 }
@@ -1131,6 +1157,36 @@ fn sort_artifact_repro_queue_entries(entries: &mut [ArtifactReproQueueEntry], no
     });
 }
 
+fn summarize_artifact_repro_queue_entries(
+    entries: &[ArtifactReproQueueEntry],
+    now: u64,
+) -> ArtifactReproQueueSummary {
+    let mut summary = ArtifactReproQueueSummary {
+        total_entries: entries.len(),
+        ..Default::default()
+    };
+    for entry in entries {
+        let leased = repro_queue_entry_has_active_lease(entry, now);
+        let backed_off = repro_queue_entry_is_in_backoff(entry, now);
+        if leased {
+            summary.leased_entries += 1;
+        }
+        if backed_off {
+            summary.backed_off_entries += 1;
+        }
+        if !leased && !backed_off {
+            summary.claimable_entries += 1;
+        }
+        match repro_queue_outcome_rank(entry.last_attempt_outcome.as_deref()) {
+            1 => summary.failed_entries += 1,
+            2 => summary.timed_out_entries += 1,
+            3 => summary.succeeded_entries += 1,
+            _ => {}
+        }
+    }
+    summary
+}
+
 fn repro_queue_backoff_secs(outcome: &str, attempts: u64) -> Option<u64> {
     let normalized = canonicalize_repro_queue_outcome(outcome);
     if normalized == "succeeded" {
@@ -1187,10 +1243,19 @@ fn artifact_repro_priority(entry: &ArtifactCatalogEntry) -> u64 {
 
 fn write_artifact_repro_queue(
     workdir: &std::path::Path,
+    queue: ArtifactReproQueue,
+) -> std::io::Result<()> {
+    write_artifact_repro_queue_at(workdir, queue, current_unix_secs())
+}
+
+fn write_artifact_repro_queue_at(
+    workdir: &std::path::Path,
     mut queue: ArtifactReproQueue,
+    now: u64,
 ) -> std::io::Result<()> {
     queue.version = ARTIFACT_REPRO_QUEUE_VERSION;
-    queue.updated_unix_secs = current_unix_secs();
+    queue.updated_unix_secs = now;
+    queue.summary = summarize_artifact_repro_queue_entries(&queue.entries, now);
     let data = serde_json::to_vec_pretty(&queue)?;
     std::fs::write(workdir.join("repro_queue.json"), data)?;
     Ok(())
@@ -1203,6 +1268,7 @@ fn load_artifact_repro_queue(workdir: &std::path::Path) -> std::io::Result<Artif
         return Ok(ArtifactReproQueue {
             version: ARTIFACT_REPRO_QUEUE_VERSION,
             updated_unix_secs: now,
+            summary: Default::default(),
             entries: Vec::new(),
         });
     }
@@ -1211,6 +1277,7 @@ fn load_artifact_repro_queue(workdir: &std::path::Path) -> std::io::Result<Artif
         serde_json::from_slice::<ArtifactReproQueue>(&data).unwrap_or(ArtifactReproQueue {
             version: ARTIFACT_REPRO_QUEUE_VERSION,
             updated_unix_secs: now,
+            summary: Default::default(),
             entries: Vec::new(),
         }),
     )
@@ -1231,6 +1298,16 @@ pub fn record_repro_queue_attempt(
     )
 }
 
+fn apply_repro_queue_attempt_outcome(entry: &mut ArtifactReproQueueEntry, outcome: &str, now: u64) {
+    entry.attempts += 1;
+    entry.last_attempt_unix_secs = Some(now);
+    entry.last_attempt_outcome = Some(canonicalize_repro_queue_outcome(outcome));
+    entry.next_attempt_not_before_unix_secs = repro_queue_backoff_secs(outcome, entry.attempts)
+        .map(|backoff| now.saturating_add(backoff));
+    entry.lease_owner = None;
+    entry.lease_expires_unix_secs = None;
+}
+
 fn record_repro_queue_attempt_at(
     workdir: &std::path::Path,
     artifact_type: &str,
@@ -1246,16 +1323,67 @@ fn record_repro_queue_attempt_at(
     else {
         return Ok(false);
     };
-    entry.attempts += 1;
-    entry.last_attempt_unix_secs = Some(now);
-    entry.last_attempt_outcome = Some(canonicalize_repro_queue_outcome(outcome));
-    entry.next_attempt_not_before_unix_secs = repro_queue_backoff_secs(outcome, entry.attempts)
-        .map(|backoff| now.saturating_add(backoff));
-    entry.lease_owner = None;
-    entry.lease_expires_unix_secs = None;
+    apply_repro_queue_attempt_outcome(entry, outcome, now);
     sort_artifact_repro_queue_entries(&mut queue.entries, now);
-    write_artifact_repro_queue(workdir, queue)?;
+    write_artifact_repro_queue_at(workdir, queue, now)?;
     Ok(true)
+}
+
+pub fn load_repro_queue_snapshot(
+    workdir: &str,
+    limit: usize,
+) -> std::io::Result<ArtifactReproQueueSnapshot> {
+    load_repro_queue_snapshot_at(std::path::Path::new(workdir), limit, current_unix_secs())
+}
+
+fn materialize_repro_queue_entries(
+    queue: &ArtifactReproQueue,
+    now: u64,
+) -> Vec<ArtifactReproQueueEntry> {
+    let mut entries = queue.entries.clone();
+    for entry in &mut entries {
+        entry.next_attempt_not_before_unix_secs = retained_repro_queue_backoff(entry, now);
+        let (lease_owner, lease_expires_unix_secs) = retained_repro_queue_lease(entry, now);
+        entry.lease_owner = lease_owner;
+        entry.lease_expires_unix_secs = lease_expires_unix_secs;
+    }
+    sort_artifact_repro_queue_entries(&mut entries, now);
+    entries
+}
+
+fn load_repro_queue_snapshot_at(
+    workdir: &std::path::Path,
+    limit: usize,
+    now: u64,
+) -> std::io::Result<ArtifactReproQueueSnapshot> {
+    let queue = load_artifact_repro_queue(workdir)?;
+    let entries = materialize_repro_queue_entries(&queue, now);
+    let summary = summarize_artifact_repro_queue_entries(&entries, now);
+    let entries = if limit == 0 || entries.len() <= limit {
+        entries
+    } else {
+        entries.into_iter().take(limit).collect()
+    };
+    Ok(ArtifactReproQueueSnapshot {
+        version: queue.version,
+        updated_unix_secs: queue.updated_unix_secs,
+        summary,
+        entries,
+    })
+}
+
+pub fn peek_repro_queue_entry(workdir: &str) -> std::io::Result<Option<ArtifactReproQueueEntry>> {
+    peek_repro_queue_entry_at(std::path::Path::new(workdir), current_unix_secs())
+}
+
+fn peek_repro_queue_entry_at(
+    workdir: &std::path::Path,
+    now: u64,
+) -> std::io::Result<Option<ArtifactReproQueueEntry>> {
+    let entries = materialize_repro_queue_entries(&load_artifact_repro_queue(workdir)?, now);
+    Ok(entries.into_iter().find(|entry| {
+        entry.lease_owner.is_none() && entry.next_attempt_not_before_unix_secs.is_none()
+    }))
 }
 
 pub fn claim_repro_queue_entry(
@@ -1291,7 +1419,7 @@ fn claim_repro_queue_entry_at(
         entry.lease_expires_unix_secs = lease_expires_unix_secs;
         let claimed = entry.clone();
         sort_artifact_repro_queue_entries(&mut queue.entries, now);
-        write_artifact_repro_queue(workdir, queue)?;
+        write_artifact_repro_queue_at(workdir, queue, now)?;
         return Ok(Some(claimed));
     }
 
@@ -1304,7 +1432,7 @@ fn claim_repro_queue_entry_at(
         entry.lease_expires_unix_secs = lease_expires_unix_secs;
         let claimed = entry.clone();
         sort_artifact_repro_queue_entries(&mut queue.entries, now);
-        write_artifact_repro_queue(workdir, queue)?;
+        write_artifact_repro_queue_at(workdir, queue, now)?;
         return Ok(Some(claimed));
     }
 
@@ -1347,17 +1475,61 @@ fn release_repro_queue_claim_at(
     entry.lease_owner = None;
     entry.lease_expires_unix_secs = None;
     sort_artifact_repro_queue_entries(&mut queue.entries, now);
-    write_artifact_repro_queue(workdir, queue)?;
+    write_artifact_repro_queue_at(workdir, queue, now)?;
+    Ok(true)
+}
+
+pub fn requeue_repro_queue_claim(
+    workdir: &str,
+    artifact_type: &str,
+    signature: &str,
+    worker_id: &str,
+    outcome: &str,
+) -> std::io::Result<bool> {
+    requeue_repro_queue_claim_at(
+        std::path::Path::new(workdir),
+        artifact_type,
+        signature,
+        worker_id,
+        outcome,
+        current_unix_secs(),
+    )
+}
+
+fn requeue_repro_queue_claim_at(
+    workdir: &std::path::Path,
+    artifact_type: &str,
+    signature: &str,
+    worker_id: &str,
+    outcome: &str,
+    now: u64,
+) -> std::io::Result<bool> {
+    let mut queue = load_artifact_repro_queue(workdir)?;
+    let Some(entry) = queue
+        .entries
+        .iter_mut()
+        .find(|entry| entry.artifact_type == artifact_type && entry.signature == signature)
+    else {
+        return Ok(false);
+    };
+    if entry.lease_owner.as_deref() != Some(worker_id) {
+        return Ok(false);
+    }
+    apply_repro_queue_attempt_outcome(entry, outcome, now);
+    sort_artifact_repro_queue_entries(&mut queue.entries, now);
+    write_artifact_repro_queue_at(workdir, queue, now)?;
     Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        artifact_signature, claim_repro_queue_entry_at, detect_crash, normalize_summary,
-        record_repro_queue_attempt, record_repro_queue_attempt_at, relative_artifact_path,
-        release_repro_queue_claim, save_crash, save_timeout, sync_artifact_catalog,
-        ArtifactCatalog, ArtifactMetadata, ArtifactReproInfo, ArtifactReproQueue,
+        artifact_signature, claim_repro_queue_entry_at, detect_crash, load_repro_queue_snapshot_at,
+        normalize_summary, peek_repro_queue_entry_at, record_repro_queue_attempt,
+        record_repro_queue_attempt_at, relative_artifact_path, release_repro_queue_claim,
+        requeue_repro_queue_claim, requeue_repro_queue_claim_at, save_crash, save_timeout,
+        sync_artifact_catalog, ArtifactCatalog, ArtifactMetadata, ArtifactReproInfo,
+        ArtifactReproQueue,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1416,6 +1588,7 @@ mod tests {
             vm_image: "/tmp/bullseye.img".to_string(),
             vm_cmdline: "console=ttyS0".to_string(),
             program: program.to_string(),
+            program_ir: None,
             shape: shape.map(str::to_string),
             profile: profile.map(str::to_string),
         }
@@ -1547,8 +1720,12 @@ mod tests {
             )
         );
         let queue = read_repro_queue(&workdir);
-        assert_eq!(queue.version, 4);
+        assert_eq!(queue.version, 5);
         assert_eq!(queue.entries.len(), 1);
+        assert_eq!(queue.summary.total_entries, 1);
+        assert_eq!(queue.summary.claimable_entries, 1);
+        assert_eq!(queue.summary.leased_entries, 0);
+        assert_eq!(queue.summary.backed_off_entries, 0);
         assert_eq!(queue.entries[0].artifact_type, "timeout");
         assert_eq!(queue.entries[0].attempts, 0);
         assert_eq!(queue.entries[0].last_attempt_unix_secs, None);
@@ -1598,6 +1775,10 @@ mod tests {
 
         let after = read_repro_queue(&workdir);
         assert_eq!(after.entries.len(), 1);
+        assert_eq!(after.summary.total_entries, 1);
+        assert_eq!(after.summary.claimable_entries, 0);
+        assert_eq!(after.summary.backed_off_entries, 1);
+        assert_eq!(after.summary.failed_entries, 1);
         assert_eq!(after.entries[0].attempts, 1);
         assert_eq!(
             after.entries[0].last_attempt_outcome.as_deref(),
@@ -1632,6 +1813,8 @@ mod tests {
                 .expect("failed attempt should record")
         );
         let failed = read_repro_queue(&workdir);
+        assert_eq!(failed.summary.failed_entries, 1);
+        assert_eq!(failed.summary.backed_off_entries, 1);
         assert_eq!(
             failed.entries[0].last_attempt_outcome.as_deref(),
             Some("failed")
@@ -1646,6 +1829,9 @@ mod tests {
                 .expect("successful attempt should record")
         );
         let succeeded = read_repro_queue(&workdir);
+        assert_eq!(succeeded.summary.succeeded_entries, 1);
+        assert_eq!(succeeded.summary.claimable_entries, 1);
+        assert_eq!(succeeded.summary.backed_off_entries, 0);
         assert_eq!(succeeded.entries[0].next_attempt_not_before_unix_secs, None);
         assert_eq!(
             succeeded.entries[0].last_attempt_outcome.as_deref(),
@@ -1676,6 +1862,8 @@ mod tests {
                 .expect("timeout alias should record")
         );
         let queue = read_repro_queue(&workdir);
+        assert_eq!(queue.summary.timed_out_entries, 1);
+        assert_eq!(queue.summary.backed_off_entries, 1);
         assert_eq!(
             queue.entries[0].last_attempt_outcome.as_deref(),
             Some("timed_out")
@@ -1718,6 +1906,8 @@ mod tests {
 
         let queue = read_repro_queue(&workdir);
         assert_eq!(queue.entries.len(), 1);
+        assert_eq!(queue.summary.leased_entries, 1);
+        assert_eq!(queue.summary.claimable_entries, 0);
         assert_eq!(queue.entries[0].lease_owner.as_deref(), Some("worker-a"));
         assert_eq!(queue.entries[0].lease_expires_unix_secs, Some(155));
 
@@ -1765,6 +1955,301 @@ mod tests {
             .expect("claim should succeed")
             .expect("next available item should be claimable");
         assert_eq!(claimed.artifact_type, "timeout");
+
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn requeue_repro_queue_claim_records_outcome_for_current_owner() {
+        let workdir = unique_temp_dir("repro-queue-requeue");
+        std::fs::create_dir_all(&workdir).expect("temp workdir should be creatable");
+
+        save_timeout(
+            workdir.to_str().expect("temp path should be utf-8"),
+            "executor_reported_hang",
+            "0. socket$inet(0x2, 0x1, 0x0)\n",
+            "socket$inet",
+            "socket$inet->connect$inet",
+            None,
+        )
+        .expect("timeout artifact should save");
+
+        let claimed = claim_repro_queue_entry_at(&workdir, "worker-a", 30, 100)
+            .expect("claim should succeed")
+            .expect("queue entry should be claimable");
+        assert!(requeue_repro_queue_claim_at(
+            &workdir,
+            &claimed.artifact_type,
+            &claimed.signature,
+            "worker-a",
+            "timeout",
+            100,
+        )
+        .expect("requeue should succeed"));
+
+        let queue = read_repro_queue(&workdir);
+        assert_eq!(queue.summary.leased_entries, 0);
+        assert_eq!(queue.summary.backed_off_entries, 1);
+        assert_eq!(queue.summary.timed_out_entries, 1);
+        assert_eq!(queue.entries[0].lease_owner, None);
+        assert_eq!(
+            queue.entries[0].last_attempt_outcome.as_deref(),
+            Some("timed_out")
+        );
+        assert_eq!(
+            queue.entries[0].next_attempt_not_before_unix_secs,
+            Some(400)
+        );
+
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn requeue_repro_queue_claim_rejects_non_owner() {
+        let workdir = unique_temp_dir("repro-queue-requeue-owner");
+        std::fs::create_dir_all(&workdir).expect("temp workdir should be creatable");
+
+        save_timeout(
+            workdir.to_str().expect("temp path should be utf-8"),
+            "executor_reported_hang",
+            "0. socket$inet(0x2, 0x1, 0x0)\n",
+            "socket$inet",
+            "socket$inet->connect$inet",
+            None,
+        )
+        .expect("timeout artifact should save");
+
+        let claimed = claim_repro_queue_entry_at(&workdir, "worker-a", 30, 100)
+            .expect("claim should succeed")
+            .expect("queue entry should be claimable");
+        assert!(!requeue_repro_queue_claim(
+            workdir.to_str().expect("temp path should be utf-8"),
+            &claimed.artifact_type,
+            &claimed.signature,
+            "worker-b",
+            "failed",
+        )
+        .expect("mismatched requeue should return false"));
+
+        let queue = read_repro_queue(&workdir);
+        assert_eq!(queue.summary.leased_entries, 1);
+        assert_eq!(queue.entries[0].lease_owner.as_deref(), Some("worker-a"));
+        assert_eq!(queue.entries[0].attempts, 0);
+
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn requeue_repro_queue_summary_tracks_claimable_leased_and_backed_off_entries() {
+        let workdir = unique_temp_dir("repro-queue-summary");
+        std::fs::create_dir_all(&workdir).expect("temp workdir should be creatable");
+
+        save_timeout(
+            workdir.to_str().expect("temp path should be utf-8"),
+            "summary-a",
+            "0. socket$inet(0x2, 0x1, 0x0)\n",
+            "socket$inet",
+            "socket$inet->connect$inet",
+            None,
+        )
+        .expect("first timeout artifact should save");
+        save_timeout(
+            workdir.to_str().expect("temp path should be utf-8"),
+            "summary-b",
+            "0. socket$inet(0x2, 0x1, 0x0)\n1. close(...)\n",
+            "socket$inet",
+            "socket$inet->connect$inet",
+            None,
+        )
+        .expect("second timeout artifact should save");
+        save_timeout(
+            workdir.to_str().expect("temp path should be utf-8"),
+            "summary-c",
+            "0. socket$inet(0x2, 0x1, 0x0)\n2. listen(...)\n",
+            "socket$inet",
+            "socket$inet->connect$inet",
+            None,
+        )
+        .expect("third timeout artifact should save");
+
+        let queue = read_repro_queue(&workdir);
+        let sig_a = queue
+            .entries
+            .iter()
+            .find(|entry| entry.summary == "summary-a")
+            .expect("summary-a should exist")
+            .signature
+            .clone();
+        let sig_c = queue
+            .entries
+            .iter()
+            .find(|entry| entry.summary == "summary-c")
+            .expect("summary-c should exist")
+            .signature
+            .clone();
+
+        assert!(
+            record_repro_queue_attempt_at(&workdir, "timeout", &sig_a, "failed", 100)
+                .expect("failed entry should record")
+        );
+        let claimed = claim_repro_queue_entry_at(&workdir, "worker-a", 30, 100)
+            .expect("claim should succeed")
+            .expect("queue entry should be claimable");
+        assert!(requeue_repro_queue_claim_at(
+            &workdir,
+            "timeout",
+            &claimed.signature,
+            "worker-a",
+            "HANGED",
+            100,
+        )
+        .expect("timed-out requeue should succeed"));
+
+        let final_queue = read_repro_queue(&workdir);
+        assert_eq!(final_queue.summary.total_entries, 3);
+        assert_eq!(final_queue.summary.claimable_entries, 1);
+        assert_eq!(final_queue.summary.leased_entries, 0);
+        assert_eq!(final_queue.summary.backed_off_entries, 2);
+        assert_eq!(final_queue.summary.failed_entries, 1);
+        assert_eq!(final_queue.summary.timed_out_entries, 1);
+        assert_eq!(final_queue.summary.succeeded_entries, 0);
+        assert_eq!(
+            final_queue
+                .entries
+                .iter()
+                .find(|entry| entry.signature != sig_a && entry.signature != claimed.signature)
+                .expect("claimable entry should remain")
+                .summary,
+            if claimed.signature == sig_c {
+                "summary-b"
+            } else {
+                "summary-c"
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn load_repro_queue_snapshot_recomputes_summary_and_applies_limit() {
+        let workdir = unique_temp_dir("repro-queue-snapshot");
+        std::fs::create_dir_all(&workdir).expect("temp workdir should be creatable");
+
+        save_timeout(
+            workdir.to_str().expect("temp path should be utf-8"),
+            "snapshot-a",
+            "0. socket$inet(0x2, 0x1, 0x0)\n",
+            "socket$inet",
+            "socket$inet->connect$inet",
+            None,
+        )
+        .expect("first timeout artifact should save");
+        save_timeout(
+            workdir.to_str().expect("temp path should be utf-8"),
+            "snapshot-b",
+            "0. socket$inet(0x2, 0x1, 0x0)\n1. close(...)\n",
+            "socket$inet",
+            "socket$inet->close",
+            None,
+        )
+        .expect("second timeout artifact should save");
+        save_timeout(
+            workdir.to_str().expect("temp path should be utf-8"),
+            "snapshot-c",
+            "0. socket$inet(0x2, 0x1, 0x0)\n2. listen(...)\n",
+            "socket$inet",
+            "socket$inet->listen",
+            None,
+        )
+        .expect("third timeout artifact should save");
+
+        let queue = read_repro_queue(&workdir);
+        let sig_a = queue
+            .entries
+            .iter()
+            .find(|entry| entry.summary == "snapshot-a")
+            .expect("snapshot-a should exist")
+            .signature
+            .clone();
+        assert!(
+            record_repro_queue_attempt_at(&workdir, "timeout", &sig_a, "failed", 100)
+                .expect("backoff should record")
+        );
+        assert!(claim_repro_queue_entry_at(&workdir, "worker-a", 30, 100)
+            .expect("claim should succeed")
+            .is_some());
+
+        let snapshot = load_repro_queue_snapshot_at(&workdir, 2, 100)
+            .expect("snapshot loading should succeed");
+        assert_eq!(snapshot.version, 5);
+        assert_eq!(snapshot.summary.total_entries, 3);
+        assert_eq!(snapshot.summary.claimable_entries, 1);
+        assert_eq!(snapshot.summary.leased_entries, 1);
+        assert_eq!(snapshot.summary.backed_off_entries, 1);
+        assert_eq!(snapshot.summary.failed_entries, 1);
+        assert_eq!(snapshot.entries.len(), 2);
+        assert!(
+            matches!(
+                snapshot.entries[0].summary.as_str(),
+                "snapshot-b" | "snapshot-c"
+            ),
+            "first visible snapshot entry should be the remaining claimable artifact"
+        );
+        assert_eq!(snapshot.entries[0].lease_owner, None);
+        assert_eq!(snapshot.entries[0].next_attempt_not_before_unix_secs, None);
+        assert_eq!(snapshot.entries[1].summary, "snapshot-a");
+        assert_eq!(snapshot.entries[1].lease_owner, None);
+        assert_eq!(
+            snapshot.entries[1].next_attempt_not_before_unix_secs,
+            Some(160)
+        );
+
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn peek_repro_queue_entry_returns_first_claimable_entry() {
+        let workdir = unique_temp_dir("repro-queue-peek");
+        std::fs::create_dir_all(&workdir).expect("temp workdir should be creatable");
+
+        save_timeout(
+            workdir.to_str().expect("temp path should be utf-8"),
+            "peek-a",
+            "0. socket$inet(0x2, 0x1, 0x0)\n",
+            "socket$inet",
+            "socket$inet->connect$inet",
+            None,
+        )
+        .expect("first timeout artifact should save");
+        save_timeout(
+            workdir.to_str().expect("temp path should be utf-8"),
+            "peek-b",
+            "0. socket$inet(0x2, 0x1, 0x0)\n1. close(...)\n",
+            "socket$inet",
+            "socket$inet->close",
+            None,
+        )
+        .expect("second timeout artifact should save");
+
+        let queue = read_repro_queue(&workdir);
+        let sig_a = queue
+            .entries
+            .iter()
+            .find(|entry| entry.summary == "peek-a")
+            .expect("peek-a should exist")
+            .signature
+            .clone();
+        assert!(
+            record_repro_queue_attempt_at(&workdir, "timeout", &sig_a, "failed", 100)
+                .expect("backoff should record")
+        );
+
+        let peeked =
+            peek_repro_queue_entry_at(&workdir, 100).expect("peek should load queue state");
+        let peeked = peeked.expect("one claimable entry should remain");
+        assert_eq!(peeked.summary, "peek-b");
+        assert_eq!(peeked.lease_owner, None);
+        assert_eq!(peeked.next_attempt_not_before_unix_secs, None);
 
         let _ = std::fs::remove_dir_all(&workdir);
     }
@@ -1899,6 +2384,9 @@ mod tests {
             .expect("successful timeout should remain in queue");
         assert!(failed_idx < timed_out_idx);
         assert!(timed_out_idx < succeeded_idx);
+        assert_eq!(rebuilt.summary.failed_entries, 1);
+        assert_eq!(rebuilt.summary.timed_out_entries, 1);
+        assert_eq!(rebuilt.summary.succeeded_entries, 1);
 
         let _ = std::fs::remove_dir_all(&workdir);
     }
@@ -1968,6 +2456,8 @@ mod tests {
         .expect("matching release should succeed"));
 
         let queue = read_repro_queue(&workdir);
+        assert_eq!(queue.summary.leased_entries, 0);
+        assert_eq!(queue.summary.claimable_entries, 1);
         assert_eq!(queue.entries[0].lease_owner, None);
         assert_eq!(queue.entries[0].lease_expires_unix_secs, None);
 
