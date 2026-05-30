@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 const TARGET_ARCH: &str = "amd64";
 const TARGET_PTR_SIZE: u64 = 8;
@@ -27,6 +28,8 @@ fn builtin_types() -> HashMap<String, ArgType> {
                 values: Vec::new(),
                 range: Some((0, 1)),
                 endian: ScalarEndian::Native,
+                allow_any: false,
+                bitfield_bits: None,
             },
         ),
         (
@@ -36,6 +39,8 @@ fn builtin_types() -> HashMap<String, ArgType> {
                 values: Vec::new(),
                 range: Some((0, 1)),
                 endian: ScalarEndian::Native,
+                allow_any: false,
+                bitfield_bits: None,
             },
         ),
         (
@@ -45,6 +50,8 @@ fn builtin_types() -> HashMap<String, ArgType> {
                 values: Vec::new(),
                 range: Some((0, 1)),
                 endian: ScalarEndian::Native,
+                allow_any: false,
+                bitfield_bits: None,
             },
         ),
         (
@@ -54,6 +61,8 @@ fn builtin_types() -> HashMap<String, ArgType> {
                 values: Vec::new(),
                 range: Some((0, 1)),
                 endian: ScalarEndian::Native,
+                allow_any: false,
+                bitfield_bits: None,
             },
         ),
         (
@@ -63,6 +72,27 @@ fn builtin_types() -> HashMap<String, ArgType> {
                 values: Vec::new(),
                 range: Some((0, 1)),
                 endian: ScalarEndian::Native,
+                allow_any: false,
+                bitfield_bits: None,
+            },
+        ),
+        (
+            "fileoff".to_string(),
+            ArgType::Const {
+                size: 8,
+                values: Vec::new(),
+                range: None,
+                endian: ScalarEndian::Native,
+                allow_any: true,
+                bitfield_bits: None,
+            },
+        ),
+        (
+            "compressed_image".to_string(),
+            ArgType::Buffer {
+                min_size: 0,
+                max_size: usize::MAX,
+                dir: BufferDir::Plain,
             },
         ),
     ])
@@ -73,6 +103,7 @@ pub fn parse_syscall_descs(input: &str) -> Result<Vec<SyscallDesc>, String> {
         consts: builtin_consts(),
         types: builtin_types(),
         templates: builtin_templates(),
+        allow_unknown_bare_syscalls: false,
         ..Default::default()
     };
     parse_input(input, "<inline>", None, &mut state, &mut HashSet::new())?;
@@ -84,6 +115,7 @@ pub fn parse_syscall_descs_from_path(path: impl AsRef<Path>) -> Result<Vec<Sysca
         consts: builtin_consts(),
         types: builtin_types(),
         templates: builtin_templates(),
+        allow_unknown_bare_syscalls: true,
         ..Default::default()
     };
     parse_path(path.as_ref(), &mut state, &mut HashSet::new())?;
@@ -100,6 +132,8 @@ struct ParseState {
     templates: HashMap<String, TypeTemplate>,
     resources: HashMap<String, ResourceDesc>,
     descs: Vec<SyscallDesc>,
+    next_synthetic_syscall_id: u64,
+    allow_unknown_bare_syscalls: bool,
 }
 
 struct PrescanFile {
@@ -108,6 +142,14 @@ struct PrescanFile {
     is_const: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MetaDirective {
+    Automatic,
+    NoExtract,
+    Arches(Vec<String>),
+}
+
+#[derive(Clone)]
 enum PendingTypeDef {
     TypeAlias {
         line_no: usize,
@@ -165,6 +207,19 @@ enum TemplateBody {
 struct TemplateField {
     name: String,
     type_text: String,
+    attrs: FieldAttrs,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct FieldAttrs {
+    overlay: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScalarTypeSpec {
+    size: usize,
+    endian: ScalarEndian,
+    bitfield_bits: Option<u8>,
 }
 
 fn builtin_templates() -> HashMap<String, TypeTemplate> {
@@ -187,10 +242,12 @@ fn builtin_templates() -> HashMap<String, TypeTemplate> {
                         TemplateField {
                             name: "val".to_string(),
                             type_text: "T".to_string(),
+                            attrs: FieldAttrs::default(),
                         },
                         TemplateField {
                             name: "void".to_string(),
                             type_text: "void".to_string(),
+                            attrs: FieldAttrs::default(),
                         },
                     ],
                     attrs: BlockAttrs {
@@ -226,6 +283,7 @@ struct ParseArgContext {
     allow_parent_len: bool,
     field_names: Option<HashMap<String, usize>>,
     current_type_name: Option<String>,
+    recursive_pending_types: Option<HashSet<String>>,
 }
 
 impl ParseArgContext {
@@ -245,6 +303,18 @@ impl ParseArgContext {
 
     fn current_type_name(&self) -> Option<&str> {
         self.current_type_name.as_deref()
+    }
+
+    fn with_recursive_pending_types(
+        mut self,
+        recursive_pending_types: Option<&HashSet<String>>,
+    ) -> Self {
+        self.recursive_pending_types = recursive_pending_types.cloned();
+        self
+    }
+
+    fn recursive_pending_types(&self) -> Option<&HashSet<String>> {
+        self.recursive_pending_types.as_ref()
     }
 }
 
@@ -272,6 +342,9 @@ fn parse_path(
         )
     })?;
     if metadata.is_dir() {
+        if parse_trace_enabled() {
+            eprintln!("parse_path: entering dir {}", resolved.display());
+        }
         prescan_path_definitions(&resolved, state, &mut HashSet::new())?;
 
         let mut entries = fs::read_dir(&resolved)
@@ -311,12 +384,8 @@ fn parse_path(
         return Ok(());
     }
 
-    if resolved.extension() == Some(OsStr::new("txt")) {
-        if let Some(const_sibling) = sibling_const_path(&resolved) {
-            if const_sibling.exists() {
-                parse_path(&const_sibling, state, visited)?;
-            }
-        }
+    if parse_trace_enabled() {
+        eprintln!("parse_path: file {}", resolved.display());
     }
 
     let input = fs::read_to_string(&resolved).map_err(|err| {
@@ -327,16 +396,27 @@ fn parse_path(
         )
     })?;
     if resolved.extension() == Some(OsStr::new("const")) {
-        parse_const_file(&input, &resolved.display().to_string(), &mut state.consts)
-    } else {
-        parse_input(
-            &input,
-            &resolved.display().to_string(),
-            resolved.parent(),
-            state,
-            visited,
-        )
+        return parse_const_file(&input, &resolved.display().to_string(), &mut state.consts);
     }
+
+    let lines = input.lines().collect::<Vec<_>>();
+    if !file_meta_allows_target(&lines, &resolved.display().to_string())? {
+        return Ok(());
+    }
+
+    if let Some(const_sibling) = sibling_const_path(&resolved) {
+        if const_sibling.exists() {
+            parse_path(&const_sibling, state, visited)?;
+        }
+    }
+
+    parse_input(
+        &input,
+        &resolved.display().to_string(),
+        resolved.parent(),
+        state,
+        visited,
+    )
 }
 
 fn prescan_path_definitions(
@@ -365,6 +445,13 @@ fn prescan_path_definitions(
     if metadata.is_dir() {
         let mut files = Vec::new();
         collect_prescan_files(&resolved, &mut files, &mut HashSet::new())?;
+        if parse_trace_enabled() {
+            eprintln!(
+                "prescan_path_definitions: {} gathered {} files",
+                resolved.display(),
+                files.len()
+            );
+        }
 
         let pending_resources = files
             .iter()
@@ -396,11 +483,6 @@ fn prescan_path_definitions(
     }
 
     if resolved.extension() == Some(OsStr::new("txt")) {
-        if let Some(const_sibling) = sibling_const_path(&resolved) {
-            if const_sibling.exists() {
-                prescan_path_definitions(&const_sibling, state, visited)?;
-            }
-        }
         let input = fs::read_to_string(&resolved).map_err(|err| {
             format!(
                 "failed to read description file {}: {}",
@@ -410,6 +492,14 @@ fn prescan_path_definitions(
         })?;
         let source = resolved.display().to_string();
         let lines = input.lines().collect::<Vec<_>>();
+        if !file_meta_allows_target(&lines, &source)? {
+            return Ok(());
+        }
+        if let Some(const_sibling) = sibling_const_path(&resolved) {
+            if const_sibling.exists() {
+                prescan_path_definitions(&const_sibling, state, visited)?;
+            }
+        }
         prescan_local_resource_definitions(&lines, &source, state)?;
         prescan_local_value_definitions(&lines, &source, state)?;
         return Ok(());
@@ -489,14 +579,6 @@ fn collect_prescan_files(
         return Ok(());
     }
 
-    if resolved.extension() == Some(OsStr::new("txt")) {
-        if let Some(const_sibling) = sibling_const_path(&resolved) {
-            if const_sibling.exists() {
-                collect_prescan_files(&const_sibling, files, visited)?;
-            }
-        }
-    }
-
     let input = fs::read_to_string(&resolved).map_err(|err| {
         format!(
             "failed to read description file {}: {}",
@@ -504,6 +586,17 @@ fn collect_prescan_files(
             err
         )
     })?;
+    if resolved.extension() == Some(OsStr::new("txt")) {
+        let lines = input.lines().collect::<Vec<_>>();
+        if !file_meta_allows_target(&lines, &resolved.display().to_string())? {
+            return Ok(());
+        }
+        if let Some(const_sibling) = sibling_const_path(&resolved) {
+            if const_sibling.exists() {
+                collect_prescan_files(&const_sibling, files, visited)?;
+            }
+        }
+    }
     files.push(PrescanFile {
         source: resolved.display().to_string(),
         lines: input.lines().map(str::to_string).collect(),
@@ -520,6 +613,29 @@ fn parse_input(
     visited: &mut HashSet<PathBuf>,
 ) -> Result<(), String> {
     let lines = input.lines().collect::<Vec<_>>();
+    if !file_meta_allows_target(&lines, source)? {
+        return Ok(());
+    }
+    if let Some(base_dir) = base_dir {
+        for (index, raw_line) in lines.iter().enumerate() {
+            let line_no = index + 1;
+            let line = strip_comment(raw_line).trim();
+            let Some(rest) = line.strip_prefix("include ") else {
+                continue;
+            };
+            if is_header_include(rest) {
+                continue;
+            }
+            let include_path = parse_include_path(line_no, rest)?;
+            let include_path = if include_path.is_absolute() {
+                include_path
+            } else {
+                base_dir.join(include_path)
+            };
+            parse_path(&include_path, state, visited)
+                .map_err(|err| format!("{}: line {}: {}", source, line_no, err))?;
+        }
+    }
     prescan_local_resource_definitions(&lines, source, state)?;
     prescan_local_value_definitions(&lines, source, state)?;
     let mut index = 0usize;
@@ -530,6 +646,14 @@ fn parse_input(
         let line = strip_comment(lines[index]).trim();
         index += 1;
         if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("meta ") {
+            parse_meta_directive(line_no, rest).map_err(|err| format!("{}: {}", source, err))?;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("incdir ") {
+            parse_incdir_path(line_no, rest).map_err(|err| format!("{}: {}", source, err))?;
             continue;
         }
         if let Some(rest) = line.strip_prefix("include ") {
@@ -566,7 +690,9 @@ fn parse_input(
                 .map_err(|err| format!("{}: {}", source, err))?;
             continue;
         }
-        if line.starts_with("define ") {
+        if let Some(rest) = line.strip_prefix("define ") {
+            parse_define(line_no, rest, &mut state.consts)
+                .map_err(|err| format!("{}: {}", source, err))?;
             continue;
         }
         if let Some(rest) = line.strip_prefix("type ") {
@@ -665,6 +791,8 @@ fn parse_input(
                 &state.types,
                 &state.templates,
                 &state.resources,
+                &mut state.next_synthetic_syscall_id,
+                state.allow_unknown_bare_syscalls,
             )
             .map_err(|err| format!("{}: {}", source, err))?,
         );
@@ -684,11 +812,18 @@ fn collect_block_lines(
         let line = lines[*index];
         block_lines.push(line.to_string());
         *index += 1;
-        if strip_comment(line).trim().strip_prefix(terminator).is_some() {
+        if strip_comment(line)
+            .trim()
+            .strip_prefix(terminator)
+            .is_some()
+        {
             return Ok(block_lines);
         }
     }
-    Err(format!("line {}: block is missing closing '{}'", line_no, terminator))
+    Err(format!(
+        "line {}: block is missing closing '{}'",
+        line_no, terminator
+    ))
 }
 
 fn collect_pending_type_definitions(lines: &[&str]) -> Result<Vec<PendingTypeDef>, String> {
@@ -759,13 +894,29 @@ fn resolve_pending_type_definitions(
     state: &mut ParseState,
     source: &str,
 ) -> Result<(), String> {
+    let mut round = 0usize;
     while !pending.is_empty() {
+        round += 1;
         let mut progress = false;
         let mut remaining = Vec::new();
+        let mut remaining_errors = Vec::new();
+        let known_types = state.types.clone();
+        let known_templates = state.templates.clone();
+        if parse_trace_enabled() {
+            eprintln!(
+                "resolve_pending_type_definitions: source={} round={} pending={} known_types={} known_templates={}",
+                source,
+                round,
+                pending.len(),
+                known_types.len(),
+                known_templates.len()
+            );
+        }
         for pending_def in pending {
-            match try_parse_pending_type_def(pending_def, state) {
+            match try_parse_pending_type_def(pending_def, state, &known_types, &known_templates) {
                 Ok(()) => progress = true,
                 Err((pending_def, err)) if is_unresolved_type_reference_error(&err) => {
+                    remaining_errors.push(err);
                     remaining.push(pending_def);
                 }
                 Err((pending_def, err)) => {
@@ -779,11 +930,97 @@ fn resolve_pending_type_definitions(
             }
         }
         if !progress {
+            let pending_type_names = remaining
+                .iter()
+                .filter_map(PendingTypeDef::defined_type_name)
+                .collect::<HashSet<_>>();
+            let relaxed_known_types = state.types.clone();
+            let relaxed_known_templates = state.templates.clone();
+            let mut relaxed_remaining = Vec::new();
+            let mut relaxed_errors = Vec::new();
+            let mut relaxed_progress = false;
+            for pending_def in remaining.iter().cloned() {
+                match try_parse_pending_type_def_relaxed(
+                    pending_def,
+                    state,
+                    &relaxed_known_types,
+                    &relaxed_known_templates,
+                    &pending_type_names,
+                ) {
+                    Ok(()) => relaxed_progress = true,
+                    Err((pending_def, err)) if is_unresolved_type_reference_error(&err) => {
+                        relaxed_errors.push(err);
+                        relaxed_remaining.push(pending_def);
+                    }
+                    Err((pending_def, err)) => {
+                        return Err(format!(
+                            "{}: {} while parsing {}",
+                            source,
+                            err,
+                            pending_def.summary()
+                        ))
+                    }
+                }
+            }
+            if relaxed_progress {
+                if parse_trace_enabled() {
+                    eprintln!(
+                        "resolve_pending_type_definitions: source={} round={} salvaged_remaining={}",
+                        source,
+                        round,
+                        relaxed_remaining.len()
+                    );
+                }
+                pending = relaxed_remaining;
+                continue;
+            }
+            let mut sample = remaining
+                .iter()
+                .zip(remaining_errors.iter())
+                .take(3)
+                .map(|(pending_def, err)| format!("{} ({})", pending_def.summary(), err))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let mut next_root = remaining_errors
+                .first()
+                .and_then(|err| unresolved_type_reference_name(err))
+                .map(str::to_string);
+            let mut seen_roots = HashSet::new();
+            let mut depth = 0usize;
+            while let Some(root_name) = next_root.take() {
+                if !seen_roots.insert(root_name.clone()) {
+                    break;
+                }
+                let Some((pending_def, err)) = remaining
+                    .iter()
+                    .zip(remaining_errors.iter())
+                    .find(|(pending_def, _)| pending_def.references_type_name(&root_name))
+                else {
+                    break;
+                };
+                sample.push_str(&format!(
+                    "; root {} blocked by {}",
+                    root_name,
+                    format!("{} ({})", pending_def.summary(), err)
+                ));
+                depth += 1;
+                if depth >= 3 {
+                    break;
+                }
+                next_root = unresolved_type_reference_name(err).map(str::to_string);
+            }
             return Err(format!(
-                "{}: unresolved type definition '{}'",
-                source,
-                remaining[0].summary()
+                "{}: unresolved type definitions: {}",
+                source, sample
             ));
+        }
+        if parse_trace_enabled() {
+            eprintln!(
+                "resolve_pending_type_definitions: source={} round={} remaining={}",
+                source,
+                round,
+                remaining.len()
+            );
         }
         pending = remaining;
     }
@@ -793,25 +1030,49 @@ fn resolve_pending_type_definitions(
 fn try_parse_pending_type_def(
     pending: PendingTypeDef,
     state: &mut ParseState,
+    known_types: &HashMap<String, ArgType>,
+    known_templates: &HashMap<String, TypeTemplate>,
+) -> Result<(), (PendingTypeDef, String)> {
+    try_parse_pending_type_def_impl(pending, state, known_types, known_templates, None)
+}
+
+fn try_parse_pending_type_def_relaxed(
+    pending: PendingTypeDef,
+    state: &mut ParseState,
+    known_types: &HashMap<String, ArgType>,
+    known_templates: &HashMap<String, TypeTemplate>,
+    recursive_pending_types: &HashSet<String>,
+) -> Result<(), (PendingTypeDef, String)> {
+    try_parse_pending_type_def_impl(
+        pending,
+        state,
+        known_types,
+        known_templates,
+        Some(recursive_pending_types),
+    )
+}
+
+fn try_parse_pending_type_def_impl(
+    pending: PendingTypeDef,
+    state: &mut ParseState,
+    known_types: &HashMap<String, ArgType>,
+    known_templates: &HashMap<String, TypeTemplate>,
+    recursive_pending_types: Option<&HashSet<String>>,
 ) -> Result<(), (PendingTypeDef, String)> {
     let result = match &pending {
-        PendingTypeDef::TypeAlias { line_no, rest } => {
-            let known_types = state.types.clone();
-            let known_templates = state.templates.clone();
-            parse_type_alias(
-                *line_no,
-                rest,
-                &state.consts,
-                &state.const_sets,
-                &state.flag_sets,
-                &state.string_sets,
-                &known_types,
-                &known_templates,
-                &state.resources,
-                &mut state.types,
-                &mut state.templates,
-            )
-        }
+        PendingTypeDef::TypeAlias { line_no, rest } => parse_type_alias(
+            *line_no,
+            rest,
+            &state.consts,
+            &state.const_sets,
+            &state.flag_sets,
+            &state.string_sets,
+            known_types,
+            known_templates,
+            &state.resources,
+            &mut state.types,
+            &mut state.templates,
+        ),
         PendingTypeDef::TypeStruct {
             line_no,
             rest,
@@ -819,8 +1080,6 @@ fn try_parse_pending_type_def(
         } => {
             let lines = block_lines.iter().map(String::as_str).collect::<Vec<_>>();
             let mut index = 0usize;
-            let known_types = state.types.clone();
-            let known_templates = state.templates.clone();
             parse_type_struct_block(
                 *line_no,
                 rest,
@@ -830,11 +1089,12 @@ fn try_parse_pending_type_def(
                 &state.const_sets,
                 &state.flag_sets,
                 &state.string_sets,
-                &known_types,
-                &known_templates,
+                known_types,
+                known_templates,
                 &state.resources,
                 &mut state.types,
                 &mut state.templates,
+                recursive_pending_types,
             )
         }
         PendingTypeDef::TypeUnion {
@@ -844,8 +1104,6 @@ fn try_parse_pending_type_def(
         } => {
             let lines = block_lines.iter().map(String::as_str).collect::<Vec<_>>();
             let mut index = 0usize;
-            let known_types = state.types.clone();
-            let known_templates = state.templates.clone();
             parse_type_union_block(
                 *line_no,
                 rest,
@@ -855,11 +1113,12 @@ fn try_parse_pending_type_def(
                 &state.const_sets,
                 &state.flag_sets,
                 &state.string_sets,
-                &known_types,
-                &known_templates,
+                known_types,
+                known_templates,
                 &state.resources,
                 &mut state.types,
                 &mut state.templates,
+                recursive_pending_types,
             )
         }
         PendingTypeDef::Struct {
@@ -869,7 +1128,6 @@ fn try_parse_pending_type_def(
         } => {
             let lines = block_lines.iter().map(String::as_str).collect::<Vec<_>>();
             let mut index = 0usize;
-            let known_types = state.types.clone();
             parse_struct_block(
                 *line_no,
                 line,
@@ -879,10 +1137,11 @@ fn try_parse_pending_type_def(
                 &state.const_sets,
                 &state.flag_sets,
                 &state.string_sets,
-                &known_types,
-                &state.templates,
+                known_types,
+                known_templates,
                 &state.resources,
                 &mut state.types,
+                recursive_pending_types,
             )
         }
         PendingTypeDef::Union {
@@ -892,7 +1151,6 @@ fn try_parse_pending_type_def(
         } => {
             let lines = block_lines.iter().map(String::as_str).collect::<Vec<_>>();
             let mut index = 0usize;
-            let known_types = state.types.clone();
             parse_union_block(
                 *line_no,
                 line,
@@ -902,10 +1160,11 @@ fn try_parse_pending_type_def(
                 &state.const_sets,
                 &state.flag_sets,
                 &state.string_sets,
-                &known_types,
-                &state.templates,
+                known_types,
+                known_templates,
                 &state.resources,
                 &mut state.types,
+                recursive_pending_types,
             )
         }
     };
@@ -924,6 +1183,49 @@ impl PendingTypeDef {
             }
         }
     }
+
+    fn references_type_name(&self, type_name: &str) -> bool {
+        let summary = self.summary();
+        summary == format!("{type_name} [")
+            || summary == format!("{type_name} {{")
+            || summary.starts_with(&format!("type {type_name} "))
+            || summary == format!("type {type_name}")
+    }
+
+    fn defined_type_name(&self) -> Option<String> {
+        match self {
+            PendingTypeDef::TypeAlias { rest, .. } => pending_def_type_name_from_alias(rest),
+            PendingTypeDef::TypeStruct { rest, .. } | PendingTypeDef::TypeUnion { rest, .. } => {
+                pending_def_type_name_from_header(rest)
+            }
+            PendingTypeDef::Struct { line, .. } | PendingTypeDef::Union { line, .. } => {
+                pending_def_type_name_from_header(line)
+            }
+        }
+    }
+}
+
+fn pending_def_type_name_from_alias(text: &str) -> Option<String> {
+    let (head, _) = split_type_definition_head_and_body(text)?;
+    pending_def_type_name_from_head(head)
+}
+
+fn pending_def_type_name_from_header(text: &str) -> Option<String> {
+    let head = text
+        .strip_suffix('{')
+        .or_else(|| text.strip_suffix('['))
+        .unwrap_or(text);
+    pending_def_type_name_from_head(head)
+}
+
+fn pending_def_type_name_from_head(text: &str) -> Option<String> {
+    let head = text.trim();
+    let name = head
+        .split_once('[')
+        .map(|(name, _)| name)
+        .unwrap_or(head)
+        .trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 fn prescan_local_resource_definitions(
@@ -1055,10 +1357,10 @@ fn prescan_local_value_definitions(
     while !pending_implicit_sets.is_empty() {
         let mut progress = false;
         let mut remaining = Vec::new();
+        let known_const_sets = state.const_sets.clone();
+        let known_flag_sets = state.flag_sets.clone();
+        let known_string_sets = state.string_sets.clone();
         for (line_no, line) in pending_implicit_sets {
-            let known_const_sets = state.const_sets.clone();
-            let known_flag_sets = state.flag_sets.clone();
-            let known_string_sets = state.string_sets.clone();
             match parse_implicit_value_set(
                 line_no,
                 &line,
@@ -1087,6 +1389,19 @@ fn prescan_local_value_definitions(
         pending_implicit_sets = remaining;
     }
     Ok(())
+}
+
+fn parse_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("SYZKALLER_RUST_TRACE_PARSE").is_some())
+}
+
+fn unresolved_type_reference_name<'a>(err: &'a str) -> Option<&'a str> {
+    let prefix = "unresolved type reference '";
+    let start = err.find(prefix)? + prefix.len();
+    let rest = &err[start..];
+    let end = rest.find('\'')?;
+    Some(&rest[..end])
 }
 
 fn strip_comment(line: &str) -> &str {
@@ -1179,7 +1494,12 @@ fn path_sort_key(path: &Path) -> (u8, String, u8, String) {
     } else {
         (file_name.to_string(), 4u8)
     };
-    (root_priority, normalized, priority, path.display().to_string())
+    (
+        root_priority,
+        normalized,
+        priority,
+        path.display().to_string(),
+    )
 }
 
 fn sibling_const_path(path: &Path) -> Option<PathBuf> {
@@ -1299,6 +1619,89 @@ fn arch_filter_allows_target(filter: &str, target_arch: &str) -> bool {
         .any(|arch| !arch.is_empty() && arch == target_arch)
 }
 
+fn file_meta_allows_target(lines: &[&str], source: &str) -> Result<bool, String> {
+    let mut allow = true;
+    let mut index = 0usize;
+    while index < lines.len() {
+        let line_no = index + 1;
+        let line = strip_comment(lines[index]).trim();
+        index += 1;
+        if line.is_empty() {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("meta ") else {
+            if line.starts_with("type ") && line.ends_with('{') {
+                collect_block_lines(lines, &mut index, line_no, "}")
+                    .map_err(|err| format!("{}: {}", source, err))?;
+                continue;
+            }
+            if line.starts_with("type ") && line.ends_with('[') {
+                collect_block_lines(lines, &mut index, line_no, "]")
+                    .map_err(|err| format!("{}: {}", source, err))?;
+                continue;
+            }
+            if line.ends_with('{') {
+                collect_block_lines(lines, &mut index, line_no, "}")
+                    .map_err(|err| format!("{}: {}", source, err))?;
+                continue;
+            }
+            if line.ends_with('[') {
+                collect_block_lines(lines, &mut index, line_no, "]")
+                    .map_err(|err| format!("{}: {}", source, err))?;
+                continue;
+            }
+            continue;
+        };
+        match parse_meta_directive(line_no, rest).map_err(|err| format!("{}: {}", source, err))? {
+            MetaDirective::Automatic | MetaDirective::NoExtract => {}
+            MetaDirective::Arches(arches) => {
+                allow &= arches.iter().any(|arch| arch == TARGET_ARCH);
+            }
+        }
+    }
+    Ok(allow)
+}
+
+fn parse_meta_directive(line_no: usize, rest: &str) -> Result<MetaDirective, String> {
+    let rest = rest.trim();
+    match rest {
+        "automatic" => return Ok(MetaDirective::Automatic),
+        "noextract" => return Ok(MetaDirective::NoExtract),
+        _ => {}
+    }
+    let Some(inner) = bracketed(rest, "arches") else {
+        return Err(format!(
+            "line {}: unsupported meta statement '{}'",
+            line_no, rest
+        ));
+    };
+    let mut arches = Vec::new();
+    for value in split_top_level(inner, ',') {
+        let raw = value.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let bytes = parse_string_literal(raw, line_no)?;
+        let arch = String::from_utf8(bytes).map_err(|err| {
+            format!(
+                "line {}: meta arches entry {} is not valid UTF-8: {}",
+                line_no, raw, err
+            )
+        })?;
+        if !is_known_arch_name(&arch) {
+            return Err(format!(
+                "line {}: unknown architecture '{}' in meta arches",
+                line_no, arch
+            ));
+        }
+        arches.push(arch);
+    }
+    if arches.is_empty() {
+        return Err(format!("line {}: meta arches list is empty", line_no));
+    }
+    Ok(MetaDirective::Arches(arches))
+}
+
 fn parse_include_path(line_no: usize, rest: &str) -> Result<PathBuf, String> {
     let path = rest.trim();
     if path.is_empty() {
@@ -1312,6 +1715,31 @@ fn parse_include_path(line_no: usize, rest: &str) -> Result<PathBuf, String> {
         return Err(format!("line {}: include path is empty", line_no));
     }
     Ok(PathBuf::from(path))
+}
+
+fn parse_incdir_path(line_no: usize, rest: &str) -> Result<(), String> {
+    let path = rest.trim();
+    if path.is_empty() {
+        return Err(format!("line {}: incdir path is empty", line_no));
+    }
+    if path
+        .strip_prefix('<')
+        .and_then(|path| path.strip_suffix('>'))
+        .is_some()
+    {
+        return Ok(());
+    }
+    if path
+        .strip_prefix('"')
+        .and_then(|path| path.strip_suffix('"'))
+        .is_some()
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "line {}: incdir must use <path> or \"path\" syntax",
+        line_no
+    ))
 }
 
 fn is_header_include(rest: &str) -> bool {
@@ -1346,6 +1774,29 @@ fn parse_const(
     }
     let value = parse_expr(expr.trim(), consts, line_no)?;
     consts.insert(name.to_string(), value);
+    Ok(())
+}
+
+fn parse_define(
+    line_no: usize,
+    rest: &str,
+    consts: &mut HashMap<String, u64>,
+) -> Result<(), String> {
+    let rest = rest.trim();
+    let split = rest
+        .find(char::is_whitespace)
+        .ok_or_else(|| format!("line {}: expected define NAME VALUE", line_no))?;
+    let name = rest[..split].trim();
+    let value_expr = rest[split..].trim();
+    if name.is_empty() {
+        return Err(format!("line {}: define name is empty", line_no));
+    }
+    if value_expr.is_empty() {
+        return Err(format!("line {}: define value is empty", line_no));
+    }
+    if let Ok(value) = parse_expr(value_expr, consts, line_no) {
+        consts.insert(name.to_string(), value);
+    }
     Ok(())
 }
 
@@ -1386,7 +1837,10 @@ fn parse_resource(
         }
         None => {
             if is_identifier_like(base) {
-                return Err(format!("line {}: unresolved resource base '{}'", line_no, base));
+                return Err(format!(
+                    "line {}: unresolved resource base '{}'",
+                    line_no, base
+                ));
             }
             let size = parse_integer(base, line_no)? as usize;
             (size, vec![kind.to_string()])
@@ -1436,7 +1890,10 @@ fn parse_implicit_value_set(
         return Err(format!("line {}: value set name is empty", line_no));
     }
     let raw_values = split_top_level(values.trim(), ',');
-    if raw_values.iter().any(|value| is_string_literal(value.trim())) {
+    if raw_values
+        .iter()
+        .any(|value| is_string_literal(value.trim()))
+    {
         let values = expand_string_value_entries(raw_values, known_string_sets, line_no)?;
         string_sets.insert(name.to_string(), values);
     } else {
@@ -1494,7 +1951,10 @@ fn expand_numeric_value_entries(
     let mut values = Vec::new();
     for raw_value in raw_values {
         let raw_value = raw_value.trim();
-        if let Some(set) = const_sets.get(raw_value).or_else(|| flag_sets.get(raw_value)) {
+        if let Some(set) = const_sets
+            .get(raw_value)
+            .or_else(|| flag_sets.get(raw_value))
+        {
             values.extend(set.values.iter().copied());
             continue;
         }
@@ -1526,8 +1986,7 @@ fn parse_type_alias(
     out_templates: &mut HashMap<String, TypeTemplate>,
 ) -> Result<(), String> {
     let arg_names = HashMap::new();
-    let (name, type_text) = rest
-        .split_once(char::is_whitespace)
+    let (name, type_text) = split_type_definition_head_and_body(rest)
         .ok_or_else(|| format!("line {}: type declaration is missing a body", line_no))?;
     let name = name.trim();
     let type_text = type_text.trim();
@@ -1546,7 +2005,7 @@ fn parse_type_alias(
         );
         return Ok(());
     }
-    if let Ok(arg_type) = parse_arg(
+    let arg_type = parse_arg(
         type_text,
         consts,
         const_sets,
@@ -1561,10 +2020,10 @@ fn parse_type_alias(
             allow_parent_len: true,
             field_names: None,
             current_type_name: None,
+            recursive_pending_types: None,
         },
-    ) {
-        out_types.insert(name.to_string(), annotate_named_arg_type(arg_type, &name));
-    }
+    )?;
+    out_types.insert(name.to_string(), annotate_named_arg_type(arg_type, &name));
     Ok(())
 }
 
@@ -1581,6 +2040,7 @@ fn parse_struct_block(
     templates: &HashMap<String, TypeTemplate>,
     resources: &HashMap<String, ResourceDesc>,
     out_types: &mut HashMap<String, ArgType>,
+    recursive_pending_types: Option<&HashSet<String>>,
 ) -> Result<(), String> {
     let name = header.strip_suffix('{').unwrap_or(header).trim();
     if name.is_empty() {
@@ -1602,6 +2062,7 @@ fn parse_struct_block(
         resources,
         line_no,
         None,
+        recursive_pending_types,
     )?;
     out_types.insert(name.to_string(), arg_type);
     Ok(())
@@ -1620,6 +2081,7 @@ fn parse_union_block(
     templates: &HashMap<String, TypeTemplate>,
     resources: &HashMap<String, ResourceDesc>,
     out_types: &mut HashMap<String, ArgType>,
+    recursive_pending_types: Option<&HashSet<String>>,
 ) -> Result<(), String> {
     let name = header.strip_suffix('[').unwrap_or(header).trim();
     if name.is_empty() {
@@ -1639,6 +2101,7 @@ fn parse_union_block(
         resources,
         line_no,
         None,
+        recursive_pending_types,
     )?;
     out_types.insert(name.to_string(), arg_type);
     Ok(())
@@ -1658,6 +2121,7 @@ fn parse_type_struct_block(
     resources: &HashMap<String, ResourceDesc>,
     out_types: &mut HashMap<String, ArgType>,
     out_templates: &mut HashMap<String, TypeTemplate>,
+    recursive_pending_types: Option<&HashSet<String>>,
 ) -> Result<(), String> {
     let head = header.strip_suffix('{').unwrap_or(header).trim();
     let (name, params) = parse_template_head(head, line_no)?;
@@ -1672,6 +2136,7 @@ fn parse_type_struct_block(
                     fields: vec![TemplateField {
                         name: "void".to_string(),
                         type_text: "void".to_string(),
+                        attrs: FieldAttrs::default(),
                     }],
                     attrs: BlockAttrs::default(),
                 },
@@ -1696,6 +2161,7 @@ fn parse_type_struct_block(
             resources,
             line_no,
             None,
+            recursive_pending_types,
         )?;
         out_types.insert(name, arg_type);
     } else {
@@ -1725,6 +2191,7 @@ fn parse_type_union_block(
     resources: &HashMap<String, ResourceDesc>,
     out_types: &mut HashMap<String, ArgType>,
     out_templates: &mut HashMap<String, TypeTemplate>,
+    recursive_pending_types: Option<&HashSet<String>>,
 ) -> Result<(), String> {
     let head = header.strip_suffix('[').unwrap_or(header).trim();
     let (name, params) = parse_template_head(head, line_no)?;
@@ -1743,6 +2210,7 @@ fn parse_type_union_block(
             resources,
             line_no,
             None,
+            recursive_pending_types,
         )?;
         out_types.insert(name, arg_type);
     } else {
@@ -1782,10 +2250,13 @@ fn collect_template_block_fields(
         let field_name = parts
             .next()
             .ok_or_else(|| format!("line {}: block field is empty", field_line_no))?;
-        let mut type_text = parts.collect::<Vec<_>>().join(" ");
-        if let Some((type_only, _attrs)) = type_text.split_once(" (") {
-            type_text = type_only.trim().to_string();
-        }
+        let raw_type_text = parts.collect::<Vec<_>>().join(" ");
+        let (type_text, field_attrs) =
+            if let Some((type_only, attrs_text)) = raw_type_text.split_once(" (") {
+                (type_only.trim().to_string(), parse_field_attrs(attrs_text))
+            } else {
+                (raw_type_text, FieldAttrs::default())
+            };
         if type_text.is_empty() {
             return Err(format!(
                 "line {}: block field '{}' is missing a type",
@@ -1795,12 +2266,45 @@ fn collect_template_block_fields(
         fields.push(TemplateField {
             name: field_name.to_string(),
             type_text,
+            attrs: field_attrs,
         });
     }
     if fields.is_empty() {
         return Err(format!("line {}: block has no fields", line_no));
     }
     Ok((fields, attrs))
+}
+
+fn parse_field_attrs(text: &str) -> FieldAttrs {
+    let mut attrs = FieldAttrs::default();
+    let inner = text.trim().strip_suffix(')').unwrap_or(text.trim());
+    for attr in split_top_level(inner, ',') {
+        match attr.trim() {
+            "out_overlay" | "in_overlay" => attrs.overlay = true,
+            _ => {}
+        }
+    }
+    attrs
+}
+
+fn struct_overlay_start(fields: &[TemplateField], line_no: usize) -> Result<Option<usize>, String> {
+    let overlay_indices = fields
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, field)| field.attrs.overlay.then_some(idx))
+        .collect::<Vec<_>>();
+    match overlay_indices.as_slice() {
+        [] => Ok(None),
+        [0] => Err(format!(
+            "line {}: overlay field must not be the first struct field",
+            line_no
+        )),
+        [idx] => Ok(Some(*idx)),
+        _ => Err(format!(
+            "line {}: multiple overlay fields in one struct are not supported",
+            line_no
+        )),
+    }
 }
 
 fn build_struct_arg_type(
@@ -1818,8 +2322,10 @@ fn build_struct_arg_type(
     resources: &HashMap<String, ResourceDesc>,
     line_no: usize,
     bindings: Option<&HashMap<String, String>>,
+    recursive_pending_types: Option<&HashSet<String>>,
 ) -> Result<ArgType, String> {
     let arg_names = HashMap::new();
+    let overlay_start = struct_overlay_start(fields, line_no)?;
     let field_names = fields
         .iter()
         .enumerate()
@@ -1845,15 +2351,22 @@ fn build_struct_arg_type(
                 allow_parent_len: true,
                 field_names: None,
                 current_type_name: None,
+                recursive_pending_types: None,
             }
             .with_current_type_name(type_name)
-            .with_field_names(&field_names),
+            .with_field_names(&field_names)
+            .with_recursive_pending_types(recursive_pending_types),
         )?;
         parsed_fields.push(arg_type);
     }
     let mut parsed_field_names = fields.iter().map(|field| field.name.clone()).collect();
     let (parsed_fields, field_prefix_size, has_var_tail) =
-        match crate::program::struct_layout_prefix_size(&parsed_fields, packed, align) {
+        match crate::program::struct_layout_prefix_size(
+            &parsed_fields,
+            packed,
+            align,
+            overlay_start,
+        ) {
             Ok((field_prefix_size, has_var_tail)) => {
                 (parsed_fields, field_prefix_size, has_var_tail)
             }
@@ -1863,8 +2376,13 @@ fn build_struct_arg_type(
                 {
                     parsed_field_names = truncated_field_names;
                     let (field_prefix_size, has_var_tail) =
-                        crate::program::struct_layout_prefix_size(&truncated_fields, packed, align)
-                            .map_err(|retry_err| format!("line {}: {}", line_no, retry_err))?;
+                        crate::program::struct_layout_prefix_size(
+                            &truncated_fields,
+                            packed,
+                            align,
+                            overlay_start,
+                        )
+                        .map_err(|retry_err| format!("line {}: {}", line_no, retry_err))?;
                     return Ok(ArgType::Struct {
                         type_name: type_name.map(str::to_string),
                         fields: truncated_fields,
@@ -1873,15 +2391,20 @@ fn build_struct_arg_type(
                         varlen: has_var_tail,
                         packed,
                         align,
+                        overlay_start,
                     });
                 }
                 let coerced_fields = coerce_opaque_fields_to_pointers(&parsed_fields);
                 if coerced_fields == parsed_fields {
                     return Err(format!("line {}: {}", line_no, err));
                 }
-                let (field_prefix_size, has_var_tail) =
-                    crate::program::struct_layout_prefix_size(&coerced_fields, packed, align)
-                        .map_err(|retry_err| format!("line {}: {}", line_no, retry_err))?;
+                let (field_prefix_size, has_var_tail) = crate::program::struct_layout_prefix_size(
+                    &coerced_fields,
+                    packed,
+                    align,
+                    overlay_start,
+                )
+                .map_err(|retry_err| format!("line {}: {}", line_no, retry_err))?;
                 (coerced_fields, field_prefix_size, has_var_tail)
             }
             Err(err) => return Err(format!("line {}: {}", line_no, err)),
@@ -1901,6 +2424,7 @@ fn build_struct_arg_type(
         varlen: has_var_tail,
         packed,
         align,
+        overlay_start,
     })
 }
 
@@ -1917,19 +2441,22 @@ fn build_union_arg_type(
     resources: &HashMap<String, ResourceDesc>,
     line_no: usize,
     bindings: Option<&HashMap<String, String>>,
+    recursive_pending_types: Option<&HashSet<String>>,
 ) -> Result<ArgType, String> {
     let arg_names = HashMap::new();
-    let field_names = fields
+    let all_field_names = fields
         .iter()
         .enumerate()
         .map(|(idx, field)| (field.name.clone(), idx))
         .collect::<HashMap<_, _>>();
     let mut parsed_fields = Vec::new();
+    let mut parsed_field_names = Vec::new();
+    let mut skipped_recursive_fields = false;
     for field in fields {
         let type_text = bindings
             .map(|bindings| substitute_template_params(&field.type_text, bindings))
             .unwrap_or_else(|| field.type_text.clone());
-        let arg_type = parse_arg(
+        let arg_type = match parse_arg(
             &type_text,
             consts,
             const_sets,
@@ -1944,11 +2471,101 @@ fn build_union_arg_type(
                 allow_parent_len: true,
                 field_names: None,
                 current_type_name: None,
+                recursive_pending_types: None,
             }
             .with_current_type_name(type_name)
-            .with_field_names(&field_names),
-        )?;
+            .with_field_names(&all_field_names)
+            .with_recursive_pending_types(recursive_pending_types),
+        ) {
+            Ok(arg_type) => arg_type,
+            Err(err)
+                if is_unresolved_type_reference_error(&err)
+                    && recursive_pending_types.is_some_and(|pending_names| {
+                        unresolved_type_reference_name(&err)
+                            .is_some_and(|name| pending_names.contains(name))
+                    }) =>
+            {
+                if let Some(pointer_arg_type) = parse_opaque_recursive_pointer_arg(&type_text) {
+                    if parse_trace_enabled() {
+                        eprintln!(
+                            "build_union_arg_type: materializing opaque recursive pointer field {}.{} = {} ({})",
+                            type_name.unwrap_or("<anonymous>"),
+                            field.name,
+                            type_text,
+                            err
+                        );
+                    }
+                    pointer_arg_type
+                } else if attrs.varlen {
+                    if parse_trace_enabled() {
+                        eprintln!(
+                            "build_union_arg_type: skipping cyclic pending varlen field {}.{} = {} ({})",
+                            type_name.unwrap_or("<anonymous>"),
+                            field.name,
+                            type_text,
+                            err
+                        );
+                    }
+                    skipped_recursive_fields = true;
+                    continue;
+                } else {
+                    return Err(err);
+                }
+            }
+            Err(err)
+                if attrs.varlen
+                    && type_name.is_some_and(|name| {
+                        type_text_references_type_name(&type_text, name)
+                            && is_unresolved_type_reference_error(&err)
+                    }) =>
+            {
+                if parse_trace_enabled() {
+                    eprintln!(
+                        "build_union_arg_type: skipping recursive varlen field {}.{} = {} ({})",
+                        type_name.unwrap_or("<anonymous>"),
+                        field.name,
+                        type_text,
+                        err
+                    );
+                }
+                skipped_recursive_fields = true;
+                continue;
+            }
+            Err(err)
+                if attrs.varlen
+                    && is_unresolved_type_reference_error(&err)
+                    && recursive_pending_types.is_some_and(|pending_names| {
+                        unresolved_type_reference_name(&err)
+                            .is_some_and(|name| pending_names.contains(name))
+                    }) =>
+            {
+                if parse_trace_enabled() {
+                    eprintln!(
+                        "build_union_arg_type: skipping cyclic pending varlen field {}.{} = {} ({})",
+                        type_name.unwrap_or("<anonymous>"),
+                        field.name,
+                        type_text,
+                        err
+                    );
+                }
+                skipped_recursive_fields = true;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        parsed_field_names.push(field.name.clone());
         parsed_fields.push(arg_type);
+    }
+    if parsed_fields.is_empty() {
+        if attrs.varlen && skipped_recursive_fields {
+            parsed_fields.push(ArgType::Void);
+            parsed_field_names.push("void".to_string());
+        } else {
+            return Err(format!(
+                "line {}: union must retain at least one field after recursive field filtering",
+                line_no
+            ));
+        }
     }
     let (parsed_fields, max_field_size) =
         match parsed_fields.iter().try_fold(0usize, |acc, field| {
@@ -1966,12 +2583,14 @@ fn build_union_arg_type(
                 if coerced_fields == parsed_fields {
                     return Err(format!("line {}: {}", line_no, err));
                 }
-                let max_field_size = coerced_fields.iter().try_fold(0usize, |acc, field| {
-                    let size = crate::program::arg_type_fixed_size(field)
-                        .ok_or_else(|| "union fields must be fixed-size".to_string())?;
-                    Ok::<usize, String>(acc.max(size))
-                })
-                .map_err(|retry_err| format!("line {}: {}", line_no, retry_err))?;
+                let max_field_size = coerced_fields
+                    .iter()
+                    .try_fold(0usize, |acc, field| {
+                        let size = crate::program::arg_type_fixed_size(field)
+                            .ok_or_else(|| "union fields must be fixed-size".to_string())?;
+                        Ok::<usize, String>(acc.max(size))
+                    })
+                    .map_err(|retry_err| format!("line {}: {}", line_no, retry_err))?;
                 (coerced_fields, max_field_size)
             }
             Err(err) => return Err(format!("line {}: {}", line_no, err)),
@@ -1996,7 +2615,7 @@ fn build_union_arg_type(
     Ok(ArgType::Union {
         type_name: type_name.map(str::to_string),
         fields: parsed_fields,
-        field_names: fields.iter().map(|field| field.name.clone()).collect(),
+        field_names: parsed_field_names,
         size,
         varlen: attrs.varlen,
         packed: attrs.packed,
@@ -2004,11 +2623,124 @@ fn build_union_arg_type(
     })
 }
 
+fn parse_opaque_recursive_pointer_arg(type_text: &str) -> Option<ArgType> {
+    let inner = bracketed(type_text, "ptr").or_else(|| bracketed(type_text, "ptr64"))?;
+    let parts = split_type_parts(inner);
+    if !(2..=3).contains(&parts.len()) {
+        return None;
+    }
+    let dir = match parts[0].trim() {
+        "in" => PtrDir::In,
+        "out" => PtrDir::Out,
+        "inout" => PtrDir::InOut,
+        _ => return None,
+    };
+    let optional = match parts.get(2).map(|part| part.trim()) {
+        None => false,
+        Some("opt") => true,
+        Some(_) => return None,
+    };
+    Some(ArgType::Ptr {
+        inner: Box::new(ArgType::Void),
+        dir,
+        optional,
+    })
+}
+
 fn coerce_opaque_fields_to_pointers(fields: &[ArgType]) -> Vec<ArgType> {
     fields
         .iter()
-        .map(|field| coerce_opaque_field_to_pointer(field).unwrap_or_else(|| field.clone()))
+        .map(|field| coerce_opaque_arg_to_fixed_size(field).unwrap_or_else(|| field.clone()))
         .collect()
+}
+
+fn coerce_opaque_arg_to_fixed_size(field: &ArgType) -> Option<ArgType> {
+    if crate::program::arg_type_fixed_size(field).is_some() {
+        return Some(field.clone());
+    }
+    if let Some(pointer) = coerce_opaque_field_to_pointer(field) {
+        return Some(pointer);
+    }
+    match field {
+        ArgType::Array {
+            inner,
+            min_len,
+            max_len,
+        } => {
+            let inner = Box::new(coerce_opaque_arg_to_fixed_size(inner)?);
+            let candidate = ArgType::Array {
+                inner,
+                min_len: *min_len,
+                max_len: *max_len,
+            };
+            crate::program::arg_type_fixed_size(&candidate).map(|_| candidate)
+        }
+        ArgType::Struct {
+            type_name,
+            fields,
+            field_names,
+            size,
+            packed,
+            align,
+            overlay_start,
+            ..
+        } => {
+            let fields = fields
+                .iter()
+                .map(coerce_opaque_arg_to_fixed_size)
+                .collect::<Option<Vec<_>>>()?;
+            let (field_prefix_size, has_var_tail) =
+                crate::program::struct_layout_prefix_size(&fields, *packed, *align, *overlay_start)
+                    .ok()?;
+            if has_var_tail {
+                return None;
+            }
+            Some(ArgType::Struct {
+                type_name: type_name.clone(),
+                fields,
+                field_names: field_names.clone(),
+                size: (*size).max(field_prefix_size),
+                varlen: false,
+                packed: *packed,
+                align: *align,
+                overlay_start: *overlay_start,
+            })
+        }
+        ArgType::Union {
+            type_name,
+            fields,
+            field_names,
+            size,
+            packed,
+            align,
+            ..
+        } => {
+            let fields = fields
+                .iter()
+                .map(coerce_opaque_arg_to_fixed_size)
+                .collect::<Option<Vec<_>>>()?;
+            let max_field_size = fields
+                .iter()
+                .filter_map(crate::program::arg_type_fixed_size)
+                .max()
+                .unwrap_or(0);
+            let union_align =
+                crate::program::union_type_alignment(&fields, *packed, *align).ok()?;
+            let rounded_size = max_field_size
+                .checked_add(union_align - 1)
+                .map(|rounded| rounded & !(union_align - 1))?;
+            Some(ArgType::Union {
+                type_name: type_name.clone(),
+                fields,
+                field_names: field_names.clone(),
+                size: (*size).max(rounded_size),
+                varlen: false,
+                packed: *packed,
+                align: *align,
+            })
+        }
+        _ => None,
+    }
 }
 
 fn truncate_zero_suffixed_varlen_struct_fields(
@@ -2025,7 +2757,10 @@ fn truncate_zero_suffixed_varlen_struct_fields(
     if var_idx + 1 >= parsed_fields.len() {
         return None;
     }
-    if parsed_fields[var_idx + 1..].iter().any(|field| !is_zero_const_arg(field)) {
+    if parsed_fields[var_idx + 1..]
+        .iter()
+        .any(|field| !is_zero_const_arg(field))
+    {
         return None;
     }
     Some((
@@ -2059,7 +2794,10 @@ fn coerce_opaque_field_to_pointer(field: &ArgType) -> Option<ArgType> {
             BufferDir::Out => PtrDir::Out,
             BufferDir::InOut => PtrDir::InOut,
         },
-        ArgType::String { fixed_len: None, .. } | ArgType::Filename => PtrDir::In,
+        ArgType::String {
+            fixed_len: None, ..
+        }
+        | ArgType::Filename => PtrDir::In,
         _ => return None,
     };
 
@@ -2080,6 +2818,7 @@ fn annotate_named_arg_type(arg_type: ArgType, type_name: &str) -> ArgType {
             varlen,
             packed,
             align,
+            overlay_start,
         } => ArgType::Struct {
             type_name: Some(type_name.to_string()),
             fields,
@@ -2088,6 +2827,7 @@ fn annotate_named_arg_type(arg_type: ArgType, type_name: &str) -> ArgType {
             varlen,
             packed,
             align,
+            overlay_start,
         },
         ArgType::Union {
             type_name: _,
@@ -2121,6 +2861,7 @@ fn instantiate_template(
     templates: &HashMap<String, TypeTemplate>,
     resources: &HashMap<String, ResourceDesc>,
     line_no: usize,
+    ctx: ParseArgContext,
 ) -> Result<ArgType, String> {
     if template.params.len() != actuals.len() {
         return Err(format!(
@@ -2140,6 +2881,7 @@ fn instantiate_template(
             varlen: false,
             packed: false,
             align: Some(align),
+            overlay_start: None,
         });
     }
     let bindings = template
@@ -2163,11 +2905,7 @@ fn instantiate_template(
                 templates,
                 resources,
                 line_no,
-                ParseArgContext {
-                    allow_parent_len: true,
-                    field_names: None,
-                    current_type_name: None,
-                },
+                ctx,
             )?;
             Ok(annotate_named_arg_type(arg_type, &template.name))
         }
@@ -2186,6 +2924,7 @@ fn instantiate_template(
             resources,
             line_no,
             Some(&bindings),
+            ctx.recursive_pending_types(),
         ),
         TemplateBody::Union { fields, attrs } => build_union_arg_type(
             fields,
@@ -2200,6 +2939,7 @@ fn instantiate_template(
             resources,
             line_no,
             Some(&bindings),
+            ctx.recursive_pending_types(),
         ),
     }
 }
@@ -2319,9 +3059,16 @@ fn parse_syscall(
     types: &HashMap<String, ArgType>,
     templates: &HashMap<String, TypeTemplate>,
     resources: &HashMap<String, ResourceDesc>,
+    next_synthetic_syscall_id: &mut u64,
+    allow_unknown_bare_syscalls: bool,
 ) -> Result<SyscallDesc, String> {
     if let Some((left, right)) = rest.split_once("->") {
-        let (name, id) = parse_name_and_id_or_lookup(line_no, left.trim())?;
+        let (name, id) = parse_name_and_id_or_lookup(
+            line_no,
+            left.trim(),
+            next_synthetic_syscall_id,
+            allow_unknown_bare_syscalls,
+        )?;
         let open = right
             .find('(')
             .ok_or_else(|| format!("line {}: syscall is missing argument list", line_no))?;
@@ -2343,7 +3090,7 @@ fn parse_syscall(
             resources,
             line_no,
         )?;
-        let attrs = parse_syscall_attrs(right[close + 1..].trim(), line_no)?;
+        let attrs = parse_syscall_attrs(right[close + 1..].trim(), consts, line_no)?;
         return Ok(SyscallDesc {
             name: name.to_string(),
             id,
@@ -2359,7 +3106,12 @@ fn parse_syscall(
         .ok_or_else(|| format!("line {}: syscall is missing argument list", line_no))?;
     let close = find_matching_paren(rest, open)
         .ok_or_else(|| format!("line {}: syscall is missing closing ')'", line_no))?;
-    let (name, id) = parse_name_and_id_or_lookup(line_no, rest[..open].trim())?;
+    let (name, id) = parse_name_and_id_or_lookup(
+        line_no,
+        rest[..open].trim(),
+        next_synthetic_syscall_id,
+        allow_unknown_bare_syscalls,
+    )?;
     let (args, arg_names) = parse_syscall_args(
         &rest[open + 1..close],
         consts,
@@ -2389,7 +3141,7 @@ fn parse_syscall(
             }
         }
     };
-    let attrs = parse_syscall_attrs(tail, line_no)?;
+    let attrs = parse_syscall_attrs(tail, consts, line_no)?;
 
     Ok(SyscallDesc {
         name: name.to_string(),
@@ -2401,7 +3153,11 @@ fn parse_syscall(
     })
 }
 
-fn parse_syscall_attrs(mut tail: &str, line_no: usize) -> Result<SyscallAttrs, String> {
+fn parse_syscall_attrs(
+    mut tail: &str,
+    consts: &HashMap<String, u64>,
+    line_no: usize,
+) -> Result<SyscallAttrs, String> {
     let mut attrs = SyscallAttrs::default();
     while !tail.is_empty() {
         if !tail.starts_with('(') {
@@ -2422,6 +3178,34 @@ fn parse_syscall_attrs(mut tail: &str, line_no: usize) -> Result<SyscallAttrs, S
                 "automatic_helper" => attrs.automatic_helper = true,
                 "no_generate" => attrs.no_generate = true,
                 "disabled" => attrs.disabled = true,
+                "ignore_return" => attrs.ignore_return = true,
+                "breaks_returns" => attrs.breaks_returns = true,
+                "no_minimize" => attrs.no_minimize = true,
+                "no_squash" => attrs.no_squash = true,
+                "remote_cover" => attrs.remote_cover = true,
+                "snapshot" => attrs.snapshot = true,
+                "kfuzz_test" => attrs.kfuzz_test = true,
+                other if other.starts_with("timeout[") && other.ends_with(']') => {
+                    let value = &other["timeout[".len()..other.len() - 1];
+                    attrs.timeout_ms = Some(parse_expr(value.trim(), consts, line_no)?);
+                }
+                other if other.starts_with("prog_timeout[") && other.ends_with(']') => {
+                    let value = &other["prog_timeout[".len()..other.len() - 1];
+                    attrs.prog_timeout_ms = Some(parse_expr(value.trim(), consts, line_no)?);
+                }
+                other if other.starts_with("fsck[") && other.ends_with(']') => {
+                    let value = &other["fsck[".len()..other.len() - 1];
+                    let bytes = parse_string_literal(value.trim(), line_no)?;
+                    let command = String::from_utf8(bytes).map_err(|err| {
+                        format!(
+                            "line {}: fsck command {} is not valid UTF-8: {}",
+                            line_no,
+                            value.trim(),
+                            err
+                        )
+                    })?;
+                    attrs.fsck_command = Some(command);
+                }
                 other => {
                     return Err(format!(
                         "line {}: unsupported syscall attribute '{}'",
@@ -2435,13 +3219,19 @@ fn parse_syscall_attrs(mut tail: &str, line_no: usize) -> Result<SyscallAttrs, S
     Ok(attrs)
 }
 
-fn parse_name_and_id_or_lookup(line_no: usize, text: &str) -> Result<(&str, u64), String> {
+fn parse_name_and_id_or_lookup<'a>(
+    line_no: usize,
+    text: &'a str,
+    next_synthetic_syscall_id: &mut u64,
+    allow_unknown_bare_syscalls: bool,
+) -> Result<(&'a str, u64), String> {
     if let Some((name, id)) = text.rsplit_once('@') {
         let name = name.trim();
         if name.is_empty() {
             return Err(format!("line {}: syscall name is empty", line_no));
         }
         let id = parse_integer(id.trim(), line_no)?;
+        *next_synthetic_syscall_id = (*next_synthetic_syscall_id).max(id + 1);
         return Ok((name, id));
     }
     if !is_valid_syscall_name(text) {
@@ -2451,13 +3241,19 @@ fn parse_name_and_id_or_lookup(line_no: usize, text: &str) -> Result<(&str, u64)
         ));
     }
     let lookup_name = text.split('$').next().unwrap_or(text);
-    let Some(id) = builtin_linux_amd64_syscall_id(lookup_name) else {
-        return Err(format!(
-            "line {}: unknown bare syscall '{}' for linux/amd64 ID lookup",
-            line_no, text
-        ));
-    };
-    Ok((text, id))
+    if let Some(id) = builtin_linux_amd64_syscall_id(lookup_name) {
+        *next_synthetic_syscall_id = (*next_synthetic_syscall_id).max(id + 1);
+        return Ok((text, id));
+    }
+    if allow_unknown_bare_syscalls {
+        let id = *next_synthetic_syscall_id;
+        *next_synthetic_syscall_id = next_synthetic_syscall_id.saturating_add(1);
+        return Ok((text, id));
+    }
+    Err(format!(
+        "line {}: unknown bare syscall '{}' for linux/amd64 ID lookup",
+        line_no, text
+    ))
 }
 
 fn is_valid_syscall_name(text: &str) -> bool {
@@ -2554,29 +3350,36 @@ fn parse_arg(
         if base == "vma" {
             return parse_vma("opt", line_no);
         }
-        return parse_arg(
-            base,
-            consts,
-            const_sets,
-            flag_sets,
-            string_sets,
-            arg_names,
-            types,
-            templates,
-            resources,
-            line_no,
-            ctx,
-        );
+        if let Some(resource) = resources.get(base) {
+            return Ok(ArgType::OptionalResource(resource.clone()));
+        }
+        if !is_builtin_bracketed_type_name(base) {
+            return parse_arg(
+                base,
+                consts,
+                const_sets,
+                flag_sets,
+                string_sets,
+                arg_names,
+                types,
+                templates,
+                resources,
+                line_no,
+                ctx,
+            );
+        }
     }
-    if let Some((size, endian)) = scalar_integer_spec(text) {
+    if let Some(spec) = parse_scalar_type_spec(text) {
         return Ok(ArgType::Const {
-            size,
+            size: spec.size,
             values: Vec::new(),
             range: None,
-            endian,
+            endian: spec.endian,
+            allow_any: true,
+            bitfield_bits: spec.bitfield_bits,
         });
     }
-    if let Some(arg_type) = parse_scalar_range_arg(text, consts, line_no)? {
+    if let Some(arg_type) = parse_scalar_range_arg(text, consts, const_sets, flag_sets, line_no)? {
         return Ok(arg_type);
     }
     if text == "filename" {
@@ -2608,20 +3411,33 @@ fn parse_arg(
             optional: false,
         });
     }
+    if text == "vma64" {
+        return Ok(ArgType::Vma {
+            min_pages: 1,
+            max_pages: 4,
+            optional: false,
+        });
+    }
     if let Some(inner) = bracketed(text, "const") {
         return parse_const_arg(inner, consts, const_sets, "const", line_no);
     }
     if let Some(inner) = bracketed(text, "flags") {
         return parse_const_arg(inner, consts, flag_sets, "flags", line_no);
     }
+    if let Some(inner) = bracketed(text, "proc") {
+        return parse_proc(inner, consts, line_no);
+    }
     if let Some(inner) = bracketed(text, "buffer") {
         return parse_buffer(inner, line_no);
     }
+    if let Some(inner) = bracketed(text, "glob") {
+        return parse_glob(inner, line_no);
+    }
     if let Some(inner) = bracketed(text, "string") {
-        return parse_string(inner, string_sets, line_no, false);
+        return parse_string(inner, consts, string_sets, line_no, false);
     }
     if let Some(inner) = bracketed(text, "stringnoz") {
-        return parse_string(inner, string_sets, line_no, true);
+        return parse_string(inner, consts, string_sets, line_no, true);
     }
     if let Some(inner) = bracketed(text, "array") {
         return parse_array(
@@ -2671,14 +3487,50 @@ fn parse_arg(
     if let Some(inner) = bracketed(text, "vma") {
         return parse_vma(inner, line_no);
     }
-    if let Some(inner) = bracketed(text, "len") {
-        return parse_len(inner, arg_names, types, line_no, LengthKind::Auto, ctx);
+    if let Some(inner) = bracketed(text, "vma64") {
+        return parse_vma(inner, line_no);
     }
-    if let Some(inner) = bracketed(text, "bytesize") {
-        return parse_len(inner, arg_names, types, line_no, LengthKind::Bytes, ctx);
+    if let Some(inner) = bracketed(text, "len") {
+        return parse_len(
+            inner,
+            arg_names,
+            types,
+            templates,
+            line_no,
+            LengthKind::Auto,
+            1,
+            ctx,
+        );
+    }
+    if let Some((scale, inner)) = bracketed_with_numeric_suffix(text, "bytesize") {
+        return parse_len(
+            inner,
+            arg_names,
+            types,
+            templates,
+            line_no,
+            LengthKind::Bytes,
+            scale,
+            ctx,
+        );
+    }
+    if let Some(inner) = bracketed(text, "bitsize") {
+        return parse_len(
+            inner,
+            arg_names,
+            types,
+            templates,
+            line_no,
+            LengthKind::Bytes,
+            8,
+            ctx,
+        );
+    }
+    if let Some(inner) = bracketed(text, "csum") {
+        return parse_csum(inner, consts, arg_names, types, templates, line_no, ctx);
     }
     if let Some(inner) = bracketed(text, "offsetof") {
-        return parse_offsetof(inner, arg_names, types, line_no, &ctx);
+        return parse_offsetof(inner, arg_names, types, templates, line_no, &ctx);
     }
     if let Some((template_name, inner)) = split_type_invocation(text) {
         if let Some(template) = templates.get(template_name) {
@@ -2697,9 +3549,13 @@ fn parse_arg(
                 templates,
                 resources,
                 line_no,
+                ctx,
             );
         }
-        return Err(format!("line {}: unresolved type reference '{}'", line_no, text));
+        return Err(format!(
+            "line {}: unresolved type reference '{}'",
+            line_no, text
+        ));
     }
     if let Some(type_text) = strip_named_arg_prefix(text) {
         return parse_arg(
@@ -2718,7 +3574,10 @@ fn parse_arg(
     }
 
     if is_identifier_like(text) {
-        return Err(format!("line {}: unresolved type reference '{}'", line_no, text));
+        return Err(format!(
+            "line {}: unresolved type reference '{}'",
+            line_no, text
+        ));
     }
 
     Err(format!("line {}: unsupported argument '{}'", line_no, text))
@@ -2745,6 +3604,8 @@ fn parse_const_arg(
             values,
             range: None,
             endian: ScalarEndian::Native,
+            allow_any: false,
+            bitfield_bits: None,
         });
     }
     if parts.len() > 2 {
@@ -2764,7 +3625,14 @@ fn parse_const_arg(
                     values: set.values.clone(),
                     range: None,
                     endian: ScalarEndian::Native,
+                    allow_any: false,
+                    bitfield_bits: None,
                 });
+            }
+            if let Some(arg_type) =
+                parse_embedded_const_constraint(single, consts, sets, line_no)?
+            {
+                return Ok(arg_type);
             }
             match parse_expr(single, consts, line_no) {
                 Ok(value) => Ok(ArgType::Const {
@@ -2772,6 +3640,16 @@ fn parse_const_arg(
                     values: vec![value],
                     range: None,
                     endian: ScalarEndian::Native,
+                    allow_any: false,
+                    bitfield_bits: None,
+                }),
+                Err(_) if expr_references_unavailable_const(single, consts) => Ok(ArgType::Const {
+                    size: 8,
+                    values: Vec::new(),
+                    range: None,
+                    endian: ScalarEndian::Native,
+                    allow_any: false,
+                    bitfield_bits: None,
                 }),
                 Err(_) => Err(format!(
                     "line {}: unknown {} set '{}' (expected [value], [value, intN], [set_name], [set_name, intN], or [size; values] syntax)",
@@ -2782,7 +3660,7 @@ fn parse_const_arg(
         [left, right] => {
             let left = left.trim();
             let right = right.trim();
-            let Some((size, endian)) = scalar_integer_spec(right) else {
+            let Some(spec) = parse_scalar_type_spec(right) else {
                 return Err(format!(
                     "line {}: {} must use [value], [value, intN], [set_name], [set_name, intN], or [size; values] syntax",
                     line_no, arg_kind
@@ -2790,23 +3668,44 @@ fn parse_const_arg(
             };
             if let Some(set) = sets.get(left) {
                 return Ok(ArgType::Const {
-                    size,
+                    size: spec.size,
                     values: set.values.clone(),
                     range: None,
-                    endian,
+                    endian: spec.endian,
+                    allow_any: false,
+                    bitfield_bits: spec.bitfield_bits,
                 });
             }
             match parse_expr(left, consts, line_no) {
                 Ok(value) => Ok(ArgType::Const {
-                    size,
+                    size: spec.size,
                     values: vec![value],
                     range: None,
-                    endian,
+                    endian: spec.endian,
+                    allow_any: false,
+                    bitfield_bits: spec.bitfield_bits,
                 }),
-                Err(_) => Err(format!(
-                    "line {}: unknown {} set '{}' (expected [value, intN] or [set_name, intN] syntax)",
-                    line_no, arg_kind, left
-                )),
+                Err(_) if expr_references_unavailable_const(left, consts) => Ok(ArgType::Const {
+                    size: spec.size,
+                    values: Vec::new(),
+                    range: None,
+                    endian: spec.endian,
+                    allow_any: false,
+                    bitfield_bits: spec.bitfield_bits,
+                }),
+                Err(_) => match parse_embedded_const_constraint(left, consts, sets, line_no)? {
+                    Some(arg_type) => match embedded_const_matches_spec(&arg_type, spec) {
+                        true => Ok(arg_type),
+                        false => Err(format!(
+                            "line {}: embedded {} scalar '{}' is incompatible with '{}'",
+                            line_no, arg_kind, left, right
+                        )),
+                    },
+                    None => Err(format!(
+                        "line {}: unknown {} set '{}' (expected [value, intN] or [set_name, intN] syntax)",
+                        line_no, arg_kind, left
+                    )),
+                },
             }
         }
         _ => Err(format!(
@@ -2814,6 +3713,48 @@ fn parse_const_arg(
             line_no, arg_kind
         )),
     }
+}
+
+fn parse_embedded_const_constraint(
+    text: &str,
+    consts: &HashMap<String, u64>,
+    sets: &HashMap<String, ValueSet>,
+    line_no: usize,
+) -> Result<Option<ArgType>, String> {
+    if let Some(spec) = parse_scalar_type_spec(text) {
+        return Ok(Some(ArgType::Const {
+            size: spec.size,
+            values: Vec::new(),
+            range: None,
+            endian: spec.endian,
+            allow_any: true,
+            bitfield_bits: spec.bitfield_bits,
+        }));
+    }
+    if let Some(arg_type) = parse_scalar_range_arg(text, consts, sets, sets, line_no)? {
+        return Ok(Some(arg_type));
+    }
+    if let Some(inner) = bracketed(text, "const") {
+        return parse_const_arg(inner, consts, sets, "const", line_no).map(Some);
+    }
+    if let Some(inner) = bracketed(text, "flags") {
+        return parse_const_arg(inner, consts, sets, "flags", line_no).map(Some);
+    }
+    Ok(None)
+}
+
+fn embedded_const_matches_spec(arg_type: &ArgType, spec: ScalarTypeSpec) -> bool {
+    matches!(
+        arg_type,
+        ArgType::Const {
+            size,
+            endian,
+            bitfield_bits,
+            ..
+        } if *size == spec.size
+            && *endian == spec.endian
+            && *bitfield_bits == spec.bitfield_bits
+    )
 }
 
 fn parse_buffer(inner: &str, line_no: usize) -> Result<ArgType, String> {
@@ -2843,6 +3784,15 @@ fn parse_buffer(inner: &str, line_no: usize) -> Result<ArgType, String> {
         max_size: 256,
         dir,
     })
+}
+
+fn parse_glob(inner: &str, line_no: usize) -> Result<ArgType, String> {
+    let pattern = inner.trim();
+    if pattern.is_empty() {
+        return Err(format!("line {}: glob pattern is empty", line_no));
+    }
+    let _ = parse_string_literal(pattern, line_no)?;
+    Ok(ArgType::Filename)
 }
 
 fn parse_array(
@@ -2930,8 +3880,9 @@ fn parse_ptr(
             ))
         }
     };
-    let inner = parse_arg(
-        parts[1].trim(),
+    let inner_text = parts[1].trim();
+    let inner = match parse_arg(
+        inner_text,
         consts,
         const_sets,
         flag_sets,
@@ -2941,8 +3892,20 @@ fn parse_ptr(
         templates,
         resources,
         line_no,
-        ctx,
-    )?;
+        ctx.clone(),
+    ) {
+        Ok(inner) => inner,
+        Err(err)
+            if is_unresolved_type_reference_error(&err)
+                && (ctx.current_type_name() == Some(inner_text)
+                    || ctx
+                        .recursive_pending_types()
+                        .is_some_and(|pending| pending.contains(inner_text))) =>
+        {
+            ArgType::Void
+        }
+        Err(err) => return Err(err),
+    };
     let optional = match parts.get(2).map(|part| part.trim()) {
         None => false,
         Some("opt") => true,
@@ -2993,8 +3956,50 @@ fn parse_vma(inner: &str, line_no: usize) -> Result<ArgType, String> {
     })
 }
 
+fn parse_proc(
+    inner: &str,
+    consts: &HashMap<String, u64>,
+    line_no: usize,
+) -> Result<ArgType, String> {
+    let parts = split_type_parts(inner);
+    if !(2..=3).contains(&parts.len()) {
+        return Err(format!(
+            "line {}: proc must use [start, per_proc] or [start, per_proc, intN] syntax",
+            line_no
+        ));
+    }
+    let values_start = parse_expr(parts[0].trim(), consts, line_no)?;
+    let values_per_proc = parse_expr(parts[1].trim(), consts, line_no)?;
+    let scalar_spec = match parts.get(2).map(|part| part.trim()) {
+        None | Some("") => ScalarTypeSpec {
+            size: 8,
+            endian: ScalarEndian::Native,
+            bitfield_bits: None,
+        },
+        Some(type_name) => parse_scalar_type_spec(type_name).ok_or_else(|| {
+            format!(
+                "line {}: unsupported proc scalar type '{}' (expected int8/int16/int32/int64/intptr)",
+                line_no, type_name
+            )
+        })?,
+    };
+    if scalar_spec.bitfield_bits.is_some() {
+        return Err(format!(
+            "line {}: proc does not support bitfield scalar storage",
+            line_no
+        ));
+    }
+    Ok(ArgType::Proc {
+        size: scalar_spec.size,
+        values_start,
+        values_per_proc,
+        endian: scalar_spec.endian,
+    })
+}
+
 fn parse_string(
     inner: &str,
+    consts: &HashMap<String, u64>,
     string_sets: &HashMap<String, Vec<Vec<u8>>>,
     line_no: usize,
     noz: bool,
@@ -3011,7 +4016,7 @@ fn parse_string(
 
     let parts = split_type_parts(inner);
     let (value_parts, fixed_len) = if parts.len() >= 2 {
-        match parse_integer(parts[parts.len() - 1].trim(), line_no) {
+        match parse_expr(parts[parts.len() - 1].trim(), consts, line_no) {
             Ok(len) => (&parts[..parts.len() - 1], Some(len as usize)),
             Err(_) => (parts.as_slice(), None),
         }
@@ -3060,8 +4065,10 @@ fn parse_len(
     inner: &str,
     arg_names: &HashMap<String, usize>,
     types: &HashMap<String, ArgType>,
+    templates: &HashMap<String, TypeTemplate>,
     line_no: usize,
     kind: LengthKind,
+    scale: usize,
     ctx: ParseArgContext,
 ) -> Result<ArgType, String> {
     let parts = split_type_parts(inner);
@@ -3075,23 +4082,43 @@ fn parse_len(
     if target_name.is_empty() {
         return Err(format!("line {}: len target is empty", line_no));
     }
-    let target = parse_length_target(target_name, arg_names, types, line_no, &ctx, "len")?;
-    let size = match parts.get(1).map(|part| part.trim()) {
-        None | Some("") => 8,
-        Some(type_name) => scalar_integer_spec(type_name).map(|(size, _)| size).ok_or_else(|| {
+    let target = parse_length_target(
+        target_name,
+        arg_names,
+        types,
+        templates,
+        line_no,
+        &ctx,
+        "len",
+    )?;
+    let scalar_spec = match parts.get(1).map(|part| part.trim()) {
+        None | Some("") => ScalarTypeSpec {
+            size: 8,
+            endian: ScalarEndian::Native,
+            bitfield_bits: None,
+        },
+        Some(type_name) => parse_scalar_type_spec(type_name).ok_or_else(|| {
             format!(
                 "line {}: unsupported len scalar type '{}' (expected int8/int16/int32/int64/intptr)",
                 line_no, type_name
             )
         })?,
     };
-    Ok(ArgType::Len { target, size, kind })
+    Ok(ArgType::Len {
+        target,
+        size: scalar_spec.size,
+        kind,
+        endian: scalar_spec.endian,
+        scale,
+        bitfield_bits: scalar_spec.bitfield_bits,
+    })
 }
 
 fn parse_offsetof(
     inner: &str,
     arg_names: &HashMap<String, usize>,
     types: &HashMap<String, ArgType>,
+    templates: &HashMap<String, TypeTemplate>,
     line_no: usize,
     ctx: &ParseArgContext,
 ) -> Result<ArgType, String> {
@@ -3106,10 +4133,16 @@ fn parse_offsetof(
     if field_name.is_empty() {
         return Err(format!("line {}: offsetof target is empty", line_no));
     }
-    let target = parse_length_target(field_name, arg_names, types, line_no, ctx, "offsetof")?;
-    let size = match parts.get(1).map(|part| part.trim()) {
-        None | Some("") => 8,
-        Some(type_name) => scalar_integer_spec(type_name).map(|(size, _)| size).ok_or_else(|| {
+    let target = parse_length_target(
+        field_name, arg_names, types, templates, line_no, ctx, "offsetof",
+    )?;
+    let scalar_spec = match parts.get(1).map(|part| part.trim()) {
+        None | Some("") => ScalarTypeSpec {
+            size: 8,
+            endian: ScalarEndian::Native,
+            bitfield_bits: None,
+        },
+        Some(type_name) => parse_scalar_type_spec(type_name).ok_or_else(|| {
             format!(
                 "line {}: unsupported offsetof scalar type '{}' (expected int8/int16/int32/int64/intptr)",
                 line_no, type_name
@@ -3118,8 +4151,92 @@ fn parse_offsetof(
     };
     Ok(ArgType::Len {
         target,
-        size,
+        size: scalar_spec.size,
         kind: LengthKind::Offset,
+        endian: scalar_spec.endian,
+        scale: 1,
+        bitfield_bits: scalar_spec.bitfield_bits,
+    })
+}
+
+fn parse_csum(
+    inner: &str,
+    consts: &HashMap<String, u64>,
+    arg_names: &HashMap<String, usize>,
+    types: &HashMap<String, ArgType>,
+    templates: &HashMap<String, TypeTemplate>,
+    line_no: usize,
+    ctx: ParseArgContext,
+) -> Result<ArgType, String> {
+    let parts = split_type_parts(inner);
+    if !(3..=4).contains(&parts.len()) {
+        return Err(format!(
+            "line {}: csum must use [target, inet, intN] or [target, pseudo, proto, intN] syntax",
+            line_no
+        ));
+    }
+    let target_name = parts[0].trim();
+    if target_name.is_empty() {
+        return Err(format!("line {}: csum target is empty", line_no));
+    }
+    let _target = parse_length_target(
+        target_name,
+        arg_names,
+        types,
+        templates,
+        line_no,
+        &ctx,
+        "csum",
+    )?;
+    match parts[1].trim() {
+        "inet" if parts.len() == 3 => {}
+        "pseudo" if parts.len() == 4 => {
+            let proto = parts[2].trim();
+            if proto.is_empty() {
+                return Err(format!("line {}: csum pseudo protocol is empty", line_no));
+            }
+            let _ = parse_expr(proto, consts, line_no)?;
+        }
+        "inet" => {
+            return Err(format!(
+                "line {}: csum[inet] must use exactly three arguments",
+                line_no
+            ))
+        }
+        "pseudo" => {
+            return Err(format!(
+                "line {}: csum[pseudo] must include a protocol argument",
+                line_no
+            ))
+        }
+        other => {
+            return Err(format!(
+                "line {}: unsupported csum kind '{}' (expected inet or pseudo)",
+                line_no, other
+            ))
+        }
+    }
+    let scalar_idx = if parts.len() == 3 { 2 } else { 3 };
+    let scalar_spec = parse_scalar_type_spec(parts[scalar_idx].trim()).ok_or_else(|| {
+        format!(
+            "line {}: unsupported csum scalar type '{}' (expected int8/int16/int32/int64/intptr)",
+            line_no,
+            parts[scalar_idx].trim()
+        )
+    })?;
+    if scalar_spec.bitfield_bits.is_some() {
+        return Err(format!(
+            "line {}: csum scalar type must not be a bitfield",
+            line_no
+        ));
+    }
+    Ok(ArgType::Const {
+        size: scalar_spec.size,
+        values: vec![0],
+        range: None,
+        endian: scalar_spec.endian,
+        allow_any: false,
+        bitfield_bits: None,
     })
 }
 
@@ -3127,6 +4244,7 @@ fn parse_length_target(
     text: &str,
     arg_names: &HashMap<String, usize>,
     types: &HashMap<String, ArgType>,
+    templates: &HashMap<String, TypeTemplate>,
     line_no: usize,
     ctx: &ParseArgContext,
     label: &str,
@@ -3206,7 +4324,7 @@ fn parse_length_target(
         });
     }
 
-    if types.contains_key(first) {
+    if types.contains_key(first) || templates.contains_key(first) {
         return Ok(LengthTarget {
             root: LengthTargetRoot::Type(first.to_string()),
             fields: segments[1..]
@@ -3216,7 +4334,7 @@ fn parse_length_target(
         });
     }
 
-    if segments.len() > 1 && is_identifier_like(first) {
+    if is_identifier_like(first) && (segments.len() > 1 || ctx.current_type_name().is_some()) {
         return Ok(LengthTarget {
             root: LengthTargetRoot::Type(first.to_string()),
             fields: segments[1..]
@@ -3230,6 +4348,13 @@ fn parse_length_target(
         "line {}: unknown {} target root '{}'",
         line_no, label, first
     ))
+}
+
+fn expr_references_unavailable_const(text: &str, consts: &HashMap<String, u64>) -> bool {
+    split_top_level(text, '|').into_iter().any(|part| {
+        let part = part.trim();
+        is_identifier_like(part) && looks_like_const_name(part) && !consts.contains_key(part)
+    })
 }
 
 fn parse_expr(text: &str, consts: &HashMap<String, u64>, line_no: usize) -> Result<u64, String> {
@@ -3281,8 +4406,10 @@ fn parse_char_literal(text: &str, line_no: usize) -> Result<Option<u64>, String>
             "t" => b'\t',
             "\\" => b'\\',
             "'" => b'\'',
-            _ if escaped.len() == 3 && escaped.starts_with('x') => u8::from_str_radix(&escaped[1..], 16)
-                .map_err(|_| format!("line {}: invalid char literal '{}'", line_no, text))?,
+            _ if escaped.len() == 3 && escaped.starts_with('x') => {
+                u8::from_str_radix(&escaped[1..], 16)
+                    .map_err(|_| format!("line {}: invalid char literal '{}'", line_no, text))?
+            }
             _ => return Err(format!("line {}: invalid char literal '{}'", line_no, text)),
         }
     } else {
@@ -3350,22 +4477,55 @@ fn parse_string_literal(text: &str, line_no: usize) -> Result<Vec<u8>, String> {
         .map_err(|err| format!("line {}: invalid string literal {}: {}", line_no, text, err))
 }
 
-fn scalar_integer_spec(text: &str) -> Option<(usize, ScalarEndian)> {
-    let base = match text.rsplit_once(':') {
-        Some((base, bits)) if !base.is_empty() && bits.parse::<u8>().is_ok() => base,
-        _ => text,
+fn parse_scalar_type_spec(text: &str) -> Option<ScalarTypeSpec> {
+    let (base, bitfield_bits) = match text.rsplit_once(':') {
+        Some((base, bits)) if !base.is_empty() => {
+            let bits = bits.parse::<u8>().ok()?;
+            (base, Some(bits))
+        }
+        _ => (text, None),
     };
 
-    match base {
-        "int8" => Some((1, ScalarEndian::Native)),
-        "int16" => Some((2, ScalarEndian::Native)),
-        "int32" => Some((4, ScalarEndian::Native)),
-        "int64" | "intptr" => Some((8, ScalarEndian::Native)),
-        "int16be" => Some((2, ScalarEndian::Big)),
-        "int32be" => Some((4, ScalarEndian::Big)),
-        "int64be" => Some((8, ScalarEndian::Big)),
-        _ => None,
+    let (size, endian) = match base {
+        "int8" => (1, ScalarEndian::Native),
+        "int16" => (2, ScalarEndian::Native),
+        "int32" => (4, ScalarEndian::Native),
+        "int64" | "intptr" => (8, ScalarEndian::Native),
+        "int16be" => (2, ScalarEndian::Big),
+        "int32be" => (4, ScalarEndian::Big),
+        "int64be" => (8, ScalarEndian::Big),
+        _ => return None,
+    };
+    if bitfield_bits.is_some_and(|bits| bits == 0 || usize::from(bits) > size * 8) {
+        return None;
     }
+    Some(ScalarTypeSpec {
+        size,
+        endian,
+        bitfield_bits,
+    })
+}
+
+fn scalar_integer_spec(text: &str) -> Option<(usize, ScalarEndian)> {
+    parse_scalar_type_spec(text).map(|spec| (spec.size, spec.endian))
+}
+
+fn is_builtin_bracketed_type_name(text: &str) -> bool {
+    matches!(
+        text,
+        "const"
+            | "flags"
+            | "buffer"
+            | "string"
+            | "stringnoz"
+            | "array"
+            | "ptr"
+            | "ptr64"
+            | "vma"
+            | "len"
+            | "bytesize"
+            | "offsetof"
+    )
 }
 
 fn parse_template_head(text: &str, line_no: usize) -> Result<(String, Vec<String>), String> {
@@ -3387,9 +4547,47 @@ fn parse_template_head(text: &str, line_no: usize) -> Result<(String, Vec<String
     Ok((text.to_string(), Vec::new()))
 }
 
+fn split_type_definition_head_and_body(text: &str) -> Option<(&str, &str)> {
+    let mut bracket_depth = 0usize;
+    for (idx, ch) in text.char_indices() {
+        match ch {
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            _ if ch.is_whitespace() && bracket_depth == 0 => {
+                let head = text[..idx].trim();
+                let body = text[idx..].trim();
+                if !head.is_empty() && !body.is_empty() {
+                    return Some((head, body));
+                }
+                return None;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn type_text_references_type_name(text: &str, type_name: &str) -> bool {
+    let mut token_start = None;
+    for (idx, ch) in text.char_indices() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' {
+            token_start.get_or_insert(idx);
+            continue;
+        }
+        if let Some(start) = token_start.take() {
+            if &text[start..idx] == type_name {
+                return true;
+            }
+        }
+    }
+    token_start.is_some_and(|start| &text[start..] == type_name)
+}
+
 fn parse_scalar_range_arg(
     text: &str,
     consts: &HashMap<String, u64>,
+    const_sets: &HashMap<String, ValueSet>,
+    flag_sets: &HashMap<String, ValueSet>,
     line_no: usize,
 ) -> Result<Option<ArgType>, String> {
     let Some(open) = text.find('[') else {
@@ -3399,20 +4597,98 @@ fn parse_scalar_range_arg(
         return Ok(None);
     }
     let scalar_name = text[..open].trim();
-    let Some((size, endian)) = scalar_integer_spec(scalar_name) else {
+    let Some(spec) = parse_scalar_type_spec(scalar_name) else {
         return Ok(None);
     };
     let inner = &text[open + 1..text.len() - 1];
-    let (min, max) = inner
-        .split_once(':')
-        .ok_or_else(|| format!("line {}: scalar range must use [min:max] syntax", line_no))?;
-    let min = parse_expr(min.trim(), consts, line_no)?;
-    let max = parse_expr(max.trim(), consts, line_no)?;
+    let parts = split_type_parts(inner);
+    if parts.is_empty() || parts.len() > 2 {
+        return Err(format!(
+            "line {}: scalar qualifier must use [value], [min:max], or [min:max, step|opt] syntax",
+            line_no
+        ));
+    }
+    let primary = parts[0].trim();
+    if primary.is_empty() {
+        return Err(format!("line {}: scalar qualifier is empty", line_no));
+    }
+    let qualifier = parts
+        .get(1)
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty());
+
+    if let Some(set) = const_sets.get(primary).or_else(|| flag_sets.get(primary)) {
+        if !matches!(qualifier, None | Some("opt")) {
+            return Err(format!(
+                "line {}: scalar value-set qualifier only supports optional ', opt'",
+                line_no
+            ));
+        }
+        return Ok(Some(ArgType::Const {
+            size: spec.size,
+            values: set.values.clone(),
+            range: None,
+            endian: spec.endian,
+            allow_any: false,
+            bitfield_bits: spec.bitfield_bits,
+        }));
+    }
+
+    if let Some((min, max)) = primary.split_once(':') {
+        if expr_references_unavailable_const(min, consts)
+            || expr_references_unavailable_const(max, consts)
+            || qualifier.is_some_and(|value| expr_references_unavailable_const(value, consts))
+        {
+            return Ok(Some(ArgType::Const {
+                size: spec.size,
+                values: Vec::new(),
+                range: None,
+                endian: spec.endian,
+                allow_any: false,
+                bitfield_bits: spec.bitfield_bits,
+            }));
+        }
+        let min = parse_expr(min.trim(), consts, line_no)?;
+        let max = parse_expr(max.trim(), consts, line_no)?;
+        if let Some(qualifier) = qualifier {
+            if qualifier != "opt" {
+                let _ = parse_expr(qualifier, consts, line_no)?;
+            }
+        }
+        return Ok(Some(ArgType::Const {
+            size: spec.size,
+            values: Vec::new(),
+            range: Some((min, max)),
+            endian: spec.endian,
+            allow_any: false,
+            bitfield_bits: spec.bitfield_bits,
+        }));
+    }
+
+    if !matches!(qualifier, None | Some("opt")) {
+        return Err(format!(
+            "line {}: scalar exact-value qualifier only supports optional ', opt'",
+            line_no
+        ));
+    }
+    if expr_references_unavailable_const(primary, consts) {
+        return Ok(Some(ArgType::Const {
+            size: spec.size,
+            values: Vec::new(),
+            range: None,
+            endian: spec.endian,
+            allow_any: false,
+            bitfield_bits: spec.bitfield_bits,
+        }));
+    }
+    let value = parse_expr(primary, consts, line_no)?;
     Ok(Some(ArgType::Const {
-        size,
-        values: Vec::new(),
-        range: Some((min, max)),
-        endian,
+        size: spec.size,
+        values: vec![value],
+        range: None,
+        endian: spec.endian,
+        allow_any: false,
+        bitfield_bits: spec.bitfield_bits,
     }))
 }
 
@@ -3420,6 +4696,21 @@ fn bracketed<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     let rest = text.strip_prefix(prefix)?;
     let rest = rest.strip_prefix('[')?;
     rest.strip_suffix(']')
+}
+
+fn bracketed_with_numeric_suffix<'a>(text: &'a str, prefix: &str) -> Option<(usize, &'a str)> {
+    if let Some(inner) = bracketed(text, prefix) {
+        return Some((1, inner));
+    }
+    let rest = text.strip_prefix(prefix)?;
+    let open = rest.find('[')?;
+    let suffix = &rest[..open];
+    if suffix.is_empty() || !suffix.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let scale = suffix.parse::<usize>().ok()?;
+    let inner = text.get(prefix.len() + suffix.len() + 1..text.len().checked_sub(1)?)?;
+    Some((scale, inner))
 }
 
 fn split_type_invocation<'a>(text: &'a str) -> Option<(&'a str, &'a str)> {
@@ -3519,10 +4810,17 @@ fn parse_syscall_args(
     if args_str.trim().is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
+    let raw_args = split_top_level(args_str, ',');
     let mut arg_names = HashMap::new();
+    for (idx, raw_arg) in raw_args.iter().enumerate() {
+        let (arg_name, _) = split_named_arg(raw_arg);
+        if let Some(name) = arg_name {
+            arg_names.insert(name, idx);
+        }
+    }
     let mut args = Vec::new();
     let mut ordered_names = Vec::new();
-    for raw_arg in split_top_level(args_str, ',') {
+    for raw_arg in raw_args {
         let (arg_name, arg_text) = split_named_arg(raw_arg);
         let arg_type = parse_arg(
             arg_text,
@@ -3538,7 +4836,6 @@ fn parse_syscall_args(
             ParseArgContext::default(),
         )?;
         if let Some(name) = arg_name {
-            arg_names.insert(name.clone(), args.len());
             ordered_names.push(name);
         } else {
             ordered_names.push(String::new());
@@ -3805,16 +5102,52 @@ mod tests {
     fn parses_syscall_generation_attrs() {
         let input = r#"
             resource fd[4] = -1, 0
-            syscall eventfd2@1 -> fd(const[4; 0], const[4; 0]) (automatic_helper, no_generate)
-            close(fd fd) (disabled)
+            define HELPER_TIMEOUT 200
+            syscall eventfd2@1 -> fd(const[4; 0], const[4; 0]) (automatic_helper, no_generate, no_minimize)
+            close(fd fd) (disabled, ignore_return, snapshot, breaks_returns, no_squash, remote_cover, kfuzz_test, timeout[HELPER_TIMEOUT], prog_timeout[3000], fsck["fsck.ext4 -n"])
         "#;
         let descs = parse_syscall_descs(input).unwrap();
 
         assert!(descs[0].attrs.automatic_helper);
         assert!(descs[0].attrs.no_generate);
+        assert!(descs[0].attrs.no_minimize);
         assert!(!descs[0].attrs.disabled);
         assert!(descs[1].attrs.disabled);
+        assert!(descs[1].attrs.ignore_return);
+        assert!(descs[1].attrs.snapshot);
+        assert!(descs[1].attrs.breaks_returns);
+        assert!(descs[1].attrs.no_squash);
+        assert!(descs[1].attrs.remote_cover);
+        assert!(descs[1].attrs.kfuzz_test);
+        assert_eq!(descs[1].attrs.timeout_ms, Some(200));
+        assert_eq!(descs[1].attrs.prog_timeout_ms, Some(3000));
+        assert_eq!(descs[1].attrs.fsck_command.as_deref(), Some("fsck.ext4 -n"));
         assert!(!descs[1].attrs.no_generate);
+    }
+
+    #[test]
+    fn parses_compressed_image_builtin_arguments() {
+        let descs = parse_syscall_descs(
+            r#"
+                syscall mount_like@1 -> int(size len[img], img ptr[in, compressed_image]) (fsck["fsck.xfs -n"])
+            "#,
+        )
+        .unwrap();
+
+        match &descs[0].args[1] {
+            ArgType::Ptr { inner, dir, .. } => {
+                assert_eq!(*dir, PtrDir::In);
+                match inner.as_ref() {
+                    ArgType::Buffer { min_size, dir, .. } => {
+                        assert_eq!(*min_size, 0);
+                        assert_eq!(*dir, BufferDir::Plain);
+                    }
+                    other => panic!("unexpected compressed_image arg: {:?}", other),
+                }
+            }
+            other => panic!("unexpected img arg: {:?}", other),
+        }
+        assert_eq!(descs[0].attrs.fsck_command.as_deref(), Some("fsck.xfs -n"));
     }
 
     #[test]
@@ -3934,6 +5267,29 @@ mod tests {
     }
 
     #[test]
+    fn path_loading_assigns_synthetic_ids_to_unknown_bare_syscalls() {
+        let dir = temp_description_dir("synthetic-syscall-ids");
+        fs::write(
+            dir.join("sys.txt"),
+            r#"
+                resource fd[int32]: -1
+                syz_execute_func(text ptr[in, text[target]]) (disabled)
+                creat(file ptr[in, filename], mode int32) fd
+                close(fd fd)
+            "#,
+        )
+        .unwrap();
+
+        let descs = parse_syscall_descs_from_path(&dir).expect("path loading should assign IDs");
+        assert_eq!(descs[0].name, "syz_execute_func");
+        assert_eq!(descs[0].id, 0);
+        assert_eq!(descs[1].name, "creat");
+        assert_eq!(descs[1].id, 1);
+        assert_eq!(descs[2].name, "close");
+        assert_eq!(descs[2].id, 248);
+    }
+
+    #[test]
     fn parses_len_and_optional_pointer_forms() {
         let input = r#"
             resource fd[4] = -1, 0
@@ -3975,7 +5331,9 @@ mod tests {
                 assert_eq!(*dir, PtrDir::InOut);
                 assert!(!optional);
                 match inner.as_ref() {
-                    ArgType::Len { target, size, kind } => {
+                    ArgType::Len {
+                        target, size, kind, ..
+                    } => {
                         assert_eq!(
                             (target, *size, *kind),
                             (
@@ -3994,7 +5352,9 @@ mod tests {
             other => panic!("unexpected accept peerlen arg: {:?}", other),
         }
         match &descs[1].args[2] {
-            ArgType::Len { target, size, kind } => {
+            ArgType::Len {
+                target, size, kind, ..
+            } => {
                 assert_eq!(
                     (target, *size, *kind),
                     (
@@ -4008,6 +5368,36 @@ mod tests {
                 )
             }
             other => panic!("unexpected bind addrlen arg: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_forward_syscall_length_targets() {
+        let descs = parse_syscall_descs(
+            r#"
+                type fd_set buffer[128:128]
+                syscall select_like@1 -> int(n len[inp, int32], inp ptr[inout, fd_set], outp ptr[inout, fd_set, opt])
+            "#,
+        )
+        .expect("forward syscall len targets should parse");
+
+        match &descs[0].args[0] {
+            ArgType::Len {
+                target, size, kind, ..
+            } => {
+                assert_eq!(
+                    (target, *size, *kind),
+                    (
+                        &LengthTarget {
+                            root: LengthTargetRoot::Arg("inp".into()),
+                            fields: Vec::new(),
+                        },
+                        4,
+                        LengthKind::Auto,
+                    )
+                );
+            }
+            other => panic!("unexpected select_like n arg: {:?}", other),
         }
     }
 
@@ -4043,6 +5433,7 @@ mod tests {
                 values,
                 range,
                 endian,
+                ..
             } => {
                 assert_eq!(*size, 8);
                 assert_eq!(values, &vec![2]);
@@ -4057,6 +5448,7 @@ mod tests {
                 values,
                 range,
                 endian,
+                ..
             } => {
                 assert_eq!(*size, 2);
                 assert_eq!(values, &vec![1]);
@@ -4091,6 +5483,7 @@ mod tests {
                                 values,
                                 range,
                                 endian,
+                                ..
                             } => {
                                 assert_eq!(*size, 2);
                                 assert_eq!(values, &vec![2]);
@@ -4105,6 +5498,7 @@ mod tests {
                                 values,
                                 range,
                                 endian,
+                                ..
                             } => {
                                 assert_eq!(*size, 2);
                                 assert!(values.is_empty());
@@ -4119,6 +5513,7 @@ mod tests {
                                 values,
                                 range,
                                 endian,
+                                ..
                             } => {
                                 assert_eq!(*size, 4);
                                 assert_eq!(values, &vec![0x7f000001]);
@@ -4134,7 +5529,9 @@ mod tests {
             other => panic!("unexpected bind addr arg: {:?}", other),
         }
         match &descs[1].args[2] {
-            ArgType::Len { target, size, kind } => {
+            ArgType::Len {
+                target, size, kind, ..
+            } => {
                 assert_eq!(
                     (target, *size, *kind),
                     (
@@ -4178,7 +5575,9 @@ mod tests {
             other => panic!("unexpected sendto buf arg: {:?}", other),
         }
         match &descs[0].args[2] {
-            ArgType::Len { target, size, kind } => {
+            ArgType::Len {
+                target, size, kind, ..
+            } => {
                 assert_eq!(
                     (target, *size, *kind),
                     (
@@ -4205,7 +5604,9 @@ mod tests {
             other => panic!("unexpected recvfrom buf arg: {:?}", other),
         }
         match &descs[1].args[2] {
-            ArgType::Len { target, size, kind } => {
+            ArgType::Len {
+                target, size, kind, ..
+            } => {
                 assert_eq!(
                     (target, *size, *kind),
                     (
@@ -4219,6 +5620,123 @@ mod tests {
                 );
             }
             other => panic!("unexpected recvfrom len arg: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_bitsize_length_forms() {
+        let input = r#"
+            type msr_bitmap {
+                bitmap array[int8, 16]
+                bits bitsize[bitmap, int32]
+            } [packed]
+            syscall use_bits@1 -> int(arg ptr[in, msr_bitmap], len bitsize[arg, int64])
+        "#;
+        let descs = parse_syscall_descs(input).expect("bitsize forms should parse");
+
+        match &descs[0].args[0] {
+            ArgType::Ptr { inner, .. } => match inner.as_ref() {
+                ArgType::Struct { fields, .. } => match &fields[1] {
+                    ArgType::Len {
+                        target,
+                        size,
+                        kind,
+                        scale,
+                        ..
+                    } => {
+                        assert_eq!(
+                            (target, *size, *kind, *scale),
+                            (
+                                &LengthTarget {
+                                    root: LengthTargetRoot::Current,
+                                    fields: vec!["bitmap".into()],
+                                },
+                                4,
+                                LengthKind::Bytes,
+                                8,
+                            )
+                        );
+                    }
+                    other => panic!("unexpected bits field: {:?}", other),
+                },
+                other => panic!("unexpected msr_bitmap type: {:?}", other),
+            },
+            other => panic!("unexpected msr_bitmap arg: {:?}", other),
+        }
+
+        match &descs[0].args[1] {
+            ArgType::Len {
+                target,
+                size,
+                kind,
+                scale,
+                ..
+            } => {
+                assert_eq!(
+                    (target, *size, *kind, *scale),
+                    (
+                        &LengthTarget {
+                            root: LengthTargetRoot::Arg("arg".into()),
+                            fields: Vec::new(),
+                        },
+                        8,
+                        LengthKind::Bytes,
+                        8,
+                    )
+                );
+            }
+            other => panic!("unexpected top-level bitsize arg: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_csum_forms_as_checksum_placeholders() {
+        let input = r#"
+            type ipv4_header_only {
+                csum csum[parent, inet, int16be]
+            } [packed]
+            type tcp_like {
+                csum csum[parent, pseudo, 6, int16be]
+            } [packed]
+            syscall use_csum@1 -> int(ip ptr[in, ipv4_header_only], tcp ptr[in, tcp_like])
+        "#;
+        let descs = parse_syscall_descs(input).expect("csum forms should parse");
+
+        for arg in &descs[0].args {
+            match arg {
+                ArgType::Ptr { inner, .. } => match inner.as_ref() {
+                    ArgType::Struct { fields, .. } => {
+                        assert!(matches!(
+                            &fields[0],
+                            ArgType::Const {
+                                size: 2,
+                                values,
+                                endian: ScalarEndian::Big,
+                                ..
+                            } if values == &vec![0]
+                        ));
+                    }
+                    other => panic!("unexpected csum wrapper type: {:?}", other),
+                },
+                other => panic!("unexpected csum syscall arg: {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn parses_glob_patterns_as_filenames() {
+        let input = r#"
+            resource fd[4] = -1, 0
+            openat$sysfs(fd const[AT_FDCWD], dir ptr[in, glob["/sys/**/*:-/sys/power/state"]], flags int32, mode int32) fd
+        "#;
+        let descs = parse_syscall_descs(input).expect("glob patterns should parse");
+
+        match &descs[0].args[1] {
+            ArgType::Ptr { inner, dir, .. } => {
+                assert_eq!(*dir, PtrDir::In);
+                assert!(matches!(inner.as_ref(), ArgType::Filename));
+            }
+            other => panic!("unexpected glob arg type: {:?}", other),
         }
     }
 
@@ -4321,12 +5839,20 @@ mod tests {
         let descs = parse_syscall_descs(
             r#"
                 resource fd[int32] = -1
-                syscall splice_like@1 -> int(off ptr[in, fileoff[int64]], enabled bool8, maybe optional[int32])
+                syscall splice_like@1 -> int(pos fileoff, off ptr[in, fileoff[int64]], enabled bool8, maybe optional[int32])
             "#,
         )
         .unwrap();
 
         match &descs[0].args[0] {
+            ArgType::Const { size, range, .. } => {
+                assert_eq!(*size, 8);
+                assert_eq!(*range, None);
+            }
+            other => panic!("unexpected plain fileoff arg: {:?}", other),
+        }
+
+        match &descs[0].args[1] {
             ArgType::Ptr { inner, .. } => match inner.as_ref() {
                 ArgType::Const { size, range, .. } => {
                     assert_eq!(*size, 8);
@@ -4337,7 +5863,7 @@ mod tests {
             other => panic!("unexpected fileoff arg: {:?}", other),
         }
 
-        match &descs[0].args[1] {
+        match &descs[0].args[2] {
             ArgType::Const { size, range, .. } => {
                 assert_eq!(*size, 1);
                 assert_eq!(*range, Some((0, 1)));
@@ -4345,7 +5871,7 @@ mod tests {
             other => panic!("unexpected bool8 arg: {:?}", other),
         }
 
-        match &descs[0].args[2] {
+        match &descs[0].args[3] {
             ArgType::Union {
                 field_names,
                 varlen,
@@ -4506,7 +6032,10 @@ mod tests {
         match &descs[0].args[0] {
             ArgType::Const { size, values, .. } => {
                 assert_eq!(*size, 1);
-                assert_eq!(values, &vec![b'P' as u64, b'O' as u64, b'C' as u64, b'F' as u64]);
+                assert_eq!(
+                    values,
+                    &vec![b'P' as u64, b'O' as u64, b'C' as u64, b'F' as u64]
+                );
             }
             other => panic!("unexpected flags arg: {:?}", other),
         }
@@ -4523,6 +6052,78 @@ mod tests {
                 assert_eq!(*range, Some((b'0' as u64, b'9' as u64)));
             }
             other => panic!("unexpected ranged char arg: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_scalar_exact_ranges_steps_and_named_sets() {
+        let descs = parse_syscall_descs(
+            r#"
+                families = 1, 2, 4
+                syscall use_scalars@1 -> int(a int32[7], b int32[1:9, 2], c int8[families], d int16be[0:3, opt])
+            "#,
+        )
+        .unwrap();
+
+        match &descs[0].args[0] {
+            ArgType::Const {
+                size,
+                values,
+                range,
+                endian,
+                ..
+            } => {
+                assert_eq!(*size, 4);
+                assert_eq!(values, &vec![7]);
+                assert_eq!(*range, None);
+                assert_eq!(*endian, ScalarEndian::Native);
+            }
+            other => panic!("unexpected scalar exact arg: {:?}", other),
+        }
+        match &descs[0].args[1] {
+            ArgType::Const {
+                size,
+                values,
+                range,
+                endian,
+                ..
+            } => {
+                assert_eq!(*size, 4);
+                assert!(values.is_empty());
+                assert_eq!(*range, Some((1, 9)));
+                assert_eq!(*endian, ScalarEndian::Native);
+            }
+            other => panic!("unexpected scalar stepped range arg: {:?}", other),
+        }
+        match &descs[0].args[2] {
+            ArgType::Const {
+                size,
+                values,
+                range,
+                endian,
+                ..
+            } => {
+                assert_eq!(*size, 1);
+                assert_eq!(values, &vec![1, 2, 4]);
+                assert_eq!(*range, None);
+                assert_eq!(*endian, ScalarEndian::Native);
+            }
+            other => panic!("unexpected scalar set arg: {:?}", other),
+        }
+        match &descs[0].args[3] {
+            ArgType::Const {
+                size,
+                values,
+                range,
+                endian,
+                ..
+            } => {
+                assert_eq!(*size, 2);
+                assert!(values.is_empty());
+                assert_eq!(*range, Some((0, 3)));
+                assert_eq!(*endian, ScalarEndian::Big);
+            }
+            other => panic!("unexpected optional ranged scalar arg: {:?}", other),
         }
     }
 
@@ -4557,6 +6158,54 @@ mod tests {
                 assert_eq!(values, &vec![7]);
             }
             other => panic!("unexpected filtered flag arg: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn arch_missing_const_constraints_become_unavailable_scalars() {
+        let dir = temp_description_dir("missing-const-constraints");
+        fs::write(
+            dir.join("sys.txt.const"),
+            concat!("arches = amd64\n", "MISSING_ARCH_CONST = amd64:???\n",),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("sys.txt"),
+            concat!(
+                "holder {\n",
+                "    exact const[MISSING_ARCH_CONST, int32]\n",
+                "    ranged int32[MISSING_ARCH_CONST:7]\n",
+                "}\n",
+                "syscall use_holder@1 -> int(arg ptr[in, holder])\n",
+            ),
+        )
+        .unwrap();
+
+        let descs = parse_syscall_descs_from_path(&dir).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        match &descs[0].args[0] {
+            ArgType::Ptr { inner, .. } => match inner.as_ref() {
+                ArgType::Struct { fields, .. } => {
+                    for field in fields {
+                        match field {
+                            ArgType::Const {
+                                values,
+                                range,
+                                allow_any,
+                                ..
+                            } => {
+                                assert!(values.is_empty());
+                                assert_eq!(*range, None);
+                                assert!(!allow_any);
+                            }
+                            other => panic!("unexpected unavailable const field: {:?}", other),
+                        }
+                    }
+                }
+                other => panic!("unexpected holder type: {:?}", other),
+            },
+            other => panic!("unexpected holder arg: {:?}", other),
         }
     }
 
@@ -4648,7 +6297,9 @@ mod tests {
 
         match &descs[0].args[0] {
             ArgType::Struct { fields, .. } => match &fields[0] {
-                ArgType::Ptr { inner, optional, .. } => {
+                ArgType::Ptr {
+                    inner, optional, ..
+                } => {
                     assert!(*optional);
                     match inner.as_ref() {
                         ArgType::Struct {
@@ -4687,6 +6338,38 @@ mod tests {
                 other => panic!("unexpected fmt field: {:?}", other),
             },
             other => panic!("unexpected fmt arg: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn alias_templates_preserve_field_context_for_len_targets() {
+        let descs = parse_syscall_descs(
+            r#"
+                holder {
+                    num fmt[dec, len[cats, int16]]
+                    cats array[int8]
+                }
+                syscall use_holder@1 -> int(arg ptr[in, holder], size len[arg])
+            "#,
+        )
+        .unwrap();
+
+        match &descs[0].args[0] {
+            ArgType::Ptr { inner, .. } => match inner.as_ref() {
+                ArgType::Struct { fields, .. } => match &fields[0] {
+                    ArgType::Len {
+                        target, size, kind, ..
+                    } => {
+                        assert_eq!(*size, 2);
+                        assert_eq!(*kind, LengthKind::Auto);
+                        assert_eq!(target.root, LengthTargetRoot::Current);
+                        assert_eq!(target.fields, vec!["cats".to_string()]);
+                    }
+                    other => panic!("unexpected fmt-derived field: {:?}", other),
+                },
+                other => panic!("unexpected holder type: {:?}", other),
+            },
+            other => panic!("unexpected holder arg: {:?}", other),
         }
     }
 
@@ -4800,7 +6483,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(descs[0].args[0], ArgType::Resource(_)));
+        assert!(matches!(descs[0].args[0], ArgType::OptionalResource(_)));
         assert!(matches!(descs[0].args[1], ArgType::Const { size: 2, .. }));
     }
 
@@ -4864,7 +6547,7 @@ mod tests {
     }
 
     #[test]
-    fn packed_structs_can_drop_zero_const_suffix_after_var_array() {
+    fn packed_structs_can_preserve_zero_const_suffix_after_var_array() {
         let descs = parse_syscall_descs(
             r#"
                 argv_array {
@@ -4886,11 +6569,12 @@ mod tests {
                     packed,
                     ..
                 } => {
-                    assert_eq!(field_names, &vec!["args"]);
-                    assert_eq!(fields.len(), 1);
+                    assert_eq!(field_names, &vec!["args", "z"]);
+                    assert_eq!(fields.len(), 2);
                     assert!(*varlen);
                     assert!(*packed);
                     assert!(matches!(fields[0], ArgType::Array { .. }));
+                    assert!(matches!(fields[1], ArgType::Const { range: None, .. }));
                 }
                 other => panic!("unexpected argv inner: {:?}", other),
             },
@@ -4940,7 +6624,11 @@ mod tests {
         .unwrap();
 
         match &descs[0].args[0] {
-            ArgType::Ptr { inner, dir, optional } => {
+            ArgType::Ptr {
+                inner,
+                dir,
+                optional,
+            } => {
                 assert_eq!(*dir, PtrDir::Out);
                 assert!(!optional);
                 match inner.as_ref() {
@@ -5013,7 +6701,11 @@ mod tests {
     fn directory_loading_prescans_later_sibling_resource_definitions() {
         let dir = temp_description_dir("directory-later-sibling-resources");
         fs::write(dir.join("00-child.txt"), "resource fd_child[fd_parent]\n").unwrap();
-        fs::write(dir.join("99-parent.txt"), "resource fd_parent[int32] = -1\n").unwrap();
+        fs::write(
+            dir.join("99-parent.txt"),
+            "resource fd_parent[int32] = -1\n",
+        )
+        .unwrap();
         fs::write(
             dir.join("sys.txt"),
             concat!(
@@ -5181,6 +6873,66 @@ mod tests {
     }
 
     #[test]
+    fn parses_known_meta_directives() {
+        let descs = parse_syscall_descs(
+            r#"
+                meta automatic
+                meta noextract
+                meta arches["amd64", "arm64"]
+
+                syscall meta_ok@1 -> int()
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(descs.len(), 1);
+        assert_eq!(descs[0].name, "meta_ok");
+    }
+
+    #[test]
+    fn parses_incdir_directives() {
+        let descs = parse_syscall_descs(
+            r#"
+                incdir <drivers/gpu/drm/img-rogue/1.13>
+                incdir "drivers/gpu/drm/img-rogue/1.13/km"
+
+                syscall incdir_ok@1 -> int()
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(descs.len(), 1);
+        assert_eq!(descs[0].name, "incdir_ok");
+    }
+
+    #[test]
+    fn path_loading_skips_files_filtered_by_meta_arches() {
+        let dir = temp_description_dir("meta-arches-filter");
+        fs::write(
+            dir.join("amd64.txt"),
+            concat!(
+                "meta arches[\"amd64\"]\n",
+                "syscall amd64_only@1 -> int()\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("arm64.txt"),
+            concat!(
+                "meta arches[\"arm64\"]\n",
+                "syscall arm64_only@2 -> int(arg missing_type)\n",
+            ),
+        )
+        .unwrap();
+
+        let descs = parse_syscall_descs_from_path(&dir).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(descs.len(), 1);
+        assert_eq!(descs[0].name, "amd64_only");
+    }
+
+    #[test]
     fn directory_loading_prescans_later_sibling_type_definitions() {
         let dir = temp_description_dir("directory-later-sibling-types");
         fs::write(
@@ -5195,11 +6947,7 @@ mod tests {
         .unwrap();
         fs::write(
             dir.join("99-type.txt"),
-            concat!(
-                "later_type {\n",
-                "    value int32\n",
-                "}\n",
-            ),
+            concat!("later_type {\n", "    value int32\n", "}\n",),
         )
         .unwrap();
 
@@ -5528,8 +7276,10 @@ mod tests {
     fn parses_string_forms_and_sets() {
         let descs = parse_syscall_descs(
             r#"
+                const NAME_LEN = 12
                 path_values = "/dev/null", "/dev/zero"
-                syscall take_strings@1 -> int(path ptr[in, string[path_values]], raw ptr[in, stringnoz["abc", 8]], name ptr[in, string[filename, 16]], plain ptr[in, string])
+                device_names = "binder0", "binder1"
+                syscall take_strings@1 -> int(path ptr[in, string[path_values]], raw ptr[in, stringnoz["abc", 8]], name ptr[in, string[filename, 16]], device ptr[in, string[device_names, NAME_LEN]], plain ptr[in, string])
             "#,
         )
         .unwrap();
@@ -5587,6 +7337,51 @@ mod tests {
                 other => panic!("unexpected filename-string inner type: {:?}", other),
             },
             other => panic!("unexpected filename-string arg: {:?}", other),
+        }
+
+        match &descs[0].args[3] {
+            ArgType::Ptr { inner, .. } => match inner.as_ref() {
+                ArgType::String {
+                    values,
+                    noz,
+                    fixed_len,
+                    filename,
+                } => {
+                    assert_eq!(values, &vec![b"binder0".to_vec(), b"binder1".to_vec()]);
+                    assert!(!noz);
+                    assert_eq!(*fixed_len, Some(12));
+                    assert!(!filename);
+                }
+                other => panic!("unexpected const-length string-set inner type: {:?}", other),
+            },
+            other => panic!("unexpected const-length string-set arg: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_string_literals_with_embedded_nul_bytes() {
+        let descs = parse_syscall_descs(
+            r#"
+                syscall take_nul_string@1 -> int(arg ptr[in, string["ab\u0000cd"]])
+            "#,
+        )
+        .expect("embedded NUL string literal should parse");
+
+        match &descs[0].args[0] {
+            ArgType::Ptr { inner, .. } => match inner.as_ref() {
+                ArgType::String {
+                    values,
+                    noz,
+                    fixed_len,
+                    ..
+                } => {
+                    assert_eq!(values, &vec![b"ab\0cd".to_vec()]);
+                    assert!(!noz);
+                    assert_eq!(*fixed_len, None);
+                }
+                other => panic!("unexpected embedded-NUL string type: {:?}", other),
+            },
+            other => panic!("unexpected embedded-NUL string arg: {:?}", other),
         }
     }
 
@@ -5663,7 +7458,9 @@ mod tests {
                 ArgType::Struct { fields, size, .. } => {
                     assert_eq!(*size, 12);
                     match &fields[0] {
-                        ArgType::Len { target, size, kind } => {
+                        ArgType::Len {
+                            target, size, kind, ..
+                        } => {
                             assert_eq!(
                                 (target, *size, *kind),
                                 (
@@ -5711,7 +7508,9 @@ mod tests {
                     assert_eq!(*size, 8);
                     assert_eq!(field_names, &vec!["nla_len", "nla_type", "payload", "end"]);
                     match &fields[0] {
-                        ArgType::Len { target, size, kind } => {
+                        ArgType::Len {
+                            target, size, kind, ..
+                        } => {
                             assert_eq!(
                                 (target, *size, *kind),
                                 (
@@ -5763,7 +7562,9 @@ mod tests {
             ArgType::Ptr { inner, .. } => match inner.as_ref() {
                 ArgType::Struct { fields, .. } => {
                     match &fields[1] {
-                        ArgType::Len { target, size, kind } => {
+                        ArgType::Len {
+                            target, size, kind, ..
+                        } => {
                             assert_eq!(
                                 (target, *size, *kind),
                                 (
@@ -5779,7 +7580,9 @@ mod tests {
                         other => panic!("unexpected type-root length field: {:?}", other),
                     }
                     match &fields[2] {
-                        ArgType::Len { target, size, kind } => {
+                        ArgType::Len {
+                            target, size, kind, ..
+                        } => {
                             assert_eq!(
                                 (target, *size, *kind),
                                 (
@@ -5805,7 +7608,9 @@ mod tests {
                 ArgType::Struct { fields, .. } => {
                     match &fields[1] {
                         ArgType::Struct { fields, .. } => match &fields[0] {
-                            ArgType::Len { target, size, kind } => {
+                            ArgType::Len {
+                                target, size, kind, ..
+                            } => {
                                 assert_eq!(
                                     (target, *size, *kind),
                                     (
@@ -5823,7 +7628,9 @@ mod tests {
                         other => panic!("unexpected parent_meta field: {:?}", other),
                     }
                     match &fields[2] {
-                        ArgType::Len { target, size, kind } => {
+                        ArgType::Len {
+                            target, size, kind, ..
+                        } => {
                             assert_eq!(
                                 (target, *size, *kind),
                                 (
@@ -5845,7 +7652,9 @@ mod tests {
         }
 
         match &descs[0].args[3] {
-            ArgType::Len { target, size, kind } => {
+            ArgType::Len {
+                target, size, kind, ..
+            } => {
                 assert_eq!(
                     (target, *size, *kind),
                     (
@@ -5882,7 +7691,9 @@ mod tests {
             ArgType::Ptr { inner, .. } => match inner.as_ref() {
                 ArgType::Struct { fields, .. } => match &fields[0] {
                     ArgType::Struct { fields, .. } => match &fields[0] {
-                        ArgType::Len { target, size, kind } => {
+                        ArgType::Len {
+                            target, size, kind, ..
+                        } => {
                             assert_eq!(
                                 (target, *size, *kind),
                                 (
@@ -5902,6 +7713,333 @@ mod tests {
                 other => panic!("unexpected outer arg type: {:?}", other),
             },
             other => panic!("unexpected syscall arg: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_single_segment_type_roots_inside_type_context() {
+        let descs = parse_syscall_descs(
+            r#"
+                outer {
+                    hdr inner
+                    payload array[int8]
+                }
+                inner {
+                    total bytesize[outer, int32]
+                } [packed]
+                syscall use_outer@1 -> int(arg ptr[in, outer])
+            "#,
+        )
+        .unwrap();
+
+        match &descs[0].args[0] {
+            ArgType::Ptr { inner, .. } => match inner.as_ref() {
+                ArgType::Struct { fields, .. } => match &fields[0] {
+                    ArgType::Struct { fields, .. } => match &fields[0] {
+                        ArgType::Len {
+                            target, size, kind, ..
+                        } => {
+                            assert_eq!(
+                                (target, *size, *kind),
+                                (
+                                    &LengthTarget {
+                                        root: LengthTargetRoot::Type("outer".into()),
+                                        fields: vec![],
+                                    },
+                                    4,
+                                    LengthKind::Bytes,
+                                )
+                            );
+                        }
+                        other => panic!("unexpected single-segment type-root field: {:?}", other),
+                    },
+                    other => panic!("unexpected nested header type: {:?}", other),
+                },
+                other => panic!("unexpected outer arg type: {:?}", other),
+            },
+            other => panic!("unexpected syscall arg: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_auto_generated_ieee802154_policy_union_fragment() {
+        let dir = temp_description_dir("auto-ieee802154-policy");
+        fs::write(
+            dir.join("00-base.txt"),
+            concat!(
+                "devnames = \"\", \"lo\"\n",
+                "resource ifindex[int32]\n",
+                "type devname string[devnames, 16]\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("10-netlink.txt"),
+            concat!(
+                "type nlattr_t[TYPE, PAYLOAD] {\n",
+                "    nla_len offsetof[size, int16]\n",
+                "    nla_type TYPE\n",
+                "    payload PAYLOAD\n",
+                "    size void\n",
+                "} [packed, align[4]]\n",
+                "type nlattr[TYPE, PAYLOAD] nlattr_t[const[TYPE, int16], PAYLOAD]\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("20-auto.txt"),
+            concat!(
+                "syscall use_auto_policy@1 -> int(arg ptr[in, ieee802154_policy_nl802154$auto])\n",
+                "ieee802154_policy_nl802154$auto [\n",
+                "    IEEE802154_ATTR_DEV_NAME nlattr[IEEE802154_ATTR_DEV_NAME, devname]\n",
+                "    IEEE802154_ATTR_DEV_INDEX nlattr[IEEE802154_ATTR_DEV_INDEX, ifindex]\n",
+                "    IEEE802154_ATTR_PHY_NAME nlattr[IEEE802154_ATTR_PHY_NAME, stringnoz]\n",
+                "    IEEE802154_ATTR_STATUS nlattr[IEEE802154_ATTR_STATUS, int8]\n",
+                "    IEEE802154_ATTR_SHORT_ADDR nlattr[IEEE802154_ATTR_SHORT_ADDR, int16]\n",
+                "    IEEE802154_ATTR_HW_ADDR nlattr[IEEE802154_ATTR_HW_ADDR, int64]\n",
+                "    IEEE802154_ATTR_PAN_ID nlattr[IEEE802154_ATTR_PAN_ID, int16]\n",
+                "    IEEE802154_ATTR_ED_LIST nlattr[IEEE802154_ATTR_ED_LIST, array[int8, 27]]\n",
+                "    IEEE802154_ATTR_CHANNEL_PAGE_LIST nlattr[IEEE802154_ATTR_CHANNEL_PAGE_LIST, array[int8, 128]]\n",
+                "    IEEE802154_ATTR_LBT_ENABLED nlattr[IEEE802154_ATTR_LBT_ENABLED, bool8]\n",
+                "] [varlen]\n",
+            ),
+        )
+        .unwrap();
+
+        let descs = parse_syscall_descs_from_path(&dir).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        match &descs[0].args[0] {
+            ArgType::Ptr { inner, .. } => match inner.as_ref() {
+                ArgType::Union {
+                    type_name,
+                    fields,
+                    varlen,
+                    ..
+                } => {
+                    assert_eq!(
+                        type_name.as_deref(),
+                        Some("ieee802154_policy_nl802154$auto")
+                    );
+                    assert_eq!(fields.len(), 10);
+                    assert!(*varlen);
+                }
+                other => panic!("unexpected auto policy inner type: {:?}", other),
+            },
+            other => panic!("unexpected auto policy arg: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fixed_unions_accept_uniform_length_string_set_fields() {
+        let descs = parse_syscall_descs(
+            r#"
+                nft_flowtable_name = "syz0", "syz1", "syz2"
+                type nlattr[TYPE, PAYLOAD] {
+                    nla_len offsetof[size, int16]
+                    nla_type const[TYPE, int16]
+                    payload PAYLOAD
+                    size void
+                } [packed, align[4]]
+                nft_flow_offload_policy [
+                    NFTA_FLOW_TABLE_NAME nlattr[0xaa, string[nft_flowtable_name]]
+                ]
+                syscall use_flow@1 -> int(arg ptr[in, nft_flow_offload_policy])
+            "#,
+        )
+        .unwrap();
+
+        match &descs[0].args[0] {
+            ArgType::Ptr { inner, .. } => match inner.as_ref() {
+                ArgType::Union {
+                    size,
+                    varlen,
+                    fields,
+                    ..
+                } => {
+                    assert_eq!(*size, 12);
+                    assert!(!varlen);
+                    assert_eq!(fields.len(), 1);
+                }
+                other => panic!("unexpected flow policy inner type: {:?}", other),
+            },
+            other => panic!("unexpected flow policy arg: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn varlen_unions_can_skip_self_recursive_fields() {
+        let descs = parse_syscall_descs(
+            r#"
+                recursive_attr [
+                    generic array[int8]
+                    nested array[recursive_attr]
+                ] [varlen]
+                syscall use_recursive@1 -> int(arg ptr[in, recursive_attr])
+            "#,
+        )
+        .unwrap();
+
+        match &descs[0].args[0] {
+            ArgType::Ptr { inner, .. } => match inner.as_ref() {
+                ArgType::Union {
+                    field_names,
+                    fields,
+                    varlen,
+                    ..
+                } => {
+                    assert!(*varlen);
+                    assert_eq!(field_names, &vec!["generic".to_string()]);
+                    assert_eq!(fields.len(), 1);
+                }
+                other => panic!("unexpected recursive union inner type: {:?}", other),
+            },
+            other => panic!("unexpected recursive union arg: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_nl_generic_attr_style_recursive_union() {
+        let descs = parse_syscall_descs(
+            r#"
+                resource fd[int32]
+                resource pid[int32]
+                resource uid[int32]
+                type ipv4_addr int32
+                type ipv6_addr array[int8, 16]
+                type nlattr_tt[TYPE, NETORDER, NESTED, PAYLOAD] {
+                    nla_len offsetof[size, int16]
+                    nla_type TYPE
+                    NLA_F_NET_BYTEORDER const[NETORDER, int16:1]
+                    NLA_F_NESTED const[NESTED, int16:1]
+                    payload PAYLOAD
+                    size void
+                } [packed, align[4]]
+                type nlnest[TYPE, PAYLOAD] nlattr_tt[const[TYPE, int16:14], 0, 1, PAYLOAD]
+                nl_generic_attr [
+                    generic array[int8]
+                    typed nlattr_tt[int16:14[0:10], 0, 0, nl_generic_attr_data]
+                    nested nlnest[int16:14[0:10], array[nl_generic_attr]]
+                ] [varlen]
+                nl_generic_attr_data [
+                    void void
+                    u32 int32
+                    u64 int64
+                    ipv4 ipv4_addr
+                    ipv6 ipv6_addr
+                    fd fd
+                    pid pid
+                    uid uid
+                    str string
+                    binary array[int8]
+                ] [varlen]
+                syscall use_nlattr@1 -> int(arg ptr[in, nl_generic_attr])
+            "#,
+        )
+        .unwrap();
+
+        match &descs[0].args[0] {
+            ArgType::Ptr { inner, .. } => match inner.as_ref() {
+                ArgType::Union {
+                    type_name,
+                    field_names,
+                    fields,
+                    varlen,
+                    ..
+                } => {
+                    assert_eq!(type_name.as_deref(), Some("nl_generic_attr"));
+                    assert!(varlen);
+                    assert_eq!(
+                        field_names,
+                        &vec!["generic".to_string(), "typed".to_string()]
+                    );
+                    assert_eq!(fields.len(), 2);
+                }
+                other => panic!("unexpected nl_generic_attr inner type: {:?}", other),
+            },
+            other => panic!("unexpected nl_generic_attr arg: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn directory_loading_handles_auto_policies_that_reference_nl_generic_attr() {
+        let dir = temp_description_dir("auto-nl-generic-attr");
+        fs::write(
+            dir.join("00-sys.txt"),
+            concat!(
+                "resource fd[int32]\n",
+                "resource pid[int32]\n",
+                "resource uid[int32]\n",
+                "type ipv4_addr int32\n",
+                "type ipv6_addr array[int8, 16]\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("10-socket_netlink.txt"),
+            concat!(
+                "type nlattr_tt[TYPE, NETORDER, NESTED, PAYLOAD] {\n",
+                "    nla_len offsetof[size, int16]\n",
+                "    nla_type TYPE\n",
+                "    NLA_F_NET_BYTEORDER const[NETORDER, int16:1]\n",
+                "    NLA_F_NESTED const[NESTED, int16:1]\n",
+                "    payload PAYLOAD\n",
+                "    size void\n",
+                "} [packed, align[4]]\n",
+                "type nlnest[TYPE, PAYLOAD] nlattr_tt[const[TYPE, int16:14], 0, 1, PAYLOAD]\n",
+                "nl_generic_attr [\n",
+                "    generic array[int8]\n",
+                "    typed nlattr_tt[int16:14[0:10], 0, 0, nl_generic_attr_data]\n",
+                "    nested nlattr_tt[int16:14[0:10], 0, 1, array[nl_generic_attr]]\n",
+                "] [varlen]\n",
+                "nl_generic_attr_data [\n",
+                "    void void\n",
+                "    u32 int32\n",
+                "    u64 int64\n",
+                "    ipv4 ipv4_addr\n",
+                "    ipv6 ipv6_addr\n",
+                "    fd fd\n",
+                "    pid pid\n",
+                "    uid uid\n",
+                "    str string\n",
+                "    binary array[int8]\n",
+                "] [varlen]\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("20-auto.txt"),
+            concat!(
+                "ip_vs_cmd_policy_ip_vs_ctl$auto [\n",
+                "    IPVS_CMD_ATTR_SERVICE nlnest[IPVS_CMD_ATTR_SERVICE, array[nl_generic_attr]]\n",
+                "    IPVS_CMD_ATTR_DEST nlnest[IPVS_CMD_ATTR_DEST, array[nl_generic_attr]]\n",
+                "] [varlen]\n",
+                "syscall use_auto@1 -> int(arg ptr[in, ip_vs_cmd_policy_ip_vs_ctl$auto])\n",
+            ),
+        )
+        .unwrap();
+
+        let descs = parse_syscall_descs_from_path(&dir).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        match &descs[0].args[0] {
+            ArgType::Ptr { inner, .. } => match inner.as_ref() {
+                ArgType::Union {
+                    type_name,
+                    fields,
+                    varlen,
+                    ..
+                } => {
+                    assert_eq!(
+                        type_name.as_deref(),
+                        Some("ip_vs_cmd_policy_ip_vs_ctl$auto")
+                    );
+                    assert!(varlen);
+                    assert_eq!(fields.len(), 2);
+                }
+                other => panic!("unexpected auto policy type: {:?}", other),
+            },
+            other => panic!("unexpected auto policy arg: {:?}", other),
         }
     }
 
@@ -5986,5 +8124,420 @@ mod tests {
             },
             other => panic!("unexpected walk_msg arg: {:?}", other),
         }
+    }
+
+    #[test]
+    fn parses_proc_scalars_in_top_level_and_vnet_style_structs() {
+        let descs = parse_syscall_descs(
+            r#"
+                type ipv4_addr_initdev {
+                    a0 const[0xac, int8]
+                    a1 const[0x1e, int8]
+                    a2 int8[0:1]
+                    a3 proc[1, 1, int8]
+                }
+                syscall use_proc@1 -> int(dev proc[1792, 2], addr ptr[in, ipv4_addr_initdev])
+            "#,
+        )
+        .expect("proc-bearing target should parse");
+
+        match &descs[0].args[0] {
+            ArgType::Proc {
+                size,
+                values_start,
+                values_per_proc,
+                endian,
+            } => {
+                assert_eq!(*size, 8);
+                assert_eq!(*values_start, 1792);
+                assert_eq!(*values_per_proc, 2);
+                assert_eq!(*endian, ScalarEndian::Native);
+            }
+            other => panic!("unexpected top-level proc arg: {:?}", other),
+        }
+
+        match &descs[0].args[1] {
+            ArgType::Ptr { inner, .. } => match inner.as_ref() {
+                ArgType::Struct { fields, size, .. } => {
+                    assert_eq!(*size, 4);
+                    match &fields[3] {
+                        ArgType::Proc {
+                            size,
+                            values_start,
+                            values_per_proc,
+                            endian,
+                        } => {
+                            assert_eq!(*size, 1);
+                            assert_eq!(*values_start, 1);
+                            assert_eq!(*values_per_proc, 1);
+                            assert_eq!(*endian, ScalarEndian::Native);
+                        }
+                        other => panic!("unexpected inline proc field: {:?}", other),
+                    }
+                }
+                other => panic!("unexpected inline proc struct: {:?}", other),
+            },
+            other => panic!("unexpected inline proc syscall arg: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_out_overlay_structs_with_explicit_parent_size() {
+        let descs = parse_syscall_descs(
+            r#"
+                type overlay_args {
+                    kind int32
+                    devid int32 (out_overlay)
+                    magic int32
+                } [size[8]]
+                type overlay_outer {
+                    prefix int32
+                    payload overlay_args
+                    suffix int32
+                } [size[16]]
+                syscall use_overlay@1 -> int(arg ptr[inout, overlay_outer])
+            "#,
+        )
+        .expect("overlay-bearing target should parse");
+
+        match &descs[0].args[0] {
+            ArgType::Ptr { inner, .. } => match inner.as_ref() {
+                ArgType::Struct {
+                    fields,
+                    size,
+                    overlay_start,
+                    ..
+                } => {
+                    assert_eq!(*size, 16);
+                    assert_eq!(*overlay_start, None);
+                    match &fields[1] {
+                        ArgType::Struct {
+                            fields,
+                            size,
+                            overlay_start,
+                            ..
+                        } => {
+                            assert_eq!(*size, 8);
+                            assert_eq!(*overlay_start, Some(1));
+                            assert_eq!(fields.len(), 3);
+                        }
+                        other => panic!("unexpected overlay payload type: {:?}", other),
+                    }
+                }
+                other => panic!("unexpected overlay outer type: {:?}", other),
+            },
+            other => panic!("unexpected overlay syscall arg: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unions_can_wait_for_later_template_aliases() {
+        let descs = parse_syscall_descs(
+            r#"
+                sock_addr [
+                    kern sock_addr_kern
+                    proc sock_addr_proc
+                ]
+                type port_id int32[1:2]
+                type sock_addr_t[FAMILY, PID, GROUPS] {
+                    family const[FAMILY, int16]
+                    pad const[0, int16]
+                    pid PID
+                    groups GROUPS
+                }
+                type sock_addr_proc sock_addr_t[1, port_id, flags[proc_groups, int32]]
+                type sock_addr_kern sock_addr_t[1, const[0, int32], flags[proc_groups, int32]]
+                proc_groups = 0, 1
+                syscall use_sockaddr@1 -> int(addr ptr[in, sock_addr])
+            "#,
+        )
+        .expect("later template aliases should resolve through pending rounds");
+
+        match &descs[0].args[0] {
+            ArgType::Ptr { inner, .. } => match inner.as_ref() {
+                ArgType::Union {
+                    type_name,
+                    fields,
+                    field_names,
+                    ..
+                } => {
+                    assert_eq!(type_name.as_deref(), Some("sock_addr"));
+                    assert_eq!(fields.len(), 2);
+                    assert_eq!(field_names, &vec!["kern".to_string(), "proc".to_string()]);
+                }
+                other => panic!("unexpected sockaddr union: {:?}", other),
+            },
+            other => panic!("unexpected sockaddr syscall arg: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn varlen_unions_can_skip_indirect_recursive_pending_fields() {
+        let descs = parse_syscall_descs(
+            r#"
+                cyc_a [
+                    base int32
+                    next cyc_b
+                ] [varlen]
+                cyc_b [
+                    base int32
+                    next cyc_c
+                ] [varlen]
+                cyc_c [
+                    base int32
+                    next cyc_a
+                ] [varlen]
+                syscall use_cycle@1 -> int(arg ptr[in, cyc_a])
+            "#,
+        )
+        .expect("indirect recursive varlen unions should salvage non-cyclic fields");
+
+        match &descs[0].args[0] {
+            ArgType::Ptr { inner, .. } => match inner.as_ref() {
+                ArgType::Union {
+                    fields,
+                    field_names,
+                    varlen,
+                    ..
+                } => {
+                    assert!(*varlen);
+                    assert_eq!(fields.len(), 1);
+                    assert_eq!(field_names, &vec!["base".to_string()]);
+                    assert!(matches!(fields[0], ArgType::Const { size: 4, .. }));
+                }
+                other => panic!("unexpected cycle union type: {:?}", other),
+            },
+            other => panic!("unexpected cycle syscall arg: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn varlen_unions_can_fall_back_to_void_when_only_recursive_fields_remain() {
+        let descs = parse_syscall_descs(
+            r#"
+                cyc_only_a [
+                    next cyc_only_b
+                ] [varlen]
+                cyc_only_b [
+                    next cyc_only_a
+                ] [varlen]
+                syscall use_cycle_only@1 -> int(arg ptr[in, cyc_only_a])
+            "#,
+        )
+        .expect("purely recursive varlen unions should keep a conservative placeholder");
+
+        match &descs[0].args[0] {
+            ArgType::Ptr { inner, .. } => match inner.as_ref() {
+                ArgType::Union {
+                    fields,
+                    field_names,
+                    varlen,
+                    ..
+                } => {
+                    assert!(*varlen);
+                    assert_eq!(fields.len(), 1);
+                    assert_eq!(field_names, &vec!["void".to_string()]);
+                    assert!(matches!(fields[0], ArgType::Void));
+                }
+                other => panic!("unexpected pure cycle union type: {:?}", other),
+            },
+            other => panic!("unexpected pure cycle syscall arg: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_adf_auto_pointer_cycles_conservatively() {
+        let descs = parse_syscall_descs(
+            r#"
+                adf_cfg_val_type$auto = 1, 2, 3
+                adf_user_cfg_ctl_data$auto {
+                    adf_user_cfg_ctl_data_0 adf_user_cfg_ctl_data_0$auto
+                    device_id int8
+                } [packed]
+                adf_user_cfg_ctl_data_0$auto [
+                    config_section ptr[inout, adf_user_cfg_section$auto]
+                    padding const[0, int64]
+                ]
+                adf_user_cfg_key_val$auto {
+                    key array[int8, 64]
+                    val array[int8, 64]
+                    adf_user_cfg_key_val_2 adf_user_cfg_key_val_2$auto
+                    type flags[adf_cfg_val_type$auto, int32]
+                } [packed]
+                adf_user_cfg_key_val_2$auto [
+                    next ptr[inout, adf_user_cfg_key_val$auto, opt]
+                    padding3 const[0, int64]
+                ]
+                adf_user_cfg_section$auto {
+                    name array[int8, 64]
+                    adf_user_cfg_section_1 adf_user_cfg_section_1$auto
+                    adf_user_cfg_section_2 adf_user_cfg_section_2$auto
+                } [packed]
+                adf_user_cfg_section_1$auto [
+                    params ptr[inout, adf_user_cfg_key_val$auto]
+                    padding1 const[0, int64]
+                ]
+                adf_user_cfg_section_2$auto [
+                    next ptr[inout, adf_user_cfg_section$auto, opt]
+                    padding3 const[0, int64]
+                ]
+                syscall use_adf@1 -> int(arg ptr[inout, adf_user_cfg_ctl_data$auto])
+            "#,
+        )
+        .expect("ADF auto pointer cycles should parse");
+
+        assert_eq!(descs.len(), 1);
+    }
+
+    #[test]
+    fn fixed_unions_can_coerce_nested_opaque_struct_fields_to_pointers() {
+        let descs = parse_syscall_descs(
+            r#"
+                event_ext {
+                    len len[ptr, int32]
+                    ptr buffer[in]
+                } [packed]
+                event_data [
+                    ext event_ext
+                    raw array[int8, 12]
+                ]
+                syscall use_event@1 -> int(arg ptr[in, event_data])
+            "#,
+        )
+        .expect("fixed unions should accept nested opaque struct fields");
+
+        match &descs[0].args[0] {
+            ArgType::Ptr { inner, .. } => match inner.as_ref() {
+                ArgType::Union { fields, .. } => match &fields[0] {
+                    ArgType::Struct { fields, size, .. } => {
+                        assert_eq!(*size, 12);
+                        assert!(matches!(
+                            &fields[1],
+                            ArgType::Ptr {
+                                inner,
+                                dir: PtrDir::In,
+                                optional: false,
+                            } if matches!(inner.as_ref(), ArgType::Buffer { .. })
+                        ));
+                    }
+                    other => panic!("unexpected ext field type: {:?}", other),
+                },
+                other => panic!("unexpected event_data type: {:?}", other),
+            },
+            other => panic!("unexpected event_data arg: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_self_referential_struct_pointers_conservatively() {
+        let descs = parse_syscall_descs(
+            r#"
+                robust_list$auto {
+                    next ptr[inout, robust_list$auto, opt]
+                }
+                robust_list_head$auto {
+                    list robust_list$auto
+                    futex_offset intptr
+                    list_op_pending ptr[inout, robust_list$auto]
+                }
+                syscall use_robust@1 -> int(arg ptr[inout, robust_list_head$auto])
+            "#,
+        )
+        .expect("self-referential struct pointers should parse");
+
+        match &descs[0].args[0] {
+            ArgType::Ptr { inner, .. } => match inner.as_ref() {
+                ArgType::Struct { fields, .. } => {
+                    match &fields[0] {
+                        ArgType::Struct { fields, .. } => {
+                            assert!(matches!(
+                                &fields[0],
+                                ArgType::Ptr {
+                                    inner,
+                                    dir: PtrDir::InOut,
+                                    optional: true
+                                } if matches!(inner.as_ref(), ArgType::Void)
+                            ));
+                        }
+                        other => panic!("unexpected robust_list field: {:?}", other),
+                    }
+                    assert!(matches!(
+                        &fields[2],
+                        ArgType::Ptr {
+                            inner,
+                            dir: PtrDir::InOut,
+                            optional: false
+                        } if matches!(inner.as_ref(), ArgType::Struct { .. })
+                    ));
+                }
+                other => panic!("unexpected robust_list_head type: {:?}", other),
+            },
+            other => panic!("unexpected robust syscall arg: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_indirect_recursive_struct_pointer_cycles_conservatively() {
+        let descs = parse_syscall_descs(
+            r#"
+                alpha {
+                    beta ptr64[inout, beta, opt]
+                } [packed]
+                beta {
+                    alpha ptr64[inout, alpha, opt]
+                } [packed]
+                syscall use_cycle@1 -> int(arg ptr[inout, alpha])
+            "#,
+        )
+        .expect("indirect recursive struct pointer cycles should parse");
+
+        match &descs[0].args[0] {
+            ArgType::Ptr { inner, .. } => match inner.as_ref() {
+                ArgType::Struct { fields, .. } => {
+                    assert!(matches!(
+                        &fields[0],
+                        ArgType::Ptr {
+                            inner,
+                            dir: PtrDir::InOut,
+                            optional: true,
+                        } if matches!(inner.as_ref(), ArgType::Void)
+                    ));
+                }
+                other => panic!("unexpected alpha type: {:?}", other),
+            },
+            other => panic!("unexpected cycle syscall arg: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_vma64_alias_forms() {
+        let descs = parse_syscall_descs(
+            r#"
+                syscall use_vma64@1 -> int(addr vma64, sized vma64[2:3], opt ptr[in, vma64[1:2]])
+            "#,
+        )
+        .expect("vma64 aliases should parse");
+
+        assert!(matches!(
+            descs[0].args[0],
+            ArgType::Vma {
+                min_pages: 1,
+                max_pages: 4,
+                optional: false
+            }
+        ));
+        assert!(matches!(
+            descs[0].args[1],
+            ArgType::Vma {
+                min_pages: 2,
+                max_pages: 3,
+                optional: false
+            }
+        ));
+        assert!(matches!(
+            descs[0].args[2],
+            ArgType::Ptr { ref inner, .. }
+                if matches!(inner.as_ref(), ArgType::Vma { min_pages: 1, max_pages: 2, .. })
+        ));
     }
 }

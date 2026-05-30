@@ -13,12 +13,23 @@ pub enum ArgType {
     /// Integer constant or flags.
     Const {
         size: usize,      // 1, 2, 4, or 8 bytes
-        values: Vec<u64>, // possible values (empty = any)
+        values: Vec<u64>, // possible values (empty = ranged, unconstrained, or unavailable)
         range: Option<(u64, u64)>,
+        endian: ScalarEndian,
+        allow_any: bool,
+        bitfield_bits: Option<u8>,
+    },
+    /// Per-process scalar value with a process-relative subrange.
+    Proc {
+        size: usize,
+        values_start: u64,
+        values_per_proc: u64,
         endian: ScalarEndian,
     },
     /// Resource handle passed between calls.
     Resource(ResourceDesc),
+    /// Resource handle that may legally fall back to its default/null value.
+    OptionalResource(ResourceDesc),
     /// Array of a supported inner type, optionally ranged.
     Array {
         inner: Box<ArgType>,
@@ -42,6 +53,7 @@ pub enum ArgType {
         varlen: bool,
         packed: bool,
         align: Option<usize>,
+        overlay_start: Option<usize>,
     },
     /// Union layout serialized into bytes. Fixed unions use `size`, varlen unions
     /// materialize one field-sized payload without padding.
@@ -65,6 +77,9 @@ pub enum ArgType {
         target: LengthTarget,
         size: usize,
         kind: LengthKind,
+        endian: ScalarEndian,
+        scale: usize,
+        bitfield_bits: Option<u8>,
     },
     /// Raw data buffer.
     Buffer {
@@ -111,6 +126,8 @@ pub enum LengthKind {
     Offset,
 }
 
+pub const PROC_DEFAULT_VALUE: u64 = u64::MAX;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LengthTarget {
     pub root: LengthTargetRoot,
@@ -130,6 +147,16 @@ pub struct SyscallAttrs {
     pub automatic_helper: bool,
     pub no_generate: bool,
     pub disabled: bool,
+    pub ignore_return: bool,
+    pub breaks_returns: bool,
+    pub no_minimize: bool,
+    pub no_squash: bool,
+    pub remote_cover: bool,
+    pub snapshot: bool,
+    pub kfuzz_test: bool,
+    pub timeout_ms: Option<u64>,
+    pub prog_timeout_ms: Option<u64>,
+    pub fsck_command: Option<String>,
 }
 
 /// Syscall descriptor.
@@ -184,6 +211,12 @@ pub struct InlinePointerValue {
     pub value: Box<ArgValue>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InlineStructLayout {
+    pub base_offset: usize,
+    pub field_ranges: Vec<(usize, usize)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceSource {
     ReturnValue,
@@ -191,6 +224,7 @@ pub enum ResourceSource {
         arg_idx: usize,
         element_idx: usize,
         offset: usize,
+        pointer_chain: Vec<usize>,
     },
 }
 
@@ -209,11 +243,13 @@ pub enum ArgValue {
     Composite {
         data: Vec<u8>,
         pointers: Vec<InlinePointerValue>,
+        struct_layouts: Vec<InlineStructLayout>,
     },
     Array {
         data: Vec<u8>,
         pointers: Vec<InlinePointerValue>,
         element_sizes: Vec<usize>,
+        struct_layouts: Vec<InlineStructLayout>,
     },
     Filename(String),
     Vma {
@@ -397,10 +433,66 @@ pub fn timeout_prone_edge_key(
     Some(format!("{}->{}", src.name, dst.name))
 }
 
+#[derive(Clone, Copy)]
+struct BitfieldSpec {
+    unit_size: usize,
+    endian: ScalarEndian,
+    bit_len: u8,
+}
+
+fn arg_type_bitfield_spec(arg_type: &ArgType) -> Option<BitfieldSpec> {
+    match arg_type {
+        ArgType::Const {
+            size,
+            endian,
+            bitfield_bits: Some(bit_len),
+            ..
+        }
+        | ArgType::Len {
+            size,
+            endian,
+            bitfield_bits: Some(bit_len),
+            ..
+        } => Some(BitfieldSpec {
+            unit_size: *size,
+            endian: *endian,
+            bit_len: *bit_len,
+        }),
+        _ => None,
+    }
+}
+
+pub(crate) fn scale_length_value(value: usize, scale: usize) -> usize {
+    if scale <= 1 {
+        value
+    } else {
+        value / scale
+    }
+}
+
+fn inferred_string_storage_len(
+    values: &[Vec<u8>],
+    noz: bool,
+    fixed_len: Option<usize>,
+) -> Option<usize> {
+    if let Some(fixed_len) = fixed_len {
+        return Some(fixed_len);
+    }
+    let mut iter = values.iter();
+    let first = iter.next()?;
+    let encoded_len = first.len().checked_add(usize::from(!noz))?;
+    if iter.all(|value| value.len().checked_add(usize::from(!noz)) == Some(encoded_len)) {
+        Some(encoded_len)
+    } else {
+        None
+    }
+}
+
 pub fn arg_type_fixed_size(arg_type: &ArgType) -> Option<usize> {
     match arg_type {
         ArgType::Const { size, .. } => Some(*size),
-        ArgType::Resource(resource) => Some(resource.size),
+        ArgType::Proc { size, .. } => Some(*size),
+        ArgType::Resource(resource) | ArgType::OptionalResource(resource) => Some(resource.size),
         ArgType::Array {
             inner,
             min_len,
@@ -413,9 +505,11 @@ pub fn arg_type_fixed_size(arg_type: &ArgType) -> Option<usize> {
         ArgType::Vma { .. } => Some(8),
         ArgType::Len { size, .. } => Some(*size),
         ArgType::String {
-            fixed_len: Some(fixed_len),
+            values,
+            noz,
+            fixed_len,
             ..
-        } => Some(*fixed_len),
+        } => inferred_string_storage_len(values, *noz, *fixed_len),
         ArgType::Buffer {
             min_size, max_size, ..
         } if min_size == max_size => Some(*max_size),
@@ -426,7 +520,8 @@ pub fn arg_type_fixed_size(arg_type: &ArgType) -> Option<usize> {
 pub fn arg_type_alignment(arg_type: &ArgType) -> Option<usize> {
     match arg_type {
         ArgType::Const { size, .. } => Some(*size),
-        ArgType::Resource(resource) => Some(resource.size),
+        ArgType::Proc { size, .. } => Some(*size),
+        ArgType::Resource(resource) | ArgType::OptionalResource(resource) => Some(resource.size),
         ArgType::Array { inner, .. } => arg_type_alignment(inner),
         ArgType::Ptr { .. } => Some(8),
         ArgType::Void => Some(1),
@@ -602,8 +697,11 @@ pub(crate) struct LengthTargetFrame<'a> {
     pub is_union: bool,
     pub varlen: bool,
     pub packed: bool,
+    pub align: Option<usize>,
+    pub overlay_start: Option<usize>,
     pub data: Option<&'a [u8]>,
     pub pointers: Option<&'a [InlinePointerValue]>,
+    pub struct_layouts: Option<&'a [InlineStructLayout]>,
     pub base_offset: usize,
 }
 
@@ -676,6 +774,11 @@ fn derive_inline_target_offset(
                 frame.is_union,
                 frame.varlen,
                 frame.packed,
+                frame.align,
+                frame.overlay_start,
+                frame.struct_layouts,
+                frame.base_offset,
+                frame.size,
                 &target.fields,
             )
         }
@@ -701,29 +804,54 @@ fn resolve_target_from_args<'a>(
             null_pointer: false,
         });
     }
-    let (root_type, root_data, root_pointers) = match (arg_type, arg_value) {
+    let (root_type, root_data, root_pointers, root_struct_layouts) = match (arg_type, arg_value) {
         (ArgType::Ptr { inner, .. }, ArgValue::Buffer(data)) => {
-            (inner.as_ref(), Some(data.as_slice()), None)
+            (inner.as_ref(), Some(data.as_slice()), None, None)
         }
-        (ArgType::Ptr { inner, .. }, ArgValue::Composite { data, pointers }) => (
+        (
+            ArgType::Ptr { inner, .. },
+            ArgValue::Composite {
+                data,
+                pointers,
+                struct_layouts,
+            },
+        ) => (
             inner.as_ref(),
             Some(data.as_slice()),
             Some(pointers.as_slice()),
+            Some(struct_layouts.as_slice()),
         ),
-        (ArgType::Ptr { inner, .. }, ArgValue::Array { data, pointers, .. }) => (
+        (
+            ArgType::Ptr { inner, .. },
+            ArgValue::Array {
+                data,
+                pointers,
+                struct_layouts,
+                ..
+            },
+        ) => (
             inner.as_ref(),
             Some(data.as_slice()),
             Some(pointers.as_slice()),
+            Some(struct_layouts.as_slice()),
         ),
-        (ArgType::Ptr { inner, .. }, ArgValue::OutPtr) => (inner.as_ref(), None, None),
+        (ArgType::Ptr { inner, .. }, ArgValue::OutPtr) => (inner.as_ref(), None, None, None),
         (ArgType::Ptr { .. }, ArgValue::Null) => return None,
         _ => (
             arg_type,
             arg_value_bytes(arg_value),
             arg_value_pointers(arg_value),
+            arg_value_struct_layouts(arg_value),
         ),
     };
-    resolve_path_value(root_type, root_data, root_pointers, 0, &target.fields)
+    resolve_path_value(
+        root_type,
+        root_data,
+        root_pointers,
+        root_struct_layouts,
+        0,
+        &target.fields,
+    )
 }
 
 fn resolve_inline_target<'a>(
@@ -742,8 +870,11 @@ fn resolve_inline_target<'a>(
                 frame.is_union,
                 frame.varlen,
                 frame.packed,
+                frame.align,
+                frame.overlay_start,
                 frame.data,
                 frame.pointers,
+                frame.struct_layouts,
                 frame.base_offset,
                 &target.fields,
             )
@@ -779,8 +910,11 @@ fn resolve_path_in_container<'a>(
     is_union: bool,
     varlen: bool,
     packed: bool,
+    align: Option<usize>,
+    overlay_start: Option<usize>,
     data: Option<&'a [u8]>,
     pointers: Option<&'a [InlinePointerValue]>,
+    struct_layouts: Option<&'a [InlineStructLayout]>,
     base_offset: usize,
     path: &[String],
 ) -> Option<ResolvedLengthValue<'a>> {
@@ -788,18 +922,41 @@ fn resolve_path_in_container<'a>(
     let field = fields.get(field_idx)?;
     let field_offset = if is_union {
         0
+    } else if let Some(field_ranges) =
+        lookup_inline_struct_layout(struct_layouts, base_offset, fields.len())
+    {
+        field_ranges
+            .get(field_idx)
+            .copied()
+            .map(|(start, _)| start.checked_sub(base_offset))??
+    } else if let Some(data) = data {
+        compute_struct_field_ranges(fields, varlen, packed, align, overlay_start, data.len())?
+            .get(field_idx)
+            .copied()
+            .map(|(start, _)| start)?
     } else {
-        compute_struct_field_offset(fields, field_idx, varlen, packed)?
+        compute_struct_field_offset(fields, field_idx, varlen, packed, overlay_start)?
     };
     let field_data = if is_union {
         slice_union_field_data(field, data)?
     } else {
-        slice_struct_field_data(fields, field_idx, varlen, packed, data)?
+        slice_struct_field_data(
+            fields,
+            field_idx,
+            varlen,
+            packed,
+            align,
+            overlay_start,
+            data,
+            struct_layouts,
+            base_offset,
+        )?
     };
     resolve_path_value(
         field,
         field_data,
         pointers,
+        struct_layouts,
         base_offset + field_offset,
         &path[1..],
     )
@@ -809,6 +966,7 @@ fn resolve_path_value<'a>(
     arg_type: &'a ArgType,
     data: Option<&'a [u8]>,
     pointers: Option<&'a [InlinePointerValue]>,
+    struct_layouts: Option<&'a [InlineStructLayout]>,
     base_offset: usize,
     path: &[String],
 ) -> Option<ResolvedLengthValue<'a>> {
@@ -832,19 +990,30 @@ fn resolve_path_value<'a>(
         let pointer_value = pointer_value?;
         return match pointer_value {
             ArgValue::Buffer(data) => {
-                resolve_path_value(inner, Some(data.as_slice()), None, 0, path)
+                resolve_path_value(inner, Some(data.as_slice()), None, None, 0, path)
             }
-            ArgValue::Composite { data, pointers } => resolve_path_value(
+            ArgValue::Composite {
+                data,
+                pointers,
+                struct_layouts,
+            } => resolve_path_value(
                 inner,
                 Some(data.as_slice()),
                 Some(pointers.as_slice()),
+                Some(struct_layouts.as_slice()),
                 0,
                 path,
             ),
-            ArgValue::Array { data, pointers, .. } => resolve_path_value(
+            ArgValue::Array {
+                data,
+                pointers,
+                struct_layouts,
+                ..
+            } => resolve_path_value(
                 inner,
                 Some(data.as_slice()),
                 Some(pointers.as_slice()),
+                Some(struct_layouts.as_slice()),
                 0,
                 path,
             ),
@@ -865,16 +1034,49 @@ fn resolve_path_value<'a>(
             field_names,
             varlen,
             packed,
+            align,
+            overlay_start,
             ..
         } => {
             let field_idx = find_field_index(field_names, &path[0])?;
             let field = fields.get(field_idx)?;
-            let field_data = slice_struct_field_data(fields, field_idx, *varlen, *packed, data)?;
-            let field_offset = compute_struct_field_offset(fields, field_idx, *varlen, *packed)?;
+            let field_data = slice_struct_field_data(
+                fields,
+                field_idx,
+                *varlen,
+                *packed,
+                *align,
+                *overlay_start,
+                data,
+                struct_layouts,
+                base_offset,
+            )?;
+            let field_offset = if let Some(field_ranges) =
+                lookup_inline_struct_layout(struct_layouts, base_offset, fields.len())
+            {
+                field_ranges
+                    .get(field_idx)
+                    .copied()
+                    .map(|(start, _)| start.checked_sub(base_offset))??
+            } else {
+                data.and_then(|data| {
+                    compute_struct_field_ranges(
+                        fields,
+                        *varlen,
+                        *packed,
+                        *align,
+                        *overlay_start,
+                        data.len(),
+                    )
+                    .and_then(|ranges| ranges.get(field_idx).copied())
+                    .map(|(start, _)| start)
+                })?
+            };
             resolve_path_value(
                 field,
                 field_data,
                 pointers,
+                struct_layouts,
                 base_offset + field_offset,
                 &path[1..],
             )
@@ -887,7 +1089,14 @@ fn resolve_path_value<'a>(
             let field_idx = find_field_index(field_names, &path[0])?;
             let field = fields.get(field_idx)?;
             let field_data = slice_union_field_data(field, data)?;
-            resolve_path_value(field, field_data, pointers, base_offset, &path[1..])
+            resolve_path_value(
+                field,
+                field_data,
+                pointers,
+                struct_layouts,
+                base_offset,
+                &path[1..],
+            )
         }
         _ => None,
     }
@@ -914,11 +1123,12 @@ fn compute_path_offset(arg_type: &ArgType, path: &[String]) -> Option<usize> {
             field_names,
             varlen,
             packed,
+            overlay_start,
             ..
         } => {
             let field_idx = find_field_index(field_names, &path[0])?;
             Some(
-                compute_struct_field_offset(fields, field_idx, *varlen, *packed)?
+                compute_struct_field_offset(fields, field_idx, *varlen, *packed, *overlay_start)?
                     + compute_path_offset(fields.get(field_idx)?, &path[1..])?,
             )
         }
@@ -940,13 +1150,28 @@ fn compute_path_offset_in_container(
     is_union: bool,
     varlen: bool,
     packed: bool,
+    align: Option<usize>,
+    overlay_start: Option<usize>,
+    struct_layouts: Option<&[InlineStructLayout]>,
+    base_offset: usize,
+    size: usize,
     path: &[String],
 ) -> Option<usize> {
     let field_idx = find_field_index(field_names, &path[0])?;
     let field_offset = if is_union {
         0
+    } else if let Some(field_ranges) =
+        lookup_inline_struct_layout(struct_layouts, base_offset, fields.len())
+    {
+        field_ranges
+            .get(field_idx)
+            .copied()
+            .map(|(start, _)| start.checked_sub(base_offset))??
     } else {
-        compute_struct_field_offset(fields, field_idx, varlen, packed)?
+        compute_struct_field_ranges(fields, varlen, packed, align, overlay_start, size)?
+            .get(field_idx)
+            .copied()
+            .map(|(start, _)| start)?
     };
     Some(field_offset + compute_path_offset(fields.get(field_idx)?, &path[1..])?)
 }
@@ -1028,6 +1253,27 @@ fn arg_value_pointers(arg_value: &ArgValue) -> Option<&[InlinePointerValue]> {
     }
 }
 
+fn arg_value_struct_layouts(arg_value: &ArgValue) -> Option<&[InlineStructLayout]> {
+    match arg_value {
+        ArgValue::Composite { struct_layouts, .. } => Some(struct_layouts.as_slice()),
+        ArgValue::Array { struct_layouts, .. } => Some(struct_layouts.as_slice()),
+        _ => None,
+    }
+}
+
+pub(crate) fn lookup_inline_struct_layout<'a>(
+    struct_layouts: Option<&'a [InlineStructLayout]>,
+    base_offset: usize,
+    field_count: usize,
+) -> Option<&'a [(usize, usize)]> {
+    struct_layouts?
+        .iter()
+        .find(|layout| {
+            layout.base_offset == base_offset && layout.field_ranges.len() == field_count
+        })
+        .map(|layout| layout.field_ranges.as_slice())
+}
+
 fn arg_type_type_name(arg_type: &ArgType) -> Option<&str> {
     match arg_type {
         ArgType::Struct { type_name, .. } | ArgType::Union { type_name, .. } => {
@@ -1041,25 +1287,284 @@ fn find_field_index(field_names: &[String], name: &str) -> Option<usize> {
     field_names.iter().position(|field_name| field_name == name)
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BitfieldFieldInfo {
+    pub(crate) unit_size: usize,
+    pub(crate) endian: ScalarEndian,
+    pub(crate) bit_len: u8,
+    pub(crate) bit_offset: usize,
+    pub(crate) is_last_in_group: bool,
+}
+
+pub(crate) fn standalone_bitfield_field_info(
+    size: usize,
+    endian: ScalarEndian,
+    bit_len: u8,
+) -> Option<BitfieldFieldInfo> {
+    if bit_len == 0 || usize::from(bit_len) > size.checked_mul(8)? {
+        return None;
+    }
+    Some(BitfieldFieldInfo {
+        unit_size: size,
+        endian,
+        bit_len,
+        bit_offset: 0,
+        is_last_in_group: true,
+    })
+}
+
+pub(crate) fn encode_bitfield_storage_value(
+    storage: &mut [u8],
+    info: BitfieldFieldInfo,
+    value: u64,
+) -> Option<()> {
+    if storage.len() != info.unit_size {
+        return None;
+    }
+    let unit_bits = info.unit_size.checked_mul(8)?;
+    let bit_len = usize::from(info.bit_len);
+    if bit_len == 0 || info.bit_offset.checked_add(bit_len)? > unit_bits {
+        return None;
+    }
+
+    let field_mask = if bit_len >= 64 {
+        u128::from(u64::MAX)
+    } else {
+        (1u128 << bit_len) - 1
+    };
+    let shift = match info.endian {
+        ScalarEndian::Native => info.bit_offset,
+        ScalarEndian::Big => unit_bits.checked_sub(info.bit_offset.checked_add(bit_len)?)?,
+    };
+    let storage_mask = field_mask.checked_shl(shift as u32)?;
+    let current = u128::from(decode_scalar_bytes_endian(storage, info.endian));
+    let next = (current & !storage_mask) | ((u128::from(value) & field_mask) << shift);
+    let encoded = encode_scalar_bytes_endian(info.unit_size, next as u64, info.endian);
+    storage.copy_from_slice(&encoded);
+    Some(())
+}
+
+pub(crate) fn compute_bitfield_field_info(
+    fields: &[ArgType],
+) -> Option<Vec<Option<BitfieldFieldInfo>>> {
+    let mut infos = vec![None; fields.len()];
+    let mut group_start_idx = None;
+    let mut group_unit_size = 0usize;
+    let mut group_endian = ScalarEndian::Native;
+    let mut group_bits_used = 0usize;
+    let mut last_idx = None;
+
+    let finalize_group = |infos: &mut [Option<BitfieldFieldInfo>], last_idx: Option<usize>| {
+        if let Some(last_idx) = last_idx {
+            if let Some(info) = infos.get_mut(last_idx).and_then(Option::as_mut) {
+                info.is_last_in_group = true;
+            }
+        }
+    };
+
+    for (idx, field) in fields.iter().enumerate() {
+        let Some(spec) = arg_type_bitfield_spec(field) else {
+            finalize_group(&mut infos, last_idx);
+            group_start_idx = None;
+            group_unit_size = 0;
+            group_bits_used = 0;
+            continue;
+        };
+        let unit_bits = spec.unit_size.checked_mul(8)?;
+        if usize::from(spec.bit_len) > unit_bits {
+            return None;
+        }
+        let compatible = group_start_idx.is_some()
+            && group_unit_size == spec.unit_size
+            && group_endian == spec.endian
+            && group_bits_used.checked_add(usize::from(spec.bit_len))? <= unit_bits;
+        if !compatible {
+            finalize_group(&mut infos, last_idx);
+            group_start_idx = Some(idx);
+            group_unit_size = spec.unit_size;
+            group_endian = spec.endian;
+            group_bits_used = 0;
+        }
+        infos[idx] = Some(BitfieldFieldInfo {
+            unit_size: spec.unit_size,
+            endian: spec.endian,
+            bit_len: spec.bit_len,
+            bit_offset: group_bits_used,
+            is_last_in_group: false,
+        });
+        group_bits_used = group_bits_used.checked_add(usize::from(spec.bit_len))?;
+        last_idx = Some(idx);
+    }
+    finalize_group(&mut infos, last_idx);
+    Some(infos)
+}
+
+fn effective_field_fixed_size(
+    field: &ArgType,
+    bitfield_info: Option<BitfieldFieldInfo>,
+) -> Option<usize> {
+    match bitfield_info {
+        Some(info) => Some(if info.is_last_in_group {
+            info.unit_size
+        } else {
+            0
+        }),
+        None => arg_type_fixed_size(field),
+    }
+}
+
+fn effective_field_alignment(
+    field: &ArgType,
+    packed: bool,
+    bitfield_info: Option<BitfieldFieldInfo>,
+) -> Option<usize> {
+    if packed {
+        return Some(1);
+    }
+    match bitfield_info {
+        Some(info) => Some(info.unit_size),
+        None => arg_type_alignment(field),
+    }
+}
+
+pub(crate) fn compute_struct_field_ranges(
+    fields: &[ArgType],
+    varlen: bool,
+    packed: bool,
+    align: Option<usize>,
+    overlay_start: Option<usize>,
+    total_size: usize,
+) -> Option<Vec<(usize, usize)>> {
+    let bitfield_info = compute_bitfield_field_info(fields)?;
+    if let Some(overlay_start) = overlay_start {
+        if varlen {
+            return None;
+        }
+        let mut ranges = Vec::with_capacity(fields.len());
+        for (idx, field) in fields.iter().enumerate() {
+            let start =
+                compute_struct_field_offset(fields, idx, false, packed, Some(overlay_start))?;
+            let size = effective_field_fixed_size(field, bitfield_info[idx])?;
+            let end = start.checked_add(size)?;
+            ranges.push((start, end));
+        }
+        return Some(ranges);
+    }
+    if !varlen {
+        let mut ranges = Vec::with_capacity(fields.len());
+        for (idx, field) in fields.iter().enumerate() {
+            let start = compute_struct_field_offset(fields, idx, false, packed, None)?;
+            let size = effective_field_fixed_size(field, bitfield_info[idx])?;
+            let end = start.checked_add(size)?;
+            ranges.push((start, end));
+        }
+        return Some(ranges);
+    }
+
+    if packed {
+        let var_indices = fields
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, field)| arg_type_fixed_size(field).is_none().then_some(idx))
+            .collect::<Vec<_>>();
+        let var_idx = match var_indices.as_slice() {
+            [var_idx] => *var_idx,
+            _ => return None,
+        };
+
+        let mut ranges = Vec::with_capacity(fields.len());
+        let mut offset = 0usize;
+        for (field, info) in fields[..var_idx]
+            .iter()
+            .zip(bitfield_info[..var_idx].iter().copied())
+        {
+            let size = effective_field_fixed_size(field, info)?;
+            let end = offset.checked_add(size)?;
+            ranges.push((offset, end));
+            offset = end;
+        }
+
+        let suffix_size = fields[var_idx + 1..]
+            .iter()
+            .zip(bitfield_info[var_idx + 1..].iter().copied())
+            .try_fold(0usize, |acc, field| {
+                let (field, info) = field;
+                let size = effective_field_fixed_size(field, info)?;
+                acc.checked_add(size)
+            })?;
+        let struct_align = struct_type_alignment(fields, true, align).ok()?;
+        let var_size = infer_packed_var_field_size(
+            &fields[var_idx],
+            offset,
+            suffix_size,
+            total_size,
+            struct_align,
+        )?;
+        let var_end = offset.checked_add(var_size)?;
+        if var_end > total_size {
+            return None;
+        }
+        ranges.push((offset, var_end));
+        offset = var_end;
+
+        for (field, info) in fields[var_idx + 1..]
+            .iter()
+            .zip(bitfield_info[var_idx + 1..].iter().copied())
+        {
+            let size = effective_field_fixed_size(field, info)?;
+            let end = offset.checked_add(size)?;
+            ranges.push((offset, end));
+            offset = end;
+        }
+        if align_up(offset, struct_align)? != total_size {
+            return None;
+        }
+        return Some(ranges);
+    }
+
+    let mut ranges = Vec::with_capacity(fields.len());
+    for (idx, field) in fields.iter().enumerate() {
+        let start = compute_struct_field_offset(fields, idx, true, false, None)?;
+        let end = match effective_field_fixed_size(field, bitfield_info[idx]) {
+            Some(size) => start.checked_add(size)?,
+            None if idx + 1 == fields.len() => total_size,
+            None => return None,
+        };
+        if end < start {
+            return None;
+        }
+        ranges.push((start, end));
+    }
+    Some(ranges)
+}
+
 fn slice_struct_field_data<'a>(
     fields: &[ArgType],
     field_idx: usize,
     varlen: bool,
     packed: bool,
+    align: Option<usize>,
+    overlay_start: Option<usize>,
     data: Option<&'a [u8]>,
+    struct_layouts: Option<&'a [InlineStructLayout]>,
+    base_offset: usize,
 ) -> Option<Option<&'a [u8]>> {
     let data = match data {
         Some(data) => data,
         None => return Some(None),
     };
-    let field = fields.get(field_idx)?;
-    let start = compute_struct_field_offset(fields, field_idx, varlen, packed)?;
-    let field_size = match arg_type_fixed_size(field) {
-        Some(field_size) => field_size,
-        None if varlen && field_idx + 1 == fields.len() => data.len().checked_sub(start)?,
-        None => return None,
+    let (start, end) = if let Some(field_ranges) =
+        lookup_inline_struct_layout(struct_layouts, base_offset, fields.len())
+    {
+        let (start, end) = *field_ranges.get(field_idx)?;
+        (
+            start.checked_sub(base_offset)?,
+            end.checked_sub(base_offset)?,
+        )
+    } else {
+        *compute_struct_field_ranges(fields, varlen, packed, align, overlay_start, data.len())?
+            .get(field_idx)?
     };
-    let end = start.checked_add(field_size)?;
     Some(Some(data.get(start..end)?))
 }
 
@@ -1068,19 +1573,20 @@ pub(crate) fn compute_struct_field_offset(
     field_idx: usize,
     varlen: bool,
     packed: bool,
+    overlay_start: Option<usize>,
 ) -> Option<usize> {
+    let bitfield_info = compute_bitfield_field_info(fields)?;
     let mut offset = 0usize;
     for (idx, field) in fields.iter().enumerate() {
-        let field_align = if packed {
-            1
-        } else {
-            arg_type_alignment(field)?
-        };
+        if overlay_start == Some(idx) {
+            offset = 0;
+        }
+        let field_align = effective_field_alignment(field, packed, bitfield_info[idx])?;
         offset = align_up(offset, field_align)?;
         if idx == field_idx {
             return Some(offset);
         }
-        match arg_type_fixed_size(field) {
+        match effective_field_fixed_size(field, bitfield_info[idx]) {
             Some(field_size) => {
                 offset = offset.checked_add(field_size)?;
             }
@@ -1089,6 +1595,168 @@ pub(crate) fn compute_struct_field_offset(
         }
     }
     None
+}
+
+fn packed_struct_var_field_index(fields: &[ArgType]) -> Option<usize> {
+    let var_indices = fields
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, field)| arg_type_fixed_size(field).is_none().then_some(idx))
+        .collect::<Vec<_>>();
+    match var_indices.as_slice() {
+        [idx] => Some(*idx),
+        _ => None,
+    }
+}
+
+fn infer_packed_var_field_size(
+    field: &ArgType,
+    prefix_size: usize,
+    suffix_size: usize,
+    total_size: usize,
+    struct_align: usize,
+) -> Option<usize> {
+    let max_padding = struct_align.saturating_sub(1);
+    for tail_padding in (0..=max_padding).rev() {
+        let logical_size = total_size.checked_sub(tail_padding)?;
+        if align_up(logical_size, struct_align)? != total_size {
+            continue;
+        }
+        let Some(prefix_and_suffix) = prefix_size.checked_add(suffix_size) else {
+            return None;
+        };
+        let Some(var_size) = logical_size.checked_sub(prefix_and_suffix) else {
+            continue;
+        };
+        if arg_type_accepts_inline_size(field, var_size) {
+            return Some(var_size);
+        }
+    }
+    None
+}
+
+fn arg_type_accepts_inline_size(arg_type: &ArgType, size: usize) -> bool {
+    let mut seen = HashSet::new();
+    arg_type_accepts_inline_size_inner(arg_type, size, &mut seen)
+}
+
+fn arg_type_accepts_inline_size_inner(
+    arg_type: &ArgType,
+    size: usize,
+    seen: &mut HashSet<usize>,
+) -> bool {
+    let key = arg_type as *const ArgType as usize;
+    if !seen.insert(key) {
+        return false;
+    }
+    let accepted = match arg_type {
+        _ if arg_type_fixed_size(arg_type).is_some() => arg_type_fixed_size(arg_type) == Some(size),
+        ArgType::Buffer {
+            min_size, max_size, ..
+        } => size >= *min_size && size <= *max_size,
+        ArgType::String { noz, fixed_len, .. } => match fixed_len {
+            Some(fixed_len) => size == *fixed_len,
+            None if *noz => true,
+            None => size >= 1,
+        },
+        ArgType::Filename => size >= 1,
+        ArgType::Array {
+            inner,
+            min_len,
+            max_len,
+        } => {
+            if let Some(elem_size) = arg_type_fixed_size(inner) {
+                elem_size == 0
+                    || (size % elem_size == 0 && {
+                        let count = size / elem_size;
+                        count >= *min_len && count <= *max_len
+                    })
+            } else if size == 0 {
+                *min_len == 0
+            } else if min_len == max_len && *min_len == 1 {
+                arg_type_accepts_inline_size_inner(inner, size, seen)
+            } else {
+                false
+            }
+        }
+        ArgType::Struct {
+            fields,
+            size: declared_size,
+            varlen,
+            packed,
+            align,
+            overlay_start,
+            ..
+        } => {
+            if let Ok((prefix_size, has_var_fields)) =
+                struct_layout_prefix_size(fields, *packed, *align, *overlay_start)
+            {
+                let struct_align = match struct_type_alignment(fields, *packed, *align) {
+                    Ok(struct_align) => struct_align,
+                    Err(_) => return false,
+                };
+                if !*varlen && !has_var_fields {
+                    *declared_size == size
+                } else if size < prefix_size || (struct_align > 1 && size % struct_align != 0) {
+                    false
+                } else if let Some(ranges) = compute_struct_field_ranges(
+                    fields,
+                    *varlen,
+                    *packed,
+                    *align,
+                    *overlay_start,
+                    size,
+                ) {
+                    fields
+                        .iter()
+                        .zip(ranges.iter())
+                        .all(|(field, (start, end))| {
+                            arg_type_accepts_inline_size_inner(
+                                field,
+                                end.saturating_sub(*start),
+                                seen,
+                            )
+                        })
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
+        ArgType::Union {
+            fields,
+            size: union_size,
+            varlen,
+            packed,
+            align,
+            ..
+        } => {
+            let union_align = match union_type_alignment(fields, *packed, *align) {
+                Ok(union_align) => union_align,
+                Err(_) => return false,
+            };
+            if *varlen {
+                if union_align > 1 && size % union_align != 0 {
+                    false
+                } else {
+                    fields
+                        .iter()
+                        .any(|field| arg_type_accepts_inline_size_inner(field, size, seen))
+                }
+            } else if *union_size != size {
+                false
+            } else {
+                fields.iter().any(|field| {
+                    arg_type_fixed_size(field).is_some_and(|field_size| field_size <= size)
+                        || arg_type_accepts_inline_size_inner(field, size, seen)
+                })
+            }
+        }
+        _ => false,
+    };
+    seen.remove(&key);
+    accepted
 }
 
 fn slice_union_field_data<'a>(field: &ArgType, data: Option<&'a [u8]>) -> Option<Option<&'a [u8]>> {
@@ -1114,9 +1782,23 @@ pub fn encode_scalar_bytes_endian(size: usize, value: u64, endian: ScalarEndian)
 }
 
 pub fn decode_scalar_bytes(data: &[u8]) -> u64 {
+    decode_scalar_bytes_endian(data, ScalarEndian::Native)
+}
+
+pub fn decode_scalar_bytes_endian(data: &[u8], endian: ScalarEndian) -> u64 {
     let mut bytes = [0u8; 8];
     let len = data.len().min(bytes.len());
-    bytes[..len].copy_from_slice(&data[..len]);
+    if endian == ScalarEndian::Big {
+        for (dst, src) in bytes[..len]
+            .iter_mut()
+            .rev()
+            .zip(data[..len].iter().copied())
+        {
+            *dst = src;
+        }
+    } else {
+        bytes[..len].copy_from_slice(&data[..len]);
+    }
     u64::from_le_bytes(bytes)
 }
 
@@ -1729,7 +2411,15 @@ fn collect_pointer_resource_outputs(
     outputs: &mut Vec<ResourceOutput>,
 ) {
     let mut next_element_idx = 0usize;
-    collect_pointer_resource_outputs_inner(arg_type, arg_idx, 0, &mut next_element_idx, outputs);
+    let mut pointer_chain = Vec::new();
+    collect_pointer_resource_outputs_inner(
+        arg_type,
+        arg_idx,
+        0,
+        &mut next_element_idx,
+        &mut pointer_chain,
+        outputs,
+    );
 }
 
 fn collect_pointer_resource_outputs_inner(
@@ -1737,16 +2427,18 @@ fn collect_pointer_resource_outputs_inner(
     arg_idx: usize,
     base_offset: usize,
     next_element_idx: &mut usize,
+    pointer_chain: &mut Vec<usize>,
     outputs: &mut Vec<ResourceOutput>,
 ) {
     match arg_type {
-        ArgType::Resource(resource) => {
+        ArgType::Resource(resource) | ArgType::OptionalResource(resource) => {
             outputs.push(ResourceOutput {
                 resource: resource.clone(),
                 source: ResourceSource::PointerElement {
                     arg_idx,
                     element_idx: *next_element_idx,
                     offset: base_offset,
+                    pointer_chain: pointer_chain.clone(),
                 },
             });
             *next_element_idx += 1;
@@ -1765,27 +2457,32 @@ fn collect_pointer_resource_outputs_inner(
                     arg_idx,
                     base_offset + (element_idx * element_size),
                     next_element_idx,
+                    pointer_chain,
                     outputs,
                 );
             }
         }
-        ArgType::Struct { fields, .. } => {
-            let mut field_offset = base_offset;
+        ArgType::Struct {
+            fields,
+            varlen,
+            packed,
+            overlay_start,
+            ..
+        } => {
             for (idx, field) in fields.iter().enumerate() {
+                let Some(field_offset) =
+                    compute_struct_field_offset(fields, idx, *varlen, *packed, *overlay_start)
+                else {
+                    return;
+                };
                 collect_pointer_resource_outputs_inner(
                     field,
                     arg_idx,
-                    field_offset,
+                    base_offset + field_offset,
                     next_element_idx,
+                    pointer_chain,
                     outputs,
                 );
-                let Some(field_size) = arg_type_fixed_size(field) else {
-                    if idx + 1 == fields.len() {
-                        return;
-                    }
-                    return;
-                };
-                field_offset += field_size;
             }
         }
         ArgType::Union { fields, .. } => {
@@ -1795,9 +2492,26 @@ fn collect_pointer_resource_outputs_inner(
                     arg_idx,
                     base_offset,
                     next_element_idx,
+                    pointer_chain,
                     outputs,
                 );
             }
+        }
+        ArgType::Ptr {
+            inner,
+            dir: PtrDir::Out | PtrDir::InOut,
+            ..
+        } => {
+            pointer_chain.push(base_offset);
+            collect_pointer_resource_outputs_inner(
+                inner,
+                arg_idx,
+                0,
+                next_element_idx,
+                pointer_chain,
+                outputs,
+            );
+            pointer_chain.pop();
         }
         _ => {}
     }
@@ -1814,6 +2528,7 @@ fn collect_input_resources(
                 resources.push(resource.clone());
             }
         }
+        ArgType::OptionalResource(_) => {}
         ArgType::Array { inner, .. } => collect_input_resources(inner, seen, resources),
         ArgType::Struct { fields, .. } => {
             for field in fields {
@@ -1837,6 +2552,7 @@ fn collect_input_resources(
 fn arg_type_contains_resource_input(arg_type: &ArgType) -> bool {
     match arg_type {
         ArgType::Resource(_) => true,
+        ArgType::OptionalResource(_) => false,
         ArgType::Array { inner, .. } => arg_type_contains_resource_input(inner),
         ArgType::Struct { fields, .. } => fields.iter().any(arg_type_contains_resource_input),
         ArgType::Union { fields, .. } => fields.iter().any(arg_type_contains_resource_input),
@@ -1845,6 +2561,85 @@ fn arg_type_contains_resource_input(arg_type: &ArgType) -> bool {
         }
         _ => false,
     }
+}
+
+fn const_has_no_valid_values(values: &[u64], range: Option<(u64, u64)>, allow_any: bool) -> bool {
+    values.is_empty() && range.is_none() && !allow_any
+}
+
+fn proc_has_no_valid_values(values_per_proc: u64) -> bool {
+    values_per_proc == 0
+}
+
+pub(crate) fn arg_type_generation_limitation(arg_type: &ArgType) -> Option<String> {
+    match arg_type {
+        ArgType::Array { inner, .. } | ArgType::Ptr { inner, .. } => {
+            arg_type_generation_limitation(inner)
+        }
+        ArgType::Const {
+            values,
+            range,
+            allow_any,
+            bitfield_bits: _,
+            ..
+        } => {
+            if const_has_no_valid_values(values, *range, *allow_any) {
+                Some("contains a constant with no valid values on this target".to_string())
+            } else {
+                None
+            }
+        }
+        ArgType::Proc {
+            values_per_proc, ..
+        } => {
+            if proc_has_no_valid_values(*values_per_proc) {
+                Some(
+                    "contains a per-process scalar with no valid values on this target".to_string(),
+                )
+            } else {
+                None
+            }
+        }
+        ArgType::Struct {
+            fields,
+            varlen: _,
+            packed: _,
+            align: _,
+            overlay_start,
+            ..
+        } => {
+            if overlay_start.is_some() {
+                return Some("contains out_overlay struct fields".to_string());
+            }
+            for field in fields {
+                if let Some(reason) = arg_type_generation_limitation(field) {
+                    return Some(reason);
+                }
+            }
+            None
+        }
+        ArgType::Union { fields, .. } => {
+            let mut first_reason = None;
+            for field in fields {
+                match arg_type_generation_limitation(field) {
+                    None => return None,
+                    Some(reason) if first_reason.is_none() => first_reason = Some(reason),
+                    Some(_) => {}
+                }
+            }
+            first_reason
+        }
+        _ => None,
+    }
+}
+
+fn syscall_generation_limitation(desc: &SyscallDesc) -> Option<String> {
+    for arg in &desc.args {
+        if let Some(reason) = arg_type_generation_limitation(arg) {
+            return Some(reason);
+        }
+    }
+    None
 }
 
 fn disabled_syscall_reason(
@@ -1894,6 +2689,19 @@ fn syscall_unavailable_reason(desc: &SyscallDesc, generatable_only: bool) -> Opt
         Some("marked disabled".to_string())
     } else if generatable_only && desc.attrs.no_generate {
         Some("marked no_generate".to_string())
+    } else if generatable_only && desc.attrs.fsck_command.is_some() {
+        Some("requires fsck helper support".to_string())
+    } else if generatable_only && desc.attrs.snapshot {
+        Some("requires snapshot-mode support".to_string())
+    } else if generatable_only && desc.attrs.no_squash {
+        Some("requires no_squash executor support".to_string())
+    } else if generatable_only && desc.attrs.remote_cover {
+        Some("requires remote coverage support".to_string())
+    } else if generatable_only && desc.attrs.kfuzz_test {
+        Some("requires kfuzz_test support".to_string())
+    } else if generatable_only {
+        syscall_generation_limitation(desc)
+            .map(|reason| format!("{reason}, which generation does not support yet"))
     } else {
         None
     }
@@ -1903,10 +2711,36 @@ fn resources_overlap(expected: &ResourceDesc, actual: &ResourceDesc) -> bool {
     expected.accepts(actual) || actual.accepts(expected)
 }
 
+fn validate_bitfield_spec(
+    size: usize,
+    bitfield_bits: Option<u8>,
+    label: &str,
+) -> Result<(), String> {
+    if let Some(bits) = bitfield_bits {
+        if bits == 0 || usize::from(bits) > size * 8 {
+            return Err(format!(
+                "{label} bitfield width {} exceeds {}-byte storage",
+                bits, size
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_arg_type(arg_type: &ArgType) -> Result<(), String> {
     match arg_type {
-        ArgType::Const { size, .. } => validate_native_size(*size, "const argument"),
-        ArgType::Resource(resource) => validate_resource_desc(resource),
+        ArgType::Const {
+            size,
+            bitfield_bits,
+            ..
+        } => {
+            validate_native_size(*size, "const argument")?;
+            validate_bitfield_spec(*size, *bitfield_bits, "const argument")
+        }
+        ArgType::Proc { size, .. } => validate_native_size(*size, "proc argument"),
+        ArgType::Resource(resource) | ArgType::OptionalResource(resource) => {
+            validate_resource_desc(resource)
+        }
         ArgType::Array {
             inner,
             min_len,
@@ -1925,6 +2759,7 @@ fn validate_arg_type(arg_type: &ArgType) -> Result<(), String> {
             varlen,
             packed,
             align,
+            overlay_start,
             ..
         } => {
             if fields.is_empty() {
@@ -1934,7 +2769,8 @@ fn validate_arg_type(arg_type: &ArgType) -> Result<(), String> {
                 validate_arg_type(field)?;
             }
             validate_alignment_value(struct_type_alignment(fields, *packed, *align)?)?;
-            let (prefix_size, has_var_tail) = struct_layout_prefix_size(fields, *packed, *align)?;
+            let (prefix_size, has_var_tail) =
+                struct_layout_prefix_size(fields, *packed, *align, *overlay_start)?;
             if prefix_size > *size {
                 return Err(format!(
                     "struct fields require at least {} bytes but declared size is {}",
@@ -2001,7 +2837,18 @@ fn validate_arg_type(arg_type: &ArgType) -> Result<(), String> {
             Ok(())
         }
         ArgType::Ptr { inner, .. } => validate_arg_type(inner),
-        ArgType::Len { size, .. } => validate_native_size(*size, "length argument"),
+        ArgType::Len {
+            size,
+            bitfield_bits,
+            scale,
+            ..
+        } => {
+            if *scale == 0 {
+                return Err("length scale must be greater than zero".to_string());
+            }
+            validate_native_size(*size, "length argument")?;
+            validate_bitfield_spec(*size, *bitfield_bits, "length argument")
+        }
         ArgType::String {
             values,
             noz,
@@ -2025,10 +2872,65 @@ fn validate_arg_value(
     arg_value: &ArgValue,
 ) -> Result<(), ValidationError> {
     match (arg_type, arg_value) {
-        (ArgType::Const { .. }, ArgValue::Const(_)) => Ok(()),
-        (ArgType::Len { target, size, kind }, ArgValue::Const(value)) => {
-            validate_len_value(prog, call_idx, desc, arg_idx, target, *size, *kind, *value)
+        (
+            ArgType::Const {
+                values,
+                range,
+                allow_any,
+                ..
+            },
+            ArgValue::Const(_),
+        ) => {
+            if const_has_no_valid_values(values, *range, *allow_any) {
+                Err(invalid_arg(
+                    call_idx,
+                    desc,
+                    arg_idx,
+                    "constant has no valid values on this target".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
         }
+        (
+            ArgType::Proc {
+                values_per_proc, ..
+            },
+            ArgValue::Const(value),
+        ) => {
+            if proc_has_no_valid_values(*values_per_proc) {
+                Err(invalid_arg(
+                    call_idx,
+                    desc,
+                    arg_idx,
+                    "per-process scalar has no valid values on this target".to_string(),
+                ))
+            } else if *value != PROC_DEFAULT_VALUE && *value >= *values_per_proc {
+                Err(invalid_arg(
+                    call_idx,
+                    desc,
+                    arg_idx,
+                    format!(
+                        "per-process scalar value {} exceeds per-proc range {}",
+                        value, values_per_proc
+                    ),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        (
+            ArgType::Len {
+                target,
+                size,
+                kind,
+                scale,
+                ..
+            },
+            ArgValue::Const(value),
+        ) => validate_len_value(
+            prog, call_idx, desc, arg_idx, target, *size, *kind, *scale, *value,
+        ),
         (ArgType::Array { .. }, ArgValue::Buffer(data)) => validate_inline_buffer(
             arg_type,
             data,
@@ -2037,10 +2939,18 @@ fn validate_arg_value(
             &[],
         )
         .map_err(|err| invalid_arg(call_idx, desc, arg_idx, err)),
-        (ArgType::Array { .. }, ArgValue::Composite { data, pointers }) => validate_inline_value(
+        (
+            ArgType::Array { .. },
+            ArgValue::Composite {
+                data,
+                pointers,
+                struct_layouts,
+            },
+        ) => validate_inline_value(
             arg_type,
             data,
             Some(pointers.as_slice()),
+            Some(struct_layouts.as_slice()),
             0,
             Some(desc),
             Some(&prog.calls[call_idx].args),
@@ -2057,6 +2967,7 @@ fn validate_arg_value(
                 data,
                 pointers,
                 element_sizes,
+                struct_layouts,
             },
         ) => validate_array_value(
             inner,
@@ -2064,6 +2975,7 @@ fn validate_arg_value(
             *max_len,
             data,
             Some(pointers.as_slice()),
+            Some(struct_layouts.as_slice()),
             element_sizes,
             0,
             Some(desc),
@@ -2071,13 +2983,18 @@ fn validate_arg_value(
             &[],
         )
         .map_err(|err| invalid_arg(call_idx, desc, arg_idx, err)),
-        (ArgType::Resource(resource), ArgValue::Const(_)) => validate_resource_desc(resource)
-            .map_err(|err| invalid_arg(call_idx, desc, arg_idx, err)),
-        (ArgType::Resource(resource), ArgValue::Null) => validate_resource_desc(resource)
-            .map_err(|err| invalid_arg(call_idx, desc, arg_idx, err)),
-        (ArgType::Resource(resource), ArgValue::ResultRef(result_ref)) => {
-            validate_result_ref(prog, descs, call_idx, desc, arg_idx, resource, result_ref)
+        (ArgType::Resource(resource) | ArgType::OptionalResource(resource), ArgValue::Const(_)) => {
+            validate_resource_desc(resource)
+                .map_err(|err| invalid_arg(call_idx, desc, arg_idx, err))
         }
+        (ArgType::Resource(resource) | ArgType::OptionalResource(resource), ArgValue::Null) => {
+            validate_resource_desc(resource)
+                .map_err(|err| invalid_arg(call_idx, desc, arg_idx, err))
+        }
+        (
+            ArgType::Resource(resource) | ArgType::OptionalResource(resource),
+            ArgValue::ResultRef(result_ref),
+        ) => validate_result_ref(prog, descs, call_idx, desc, arg_idx, resource, result_ref),
         (
             ArgType::Ptr {
                 inner,
@@ -2088,6 +3005,7 @@ fn validate_arg_value(
                 data,
                 pointers,
                 element_sizes,
+                struct_layouts,
             },
         ) => validate_pointer_array(
             prog,
@@ -2099,6 +3017,7 @@ fn validate_arg_value(
             data,
             pointers,
             element_sizes,
+            struct_layouts,
         ),
         (
             ArgType::Ptr {
@@ -2114,8 +3033,22 @@ fn validate_arg_value(
                 dir,
                 optional: _,
             },
-            ArgValue::Composite { data, pointers },
-        ) => validate_pointer_composite(prog, call_idx, desc, arg_idx, inner, *dir, data, pointers),
+            ArgValue::Composite {
+                data,
+                pointers,
+                struct_layouts,
+            },
+        ) => validate_pointer_composite(
+            prog,
+            call_idx,
+            desc,
+            arg_idx,
+            inner,
+            *dir,
+            data,
+            pointers,
+            struct_layouts,
+        ),
         (
             ArgType::Struct {
                 type_name,
@@ -2125,6 +3058,7 @@ fn validate_arg_value(
                 varlen,
                 packed,
                 align,
+                overlay_start,
                 ..
             },
             ArgValue::Buffer(data),
@@ -2136,7 +3070,9 @@ fn validate_arg_value(
             *varlen,
             *packed,
             *align,
+            *overlay_start,
             data,
+            None,
             Some(desc),
             Some(&prog.calls[call_idx].args),
             &[],
@@ -2151,9 +3087,14 @@ fn validate_arg_value(
                 varlen,
                 packed,
                 align,
+                overlay_start,
                 ..
             },
-            ArgValue::Composite { data, pointers },
+            ArgValue::Composite {
+                data,
+                pointers,
+                struct_layouts,
+            },
         ) => validate_struct_buffer_with_pointers(
             type_name.as_deref(),
             fields,
@@ -2162,8 +3103,10 @@ fn validate_arg_value(
             *varlen,
             *packed,
             *align,
+            *overlay_start,
             data,
             Some(pointers.as_slice()),
+            Some(struct_layouts.as_slice()),
             0,
             Some(desc),
             Some(&prog.calls[call_idx].args),
@@ -2191,6 +3134,7 @@ fn validate_arg_value(
             *packed,
             *align,
             data,
+            None,
             Some(desc),
             Some(&prog.calls[call_idx].args),
             &[],
@@ -2207,7 +3151,11 @@ fn validate_arg_value(
                 align,
                 ..
             },
-            ArgValue::Composite { data, pointers },
+            ArgValue::Composite {
+                data,
+                pointers,
+                struct_layouts,
+            },
         ) => validate_union_buffer_with_pointers(
             type_name.as_deref(),
             fields,
@@ -2218,6 +3166,7 @@ fn validate_arg_value(
             *align,
             data,
             Some(pointers.as_slice()),
+            Some(struct_layouts.as_slice()),
             0,
             Some(desc),
             Some(&prog.calls[call_idx].args),
@@ -2375,6 +3324,7 @@ fn validate_len_value(
     target: &LengthTarget,
     size: usize,
     kind: LengthKind,
+    scale: usize,
     value: u64,
 ) -> Result<(), ValidationError> {
     validate_native_size(size, "length argument")
@@ -2388,6 +3338,7 @@ fn validate_len_value(
             format!("cannot derive length from target {:?}", target),
         ));
     };
+    let expected = scale_length_value(expected, scale);
     if value != expected as u64 {
         return Err(invalid_arg(
             call_idx,
@@ -2411,7 +3362,7 @@ fn validate_pointer_buffer(
     dir: PtrDir,
     data: &[u8],
 ) -> Result<(), ValidationError> {
-    validate_pointer_bytes(prog, call_idx, desc, arg_idx, inner, dir, data, None)
+    validate_pointer_bytes(prog, call_idx, desc, arg_idx, inner, dir, data, None, None)
 }
 
 fn validate_pointer_array(
@@ -2424,6 +3375,7 @@ fn validate_pointer_array(
     data: &[u8],
     pointers: &[InlinePointerValue],
     element_sizes: &[usize],
+    struct_layouts: &[InlineStructLayout],
 ) -> Result<(), ValidationError> {
     if dir == PtrDir::Out {
         return Err(invalid_arg(
@@ -2452,6 +3404,7 @@ fn validate_pointer_array(
         *max_len,
         data,
         Some(pointers),
+        Some(struct_layouts),
         element_sizes,
         0,
         Some(desc),
@@ -2470,6 +3423,7 @@ fn validate_pointer_composite(
     dir: PtrDir,
     data: &[u8],
     pointers: &[InlinePointerValue],
+    struct_layouts: &[InlineStructLayout],
 ) -> Result<(), ValidationError> {
     validate_pointer_bytes(
         prog,
@@ -2480,6 +3434,7 @@ fn validate_pointer_composite(
         dir,
         data,
         Some(pointers),
+        Some(struct_layouts),
     )
 }
 
@@ -2492,6 +3447,7 @@ fn validate_pointer_bytes(
     dir: PtrDir,
     data: &[u8],
     pointers: Option<&[InlinePointerValue]>,
+    struct_layouts: Option<&[InlineStructLayout]>,
 ) -> Result<(), ValidationError> {
     if dir == PtrDir::Out {
         return Err(invalid_arg(
@@ -2508,7 +3464,13 @@ fn validate_pointer_bytes(
             .map_err(|err| invalid_arg(call_idx, desc, arg_idx, err)),
         ArgType::String { noz, fixed_len, .. } => validate_string_buffer(data, *noz, *fixed_len)
             .map_err(|err| invalid_arg(call_idx, desc, arg_idx, err)),
-        ArgType::Len { target, size, kind } => {
+        ArgType::Len {
+            target,
+            size,
+            kind,
+            scale,
+            ..
+        } => {
             if data.len() != *size {
                 return Err(invalid_arg(
                     call_idx,
@@ -2529,6 +3491,7 @@ fn validate_pointer_bytes(
                 target,
                 *size,
                 *kind,
+                *scale,
                 decode_scalar_bytes(data),
             )
         }
@@ -2554,6 +3517,7 @@ fn validate_pointer_bytes(
                     *align,
                     data,
                     pointers,
+                    struct_layouts,
                     0,
                     Some(desc),
                     Some(&prog.calls[call_idx].args),
@@ -2565,6 +3529,7 @@ fn validate_pointer_bytes(
                 inner,
                 data,
                 pointers,
+                struct_layouts,
                 0,
                 Some(desc),
                 Some(&prog.calls[call_idx].args),
@@ -2582,7 +3547,7 @@ fn validate_inline_buffer(
     args: Option<&[ArgValue]>,
     frames: &[LengthTargetFrame<'_>],
 ) -> Result<(), String> {
-    validate_inline_value(arg_type, data, None, 0, desc, args, frames)
+    validate_inline_value(arg_type, data, None, None, 0, desc, args, frames)
 }
 
 fn validate_array_value(
@@ -2591,6 +3556,7 @@ fn validate_array_value(
     max_len: usize,
     data: &[u8],
     pointers: Option<&[InlinePointerValue]>,
+    struct_layouts: Option<&[InlineStructLayout]>,
     element_sizes: &[usize],
     base_offset: usize,
     desc: Option<&SyscallDesc>,
@@ -2617,6 +3583,7 @@ fn validate_array_value(
             inner,
             chunk,
             pointers,
+            struct_layouts,
             base_offset + offset,
             desc,
             args,
@@ -2638,14 +3605,42 @@ fn validate_inline_value(
     arg_type: &ArgType,
     data: &[u8],
     pointers: Option<&[InlinePointerValue]>,
+    struct_layouts: Option<&[InlineStructLayout]>,
     base_offset: usize,
     desc: Option<&SyscallDesc>,
     args: Option<&[ArgValue]>,
     frames: &[LengthTargetFrame<'_>],
 ) -> Result<(), String> {
     match arg_type {
-        ArgType::Const { size, .. } => validate_exact_inline_size(data.len(), *size, "const field"),
-        ArgType::Resource(resource) => {
+        ArgType::Const {
+            size,
+            values,
+            range,
+            allow_any,
+            bitfield_bits,
+            ..
+        } => {
+            if bitfield_bits.is_some() && data.is_empty() {
+                return Ok(());
+            }
+            validate_exact_inline_size(data.len(), *size, "const field")?;
+            if const_has_no_valid_values(values, *range, *allow_any) {
+                return Err("const field has no valid values on this target".to_string());
+            }
+            Ok(())
+        }
+        ArgType::Proc {
+            size,
+            values_per_proc,
+            ..
+        } => {
+            validate_exact_inline_size(data.len(), *size, "proc field")?;
+            if proc_has_no_valid_values(*values_per_proc) {
+                return Err("proc field has no valid values on this target".to_string());
+            }
+            Ok(())
+        }
+        ArgType::Resource(resource) | ArgType::OptionalResource(resource) => {
             validate_exact_inline_size(data.len(), resource.size, "resource field")
         }
         ArgType::Array {
@@ -2678,6 +3673,7 @@ fn validate_inline_value(
                     inner,
                     chunk,
                     pointers,
+                    struct_layouts,
                     base_offset + (element_idx * elem_size),
                     desc,
                     args,
@@ -2699,17 +3695,20 @@ fn validate_inline_value(
                     *dir,
                     pointer_data,
                     None,
+                    None,
                     desc,
                     args,
                 ),
                 Some(ArgValue::Composite {
                     data: pointer_data,
                     pointers: pointer_pointers,
+                    struct_layouts: pointer_struct_layouts,
                 }) => validate_pointer_value_for_inline_field(
                     inner,
                     *dir,
                     pointer_data,
                     Some(pointer_pointers.as_slice()),
+                    Some(pointer_struct_layouts.as_slice()),
                     desc,
                     args,
                 ),
@@ -2717,11 +3716,13 @@ fn validate_inline_value(
                     data: pointer_data,
                     pointers: pointer_pointers,
                     element_sizes,
+                    struct_layouts: pointer_struct_layouts,
                 }) => validate_pointer_array_value_for_inline_field(
                     inner,
                     *dir,
                     pointer_data,
                     Some(pointer_pointers.as_slice()),
+                    Some(pointer_struct_layouts.as_slice()),
                     element_sizes,
                     desc,
                     args,
@@ -2744,6 +3745,7 @@ fn validate_inline_value(
             varlen,
             packed,
             align,
+            overlay_start,
             ..
         } => validate_struct_buffer_with_pointers(
             type_name.as_deref(),
@@ -2753,8 +3755,10 @@ fn validate_inline_value(
             *varlen,
             *packed,
             *align,
+            *overlay_start,
             data,
             pointers,
+            struct_layouts,
             base_offset,
             desc,
             args,
@@ -2779,17 +3783,32 @@ fn validate_inline_value(
             *align,
             data,
             pointers,
+            struct_layouts,
             base_offset,
             desc,
             args,
             frames,
         ),
         ArgType::Vma { .. } => validate_exact_inline_size(data.len(), 8, "vma field"),
-        ArgType::Len { target, size, kind } => {
+        ArgType::Len {
+            target,
+            size,
+            kind,
+            endian,
+            scale,
+            bitfield_bits,
+        } => {
+            if bitfield_bits.is_some() && data.is_empty() {
+                return Ok(());
+            }
             validate_exact_inline_size(data.len(), *size, "length field")?;
+            if bitfield_bits.is_some() {
+                return Ok(());
+            }
             let expected = derive_inline_target_length(desc, args, frames, target, *kind);
             if let Some(expected) = expected {
-                let actual = decode_scalar_bytes(data);
+                let actual = decode_scalar_bytes_endian(data, *endian);
+                let expected = scale_length_value(expected, *scale);
                 if actual != expected as u64 {
                     return Err(format!(
                         "derived inline field has value {}, expected {}",
@@ -2817,6 +3836,7 @@ fn validate_pointer_value_for_inline_field(
     dir: PtrDir,
     data: &[u8],
     pointers: Option<&[InlinePointerValue]>,
+    struct_layouts: Option<&[InlineStructLayout]>,
     desc: Option<&SyscallDesc>,
     args: Option<&[ArgValue]>,
 ) -> Result<(), String> {
@@ -2828,11 +3848,25 @@ fn validate_pointer_value_for_inline_field(
             min_size, max_size, ..
         } => validate_buffer_size(data.len(), *min_size, *max_size),
         ArgType::String { noz, fixed_len, .. } => validate_string_buffer(data, *noz, *fixed_len),
-        ArgType::Len { target, size, kind } => {
+        ArgType::Len {
+            target,
+            size,
+            kind,
+            endian,
+            scale,
+            bitfield_bits,
+        } => {
+            if bitfield_bits.is_some() && data.is_empty() {
+                return Ok(());
+            }
             validate_exact_inline_size(data.len(), *size, "length pointer buffer")?;
+            if bitfield_bits.is_some() {
+                return Ok(());
+            }
             let expected = derive_inline_target_length(desc, args, &[], target, *kind)
                 .ok_or_else(|| format!("cannot derive length from target {:?}", target))?;
-            let actual = decode_scalar_bytes(data) as usize;
+            let actual = decode_scalar_bytes_endian(data, *endian) as usize;
+            let expected = scale_length_value(expected, *scale);
             if actual == expected {
                 Ok(())
             } else {
@@ -2861,12 +3895,13 @@ fn validate_pointer_value_for_inline_field(
             *align,
             data,
             pointers,
+            struct_layouts,
             0,
             desc,
             args,
             &[],
         ),
-        _ => validate_inline_value(inner, data, pointers, 0, desc, args, &[]),
+        _ => validate_inline_value(inner, data, pointers, struct_layouts, 0, desc, args, &[]),
     }
 }
 
@@ -2875,6 +3910,7 @@ fn validate_pointer_array_value_for_inline_field(
     dir: PtrDir,
     data: &[u8],
     pointers: Option<&[InlinePointerValue]>,
+    struct_layouts: Option<&[InlineStructLayout]>,
     element_sizes: &[usize],
     desc: Option<&SyscallDesc>,
     args: Option<&[ArgValue]>,
@@ -2896,6 +3932,7 @@ fn validate_pointer_array_value_for_inline_field(
         *max_len,
         data,
         pointers,
+        struct_layouts,
         element_sizes,
         0,
         desc,
@@ -2912,7 +3949,9 @@ fn validate_struct_buffer(
     varlen: bool,
     packed: bool,
     align: Option<usize>,
+    overlay_start: Option<usize>,
     data: &[u8],
+    struct_layouts: Option<&[InlineStructLayout]>,
     desc: Option<&SyscallDesc>,
     args: Option<&[ArgValue]>,
     frames: &[LengthTargetFrame<'_>],
@@ -2925,8 +3964,10 @@ fn validate_struct_buffer(
         varlen,
         packed,
         align,
+        overlay_start,
         data,
         None,
+        struct_layouts,
         0,
         desc,
         args,
@@ -2942,16 +3983,19 @@ fn validate_struct_buffer_with_pointers(
     varlen: bool,
     packed: bool,
     align: Option<usize>,
+    overlay_start: Option<usize>,
     data: &[u8],
     pointers: Option<&[InlinePointerValue]>,
+    struct_layouts: Option<&[InlineStructLayout]>,
     base_offset: usize,
     desc: Option<&SyscallDesc>,
     args: Option<&[ArgValue]>,
     frames: &[LengthTargetFrame<'_>],
 ) -> Result<(), String> {
-    let (prefix_size, has_var_tail) = struct_layout_prefix_size(fields, packed, align)?;
+    let (prefix_size, has_var_fields) =
+        struct_layout_prefix_size(fields, packed, align, overlay_start)?;
     let struct_align = struct_type_alignment(fields, packed, align)?;
-    if !varlen && !has_var_tail {
+    if !varlen && !has_var_fields {
         validate_exact_inline_size(data.len(), size, "struct buffer")?;
     } else if data.len() < prefix_size {
         return Err(format!(
@@ -2975,27 +4019,38 @@ fn validate_struct_buffer_with_pointers(
         is_union: false,
         varlen,
         packed,
+        align,
+        overlay_start,
         data: Some(data),
         pointers,
+        struct_layouts,
         base_offset,
     });
-    for (idx, field) in fields.iter().enumerate() {
-        let offset = compute_struct_field_offset(fields, idx, varlen, packed)
-            .ok_or_else(|| "struct field offset overflow".to_string())?;
-        let field_size = if let Some(field_size) = arg_type_fixed_size(field) {
-            field_size
-        } else if idx + 1 == fields.len() {
-            data.len().saturating_sub(offset)
-        } else {
-            return Err("only trailing variable-sized struct fields are supported".to_string());
-        };
-        let end = offset
-            .checked_add(field_size)
-            .ok_or_else(|| "struct field offset overflow".to_string())?;
+    let ranges = if let Some(field_ranges) =
+        lookup_inline_struct_layout(struct_layouts, base_offset, fields.len())
+    {
+        field_ranges
+            .iter()
+            .map(|(start, end)| {
+                Ok((
+                    start
+                        .checked_sub(base_offset)
+                        .ok_or_else(|| "struct field start underflow".to_string())?,
+                    end.checked_sub(base_offset)
+                        .ok_or_else(|| "struct field end underflow".to_string())?,
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    } else {
+        compute_struct_field_ranges(fields, varlen, packed, align, overlay_start, data.len())
+            .ok_or_else(|| "struct field layout overflow".to_string())?
+    };
+    for (field, (offset, end)) in fields.iter().zip(ranges.into_iter()) {
         validate_inline_value(
             field,
             &data[offset..end],
             pointers,
+            struct_layouts,
             base_offset + offset,
             desc,
             args,
@@ -3009,7 +4064,7 @@ fn compute_field_offsets(fields: &[ArgType], packed: bool) -> Result<Vec<usize>,
     let mut offsets = Vec::with_capacity(fields.len());
     for idx in 0..fields.len() {
         offsets.push(
-            compute_struct_field_offset(fields, idx, false, packed)
+            compute_struct_field_offset(fields, idx, false, packed, None)
                 .ok_or_else(|| "field offset overflow".to_string())?,
         );
     }
@@ -3020,40 +4075,56 @@ pub(crate) fn struct_layout_prefix_size(
     fields: &[ArgType],
     packed: bool,
     align: Option<usize>,
+    overlay_start: Option<usize>,
 ) -> Result<(usize, bool), String> {
+    if let Some(overlay_start) = overlay_start {
+        if overlay_start == 0 || overlay_start >= fields.len() {
+            return Err("overlay field index is out of bounds".to_string());
+        }
+        if fields
+            .iter()
+            .any(|field| arg_type_fixed_size(field).is_none())
+        {
+            return Err("overlay structs with variable-sized fields are not supported".to_string());
+        }
+        let lhs = struct_layout_prefix_size(&fields[..overlay_start], packed, None, None)?.0;
+        let rhs = struct_layout_prefix_size(&fields[overlay_start..], packed, None, None)?.0;
+        let struct_align = struct_type_alignment(fields, packed, align)?;
+        let prefix_size = align_up(lhs.max(rhs), struct_align)
+            .ok_or_else(|| "struct size overflow".to_string())?;
+        return Ok((prefix_size, false));
+    }
+    let bitfield_info = compute_bitfield_field_info(fields)
+        .ok_or_else(|| "bitfield layout overflow".to_string())?;
     let mut prefix_size = 0usize;
-    let mut saw_var_tail = false;
+    let mut saw_var_field = false;
     for (idx, field) in fields.iter().enumerate() {
-        let field_align = if packed {
-            1
-        } else {
-            arg_type_alignment(field)
-                .ok_or_else(|| "struct fields must have a known alignment".to_string())?
-        };
+        let field_align = effective_field_alignment(field, packed, bitfield_info[idx])
+            .ok_or_else(|| "struct fields must have a known alignment".to_string())?;
         prefix_size =
             align_up(prefix_size, field_align).ok_or_else(|| "struct size overflow".to_string())?;
-        match arg_type_fixed_size(field) {
+        match effective_field_fixed_size(field, bitfield_info[idx]) {
             Some(field_size) => {
                 prefix_size = prefix_size
                     .checked_add(field_size)
                     .ok_or_else(|| "struct size overflow".to_string())?;
             }
             None => {
-                if idx + 1 != fields.len() {
+                if !packed && idx + 1 != fields.len() {
                     return Err(
                         "only trailing variable-sized struct fields are supported".to_string()
                     );
                 }
-                saw_var_tail = true;
+                saw_var_field = true;
             }
         }
     }
-    if !saw_var_tail {
+    if !saw_var_field {
         let struct_align = struct_type_alignment(fields, packed, align)?;
         prefix_size = align_up(prefix_size, struct_align)
             .ok_or_else(|| "struct size overflow".to_string())?;
     }
-    Ok((prefix_size, saw_var_tail))
+    Ok((prefix_size, saw_var_field))
 }
 
 fn validate_exact_inline_size(actual: usize, expected: usize, label: &str) -> Result<(), String> {
@@ -3073,6 +4144,7 @@ fn validate_union_buffer(
     packed: bool,
     align: Option<usize>,
     data: &[u8],
+    struct_layouts: Option<&[InlineStructLayout]>,
     desc: Option<&SyscallDesc>,
     args: Option<&[ArgValue]>,
     frames: &[LengthTargetFrame<'_>],
@@ -3087,6 +4159,7 @@ fn validate_union_buffer(
         align,
         data,
         None,
+        struct_layouts,
         0,
         desc,
         args,
@@ -3104,6 +4177,7 @@ fn validate_union_buffer_with_pointers(
     align: Option<usize>,
     data: &[u8],
     pointers: Option<&[InlinePointerValue]>,
+    struct_layouts: Option<&[InlineStructLayout]>,
     base_offset: usize,
     desc: Option<&SyscallDesc>,
     args: Option<&[ArgValue]>,
@@ -3149,8 +4223,11 @@ fn validate_union_buffer_with_pointers(
         is_union: true,
         varlen,
         packed,
+        align,
+        overlay_start: None,
         data: Some(data),
         pointers,
+        struct_layouts,
         base_offset,
     });
 
@@ -3165,6 +4242,7 @@ fn validate_union_buffer_with_pointers(
                             field,
                             field_data,
                             pointers,
+                            struct_layouts,
                             base_offset,
                             desc,
                             args,
@@ -3182,6 +4260,7 @@ fn validate_union_buffer_with_pointers(
                         field,
                         data,
                         pointers,
+                        struct_layouts,
                         base_offset,
                         desc,
                         args,
@@ -3202,6 +4281,7 @@ fn validate_union_buffer_with_pointers(
                 field,
                 field_data,
                 pointers,
+                struct_layouts,
                 base_offset,
                 desc,
                 args,
@@ -3283,9 +4363,6 @@ fn validate_string_type(
         }
     }
     for value in values {
-        if value.contains(&0) {
-            return Err("string literals may not contain embedded NUL bytes".to_string());
-        }
         if let Some(fixed_len) = fixed_len {
             let encoded_len = if noz { value.len() } else { value.len() + 1 };
             if encoded_len > fixed_len {
@@ -3385,8 +4462,9 @@ fn invalid_arg(
 fn describe_arg_type(arg_type: &ArgType) -> &'static str {
     match arg_type {
         ArgType::Const { .. } => "const",
+        ArgType::Proc { .. } => "proc",
         ArgType::Len { .. } => "length",
-        ArgType::Resource(_) => "resource",
+        ArgType::Resource(_) | ArgType::OptionalResource(_) => "resource",
         ArgType::Array { .. } => "array",
         ArgType::Struct { .. } => "struct",
         ArgType::Union { .. } => "union",
@@ -3438,10 +4516,12 @@ mod tests {
                 arg_idx,
                 element_idx,
                 offset,
+                ref pointer_chain,
             } => {
                 assert_eq!(arg_idx, 0);
                 assert_eq!(element_idx, 1);
                 assert_eq!(offset, 4);
+                assert!(pointer_chain.is_empty());
             }
             ref other => panic!("unexpected output source: {:?}", other),
         }
@@ -3482,10 +4562,49 @@ mod tests {
                 arg_idx,
                 element_idx,
                 offset,
+                ref pointer_chain,
             } => {
                 assert_eq!(arg_idx, 3);
                 assert_eq!(element_idx, 1);
                 assert_eq!(offset, 4);
+                assert!(pointer_chain.is_empty());
+            }
+            ref other => panic!("unexpected output source: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn nested_pointer_outputs_expose_resource_offsets_and_pointer_chain() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                resource handle[intptr]
+                type inner {
+                    h0 handle
+                    h1 handle
+                }
+                type wrapper {
+                    out ptr[out, inner]
+                }
+                syscall make@1 -> int(arg ptr[inout, wrapper])
+            "#,
+        )
+        .expect("test target should parse");
+        let outputs = resource_outputs(&descs[0]);
+
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].resource.kind, "handle");
+        assert_eq!(outputs[1].resource.kind, "handle");
+        match outputs[1].source {
+            ResourceSource::PointerElement {
+                arg_idx,
+                element_idx,
+                offset,
+                ref pointer_chain,
+            } => {
+                assert_eq!(arg_idx, 0);
+                assert_eq!(element_idx, 1);
+                assert_eq!(offset, 8);
+                assert_eq!(pointer_chain, &vec![0]);
             }
             ref other => panic!("unexpected output source: {:?}", other),
         }
@@ -3519,7 +4638,7 @@ mod tests {
         let eventfd2_idx = syscall_idx(&descs, "eventfd2");
 
         let fd_input = match &close.args[0] {
-            ArgType::Resource(resource) => resource.clone(),
+            ArgType::Resource(resource) | ArgType::OptionalResource(resource) => resource.clone(),
             other => panic!("unexpected close arg: {:?}", other),
         };
         let sock_output = match &socket.ret {
@@ -3589,6 +4708,25 @@ mod tests {
     }
 
     #[test]
+    fn optional_resource_inputs_do_not_block_self_constructing_resources() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                resource ring[4] = -1
+                syscall setup@1 -> ring(parent ring[opt])
+                syscall use_ring@2 -> int(fd ring)
+            "#,
+        )
+        .expect("optional resource target should parse");
+
+        let enabled = transitively_enabled_syscalls(&descs);
+        let generatable = transitively_generatable_syscalls(&descs);
+
+        assert_eq!(enabled.enabled, vec![0, 1]);
+        assert_eq!(generatable.enabled, vec![0, 1]);
+        assert!(generatable.disabled.is_empty());
+    }
+
+    #[test]
     fn generatable_availability_respects_no_generate_attrs() {
         let descs = crate::description::parse_syscall_descs(
             r#"
@@ -3617,6 +4755,219 @@ mod tests {
             .get(&2)
             .expect("close should not be generatable without a live fd constructor")
             .contains("constructors are not transitively enabled: eventfd2"));
+    }
+
+    #[test]
+    fn generatable_availability_accepts_packed_structs_with_multiple_variable_fields() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type binfmt_register_like {
+                    colon0 const[':', int8]
+                    name stringnoz["syz0"]
+                    colon1 const[':', int8]
+                    kind stringnoz["M"]
+                    colon2 const[':', int8]
+                    magic stringnoz
+                    colon3 const[':', int8]
+                    mask stringnoz
+                } [packed]
+                syscall register_like@1 -> int(arg ptr[in, binfmt_register_like])
+            "#,
+        )
+        .expect("test target should parse");
+
+        let enabled = transitively_enabled_syscalls(&descs);
+        let generatable = transitively_generatable_syscalls(&descs);
+
+        assert_eq!(enabled.enabled, vec![0]);
+        assert_eq!(generatable.enabled, vec![0]);
+        assert!(!generatable.disabled.contains_key(&0));
+    }
+
+    #[test]
+    fn generatable_availability_accepts_packed_varlen_structs_with_explicit_alignment() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type packed_mid_aligned {
+                    prefix int32
+                    payload array[int64]
+                    payload_words len[payload, intptr]
+                    tail ptr[in, array[int8, 4]]
+                } [packed, align[8]]
+                syscall use_mid@1 -> int(arg ptr[in, packed_mid_aligned], arglen len[arg, intptr])
+            "#,
+        )
+        .expect("test target should parse");
+
+        let enabled = transitively_enabled_syscalls(&descs);
+        let generatable = transitively_generatable_syscalls(&descs);
+
+        assert_eq!(enabled.enabled, vec![0]);
+        assert_eq!(generatable.enabled, vec![0]);
+        assert!(!generatable.disabled.contains_key(&0));
+    }
+
+    #[test]
+    fn generatable_availability_accepts_bitfield_backed_structs() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type ipv4_like {
+                    ihl bytesize4[parent, int8:4]
+                    version const[4, int8:4]
+                    payload array[int8, 3:3]
+                } [packed]
+                syscall use_ipv4_like@1 -> int(arg ptr[in, ipv4_like], arglen len[arg, intptr])
+            "#,
+        )
+        .expect("test target should parse");
+
+        let enabled = transitively_enabled_syscalls(&descs);
+        let generatable = transitively_generatable_syscalls(&descs);
+
+        assert_eq!(enabled.enabled, vec![0]);
+        assert_eq!(generatable.enabled, vec![0]);
+        assert!(!generatable.disabled.contains_key(&0));
+    }
+
+    #[test]
+    fn generatable_availability_excludes_unimplemented_syscall_attrs() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                syscall stable@1 -> int()
+                syscall freeze@2 -> int() (snapshot)
+                syscall seccompish@3 -> int() (breaks_returns)
+                syscall vmcall@4 -> int() (no_squash)
+                syscall coverme@5 -> int() (remote_cover)
+                syscall fuzztest@6 -> int() (kfuzz_test, timeout[300])
+                syscall needs_fsck@7 -> int() (fsck["fsck.ext4 -n"])
+                syscall longprog@8 -> int() (prog_timeout[3000])
+            "#,
+        )
+        .expect("attribute target should parse");
+
+        let enabled = transitively_enabled_syscalls(&descs);
+        let generatable = transitively_generatable_syscalls(&descs);
+
+        assert_eq!(enabled.enabled, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(generatable.enabled, vec![0, 2, 7]);
+        assert_eq!(
+            generatable
+                .disabled
+                .get(&1)
+                .expect("snapshot syscall should be excluded"),
+            "requires snapshot-mode support"
+        );
+        assert_eq!(
+            generatable
+                .disabled
+                .get(&3)
+                .expect("no_squash syscall should be excluded"),
+            "requires no_squash executor support"
+        );
+        assert_eq!(
+            generatable
+                .disabled
+                .get(&4)
+                .expect("remote_cover syscall should be excluded"),
+            "requires remote coverage support"
+        );
+        assert_eq!(
+            generatable
+                .disabled
+                .get(&5)
+                .expect("kfuzz_test syscall should be excluded"),
+            "requires kfuzz_test support"
+        );
+        assert_eq!(
+            generatable
+                .disabled
+                .get(&6)
+                .expect("fsck syscall should be excluded"),
+            "requires fsck helper support"
+        );
+    }
+
+    #[test]
+    fn generatable_availability_accepts_breaks_returns_resource_chains() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                resource listenerfd[4] = -1
+                syscall make_listener@1 -> listenerfd() (breaks_returns)
+                syscall use_listener@2 -> int(fd listenerfd) (breaks_returns)
+            "#,
+        )
+        .expect("breaks_returns resource target should parse");
+
+        let enabled = transitively_enabled_syscalls(&descs);
+        let generatable = transitively_generatable_syscalls(&descs);
+
+        assert_eq!(enabled.enabled, vec![0, 1]);
+        assert_eq!(generatable.enabled, vec![0, 1]);
+        assert!(generatable.disabled.is_empty());
+    }
+
+    #[test]
+    fn out_overlay_structs_compute_layouts_but_are_not_generatable_yet() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type overlay_args {
+                    kind int32
+                    devid int32 (out_overlay)
+                    magic int32
+                } [size[8]]
+                syscall use_overlay@1 -> int(arg ptr[inout, overlay_args])
+            "#,
+        )
+        .expect("overlay-bearing target should parse");
+
+        let enabled = transitively_enabled_syscalls(&descs);
+        let generatable = transitively_generatable_syscalls(&descs);
+        assert_eq!(enabled.enabled, vec![0]);
+        assert!(generatable.enabled.is_empty());
+        assert_eq!(
+            generatable
+                .disabled
+                .get(&0)
+                .expect("overlay syscall should be excluded from generation"),
+            "contains out_overlay struct fields, which generation does not support yet"
+        );
+
+        let overlay = match &descs[0].args[0] {
+            ArgType::Ptr { inner, .. } => inner.as_ref(),
+            other => panic!("unexpected overlay arg: {:?}", other),
+        };
+
+        match overlay {
+            ArgType::Struct {
+                fields,
+                size,
+                packed,
+                align,
+                overlay_start,
+                ..
+            } => {
+                assert_eq!(*size, 8);
+                assert_eq!(*overlay_start, Some(1));
+                assert_eq!(
+                    compute_struct_field_offset(fields, 0, false, *packed, *overlay_start),
+                    Some(0)
+                );
+                assert_eq!(
+                    compute_struct_field_offset(fields, 1, false, *packed, *overlay_start),
+                    Some(0)
+                );
+                assert_eq!(
+                    compute_struct_field_offset(fields, 2, false, *packed, *overlay_start),
+                    Some(4)
+                );
+                assert_eq!(
+                    struct_layout_prefix_size(fields, *packed, *align, *overlay_start)
+                        .expect("overlay layout should compute"),
+                    (8, false)
+                );
+            }
+            other => panic!("unexpected overlay type: {:?}", other),
+        }
     }
 
     #[test]
@@ -4095,6 +5446,70 @@ mod tests {
     }
 
     #[test]
+    fn validates_string_literals_with_embedded_nul_bytes() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                syscall write_nul@1 -> int(arg ptr[in, string["ab\u0000cd"]], arg_len len[arg])
+            "#,
+        )
+        .expect("embedded-NUL string target should parse");
+
+        let valid = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![ArgValue::Buffer(b"ab\0cd\0".to_vec()), ArgValue::Const(6)],
+            }],
+        };
+
+        valid
+            .validate(&descs)
+            .expect("embedded-NUL string buffers should validate");
+    }
+
+    #[test]
+    fn validates_packed_aligned_structs_with_nontrailing_var_fields() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type packed_mid_aligned {
+                    prefix int32
+                    payload array[int64]
+                    payload_words len[payload, intptr]
+                    tail ptr[in, array[int8, 4]]
+                } [packed, align[8]]
+                syscall use_mid@1 -> int(arg ptr[in, packed_mid_aligned], arglen len[arg, intptr])
+            "#,
+        )
+        .expect("test target should parse");
+
+        let valid = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![
+                    ArgValue::Composite {
+                        data: encode_scalar_bytes(4, 0x1122_3344)
+                            .into_iter()
+                            .chain(encode_scalar_bytes(8, 1))
+                            .chain(encode_scalar_bytes(8, 1))
+                            .chain(vec![0; 8])
+                            .chain(vec![0; 4])
+                            .collect(),
+                        pointers: vec![InlinePointerValue {
+                            offset: 20,
+                            value: Box::new(ArgValue::Buffer(vec![1, 2, 3, 4])),
+                        }],
+                        struct_layouts: Vec::new(),
+                    },
+                    ArgValue::Const(32),
+                ],
+            }],
+        };
+
+        valid
+            .validate(&descs)
+            .expect("packed aligned mid-var struct should validate");
+    }
+
+    #[test]
     fn distinguishes_len_from_bytesize_for_pointer_arrays() {
         let descs = crate::description::parse_syscall_descs(
             r#"
@@ -4445,6 +5860,7 @@ mod tests {
             data: control_data,
             pointers: Vec::new(),
             element_sizes: vec![24, 16],
+            struct_layouts: Vec::new(),
         };
         let valid = Program {
             calls: vec![Call {
@@ -4472,6 +5888,7 @@ mod tests {
                                         offset: 0,
                                         value: Box::new(ArgValue::Buffer(vec![1, 2, 3, 4, 5])),
                                     }],
+                                    struct_layouts: Vec::new(),
                                 }),
                             },
                             InlinePointerValue {
@@ -4479,6 +5896,7 @@ mod tests {
                                 value: Box::new(control.clone()),
                             },
                         ],
+                        struct_layouts: Vec::new(),
                     },
                     ArgValue::Const(0),
                 ],
@@ -4514,6 +5932,7 @@ mod tests {
                                         offset: 0,
                                         value: Box::new(ArgValue::Buffer(vec![1, 2, 3, 4, 5])),
                                     }],
+                                    struct_layouts: Vec::new(),
                                 }),
                             },
                             InlinePointerValue {
@@ -4521,6 +5940,7 @@ mod tests {
                                 value: Box::new(control),
                             },
                         ],
+                        struct_layouts: Vec::new(),
                     },
                     ArgValue::Const(0),
                 ],
@@ -4574,15 +5994,15 @@ mod tests {
                 assert_eq!(*align, None);
                 assert_eq!(*size, 24);
                 assert_eq!(
-                    compute_struct_field_offset(fields, 0, false, *packed),
+                    compute_struct_field_offset(fields, 0, false, *packed, None),
                     Some(0)
                 );
                 assert_eq!(
-                    compute_struct_field_offset(fields, 1, false, *packed),
+                    compute_struct_field_offset(fields, 1, false, *packed, None),
                     Some(8)
                 );
                 assert_eq!(
-                    compute_struct_field_offset(fields, 2, false, *packed),
+                    compute_struct_field_offset(fields, 2, false, *packed, None),
                     Some(16)
                 );
             }
@@ -4601,20 +6021,91 @@ mod tests {
                 assert_eq!(*align, Some(8));
                 assert_eq!(*size, 16);
                 assert_eq!(
-                    compute_struct_field_offset(fields, 0, false, *packed),
+                    compute_struct_field_offset(fields, 0, false, *packed, None),
                     Some(0)
                 );
                 assert_eq!(
-                    compute_struct_field_offset(fields, 1, false, *packed),
+                    compute_struct_field_offset(fields, 1, false, *packed, None),
                     Some(4)
                 );
                 assert_eq!(
-                    compute_struct_field_offset(fields, 2, false, *packed),
+                    compute_struct_field_offset(fields, 2, false, *packed, None),
                     Some(12)
                 );
             }
             other => panic!("unexpected packed hdr type: {:?}", other),
         }
+    }
+
+    #[test]
+    fn validates_packed_struct_with_nontrailing_var_field() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type packed_mid {
+                    prefix int32
+                    payload array[int64]
+                    payload_words len[payload, intptr]
+                    tail ptr[in, array[int8, 4]]
+                } [packed]
+                syscall use_mid@1 -> int(arg ptr[in, packed_mid], arglen len[arg, intptr])
+            "#,
+        )
+        .expect("test target should parse");
+
+        let valid = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![
+                    ArgValue::Composite {
+                        data: encode_scalar_bytes(4, 0x1122_3344)
+                            .into_iter()
+                            .chain(encode_scalar_bytes(8, 1))
+                            .chain(encode_scalar_bytes(8, 2))
+                            .chain(encode_scalar_bytes(8, 2))
+                            .chain(vec![0; 8])
+                            .collect(),
+                        pointers: vec![InlinePointerValue {
+                            offset: 28,
+                            value: Box::new(ArgValue::Buffer(vec![1, 2, 3, 4])),
+                        }],
+                        struct_layouts: Vec::new(),
+                    },
+                    ArgValue::Const(36),
+                ],
+            }],
+        };
+        valid
+            .validate(&descs)
+            .expect("packed struct with mid var field should validate");
+
+        let invalid = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![
+                    ArgValue::Composite {
+                        data: encode_scalar_bytes(4, 0x1122_3344)
+                            .into_iter()
+                            .chain(encode_scalar_bytes(8, 1))
+                            .chain(encode_scalar_bytes(8, 2))
+                            .chain(encode_scalar_bytes(8, 1))
+                            .chain(vec![0; 8])
+                            .collect(),
+                        pointers: vec![InlinePointerValue {
+                            offset: 28,
+                            value: Box::new(ArgValue::Buffer(vec![1, 2, 3, 4])),
+                        }],
+                        struct_layouts: Vec::new(),
+                    },
+                    ArgValue::Const(36),
+                ],
+            }],
+        };
+        let err = invalid
+            .validate(&descs)
+            .expect_err("wrong derived count after var field must be rejected");
+        assert!(err
+            .to_string()
+            .contains("derived inline field has value 1, expected 2"));
     }
 
     #[test]
@@ -4644,6 +6135,7 @@ mod tests {
                             offset: 0,
                             value: Box::new(ArgValue::Buffer(vec![1, 2, 3, 4, 5, 6])),
                         }],
+                        struct_layouts: Vec::new(),
                     },
                     ArgValue::Const(6),
                 ],
@@ -4667,6 +6159,7 @@ mod tests {
                             offset: 0,
                             value: Box::new(ArgValue::Buffer(vec![1, 2, 3, 4, 5, 6])),
                         }],
+                        struct_layouts: Vec::new(),
                     },
                     ArgValue::Const(6),
                 ],
@@ -4730,8 +6223,10 @@ mod tests {
                                     offset: 0,
                                     value: Box::new(ArgValue::Buffer(vec![1, 2, 3, 4, 5])),
                                 }],
+                                struct_layouts: Vec::new(),
                             }),
                         }],
+                        struct_layouts: Vec::new(),
                     },
                     ArgValue::Const(0),
                 ],
@@ -4769,8 +6264,10 @@ mod tests {
                                     offset: 0,
                                     value: Box::new(ArgValue::Buffer(vec![1, 2, 3, 4, 5])),
                                 }],
+                                struct_layouts: Vec::new(),
                             }),
                         }],
+                        struct_layouts: Vec::new(),
                     },
                     ArgValue::Const(0),
                 ],

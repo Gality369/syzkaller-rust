@@ -15,6 +15,19 @@ const EXEC_ARG_DATA: u64 = 4;
 
 const EXEC_NO_COPYOUT: u64 = !0u64;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PointerPathKey {
+    arg_idx: usize,
+    offsets: Vec<usize>,
+}
+
+fn scalar_endian_exec_format(endian: ScalarEndian) -> u64 {
+    match endian {
+        ScalarEndian::Native => 0,
+        ScalarEndian::Big => 1,
+    }
+}
+
 /// Serialize a program into the executor's binary format.
 /// This matches the varint-encoded format from Go's encodingexec.go.
 pub fn serialize_program(
@@ -37,6 +50,7 @@ pub fn serialize_program(
         let desc = &descs[call.syscall_idx];
         let outputs = resource_outputs(desc);
         let mut data_addrs: Vec<(usize, u64)> = Vec::new(); // (arg_idx, addr)
+        let mut nested_data_addrs: HashMap<PointerPathKey, u64> = HashMap::new();
 
         // First pass: allocate data pages and emit copyin instructions for pointer args
         for (arg_idx, (arg_type, arg_val)) in desc.args.iter().zip(call.args.iter()).enumerate() {
@@ -63,14 +77,20 @@ pub fn serialize_program(
                                 dir: PtrDir::In | PtrDir::InOut,
                                 ..
                             },
-                            ArgValue::Composite { data, pointers },
-                        ) => emit_composite_copyin(
-                            &mut w,
-                            addr,
-                            data,
-                            pointers,
-                            &mut next_data_page,
-                        )?,
+                            ArgValue::Composite { data, pointers, .. },
+                        ) => {
+                            let mut pointer_chain = Vec::new();
+                            emit_composite_copyin(
+                                &mut w,
+                                addr,
+                                data,
+                                pointers,
+                                &mut next_data_page,
+                                arg_idx,
+                                &mut nested_data_addrs,
+                                &mut pointer_chain,
+                            )?
+                        }
                         (
                             ArgType::Ptr {
                                 inner: _,
@@ -78,13 +98,19 @@ pub fn serialize_program(
                                 ..
                             },
                             ArgValue::Array { data, pointers, .. },
-                        ) => emit_composite_copyin(
-                            &mut w,
-                            addr,
-                            data,
-                            pointers,
-                            &mut next_data_page,
-                        )?,
+                        ) => {
+                            let mut pointer_chain = Vec::new();
+                            emit_composite_copyin(
+                                &mut w,
+                                addr,
+                                data,
+                                pointers,
+                                &mut next_data_page,
+                                arg_idx,
+                                &mut nested_data_addrs,
+                                &mut pointer_chain,
+                            )?
+                        }
                         (ArgType::Filename, ArgValue::Filename(name)) => {
                             let data = {
                                 let mut d = name.as_bytes().to_vec();
@@ -136,6 +162,30 @@ pub fn serialize_program(
                     w.write_val(meta_const(*size, 0, 0, 0, 0));
                     w.write_val(*val);
                 }
+                (
+                    ArgType::Proc {
+                        size,
+                        values_start,
+                        values_per_proc,
+                        endian,
+                    },
+                    ArgValue::Const(val),
+                ) => {
+                    let (value, pid_stride) = if *val == PROC_DEFAULT_VALUE {
+                        (0, 0)
+                    } else {
+                        (values_start.wrapping_add(*val), *values_per_proc)
+                    };
+                    w.write_val(EXEC_ARG_CONST);
+                    w.write_val(meta_const(
+                        *size,
+                        scalar_endian_exec_format(*endian),
+                        0,
+                        0,
+                        pid_stride,
+                    ));
+                    w.write_val(value);
+                }
                 (ArgType::Len { size, .. }, ArgValue::Const(val)) => {
                     w.write_val(EXEC_ARG_CONST);
                     w.write_val(meta_const(*size, 0, 0, 0, 0));
@@ -150,12 +200,18 @@ pub fn serialize_program(
                     w.write_val(meta_const(8, 0, 0, 0, 0));
                     w.write_val(0);
                 }
-                (ArgType::Resource(resource), ArgValue::Const(val)) => {
+                (
+                    ArgType::Resource(resource) | ArgType::OptionalResource(resource),
+                    ArgValue::Const(val),
+                ) => {
                     w.write_val(EXEC_ARG_CONST);
                     w.write_val(meta_const(resource.size, 0, 0, 0, 0));
                     w.write_val(*val);
                 }
-                (ArgType::Resource(resource), ArgValue::ResultRef(result_ref)) => {
+                (
+                    ArgType::Resource(resource) | ArgType::OptionalResource(resource),
+                    ArgValue::ResultRef(result_ref),
+                ) => {
                     if let Some(copyout_idx) = resolved_results.get(result_ref).copied() {
                         w.write_val(EXEC_ARG_RESULT);
                         w.write_val(meta_result(resource.size, 0));
@@ -169,7 +225,10 @@ pub fn serialize_program(
                         w.write_val(resource.default_value());
                     }
                 }
-                (ArgType::Resource(resource), ArgValue::Null) => {
+                (
+                    ArgType::Resource(resource) | ArgType::OptionalResource(resource),
+                    ArgValue::Null,
+                ) => {
                     w.write_val(EXEC_ARG_CONST);
                     w.write_val(meta_const(resource.size, 0, 0, 0, 0));
                     w.write_val(resource.default_value());
@@ -231,17 +290,32 @@ pub fn serialize_program(
                 continue;
             }
             if let ResourceSource::PointerElement {
-                arg_idx, offset, ..
+                arg_idx,
+                offset,
+                pointer_chain,
+                ..
             } = output.source
             {
-                let Some((_, base_addr)) = data_addrs.iter().find(|(idx, _)| *idx == arg_idx)
-                else {
+                let base_addr = if pointer_chain.is_empty() {
+                    data_addrs
+                        .iter()
+                        .find(|(idx, _)| *idx == arg_idx)
+                        .map(|(_, addr)| *addr)
+                } else {
+                    nested_data_addrs
+                        .get(&PointerPathKey {
+                            arg_idx,
+                            offsets: pointer_chain,
+                        })
+                        .copied()
+                };
+                let Some(base_addr) = base_addr else {
                     continue;
                 };
                 resolved_results.insert(result_ref, next_copyout_idx);
                 w.write_val(EXEC_INSTR_COPYOUT);
                 w.write_val(next_copyout_idx);
-                w.write_val(*base_addr - DATA_OFFSET + offset as u64);
+                w.write_val(base_addr - DATA_OFFSET + offset as u64);
                 w.write_val(output.resource.size as u64);
                 next_copyout_idx += 1;
             }
@@ -266,18 +340,35 @@ fn emit_arg_value_copyin(
     addr: u64,
     value: &ArgValue,
     next_data_page: &mut u64,
+    root_arg_idx: usize,
+    nested_data_addrs: &mut HashMap<PointerPathKey, u64>,
+    pointer_chain: &mut Vec<usize>,
 ) -> Result<(), ValidationError> {
     match value {
         ArgValue::Buffer(data) => {
             emit_copyin_bytes(w, addr, data);
             Ok(())
         }
-        ArgValue::Composite { data, pointers } => {
-            emit_composite_copyin(w, addr, data, pointers, next_data_page)
-        }
-        ArgValue::Array { data, pointers, .. } => {
-            emit_composite_copyin(w, addr, data, pointers, next_data_page)
-        }
+        ArgValue::Composite { data, pointers, .. } => emit_composite_copyin(
+            w,
+            addr,
+            data,
+            pointers,
+            next_data_page,
+            root_arg_idx,
+            nested_data_addrs,
+            pointer_chain,
+        ),
+        ArgValue::Array { data, pointers, .. } => emit_composite_copyin(
+            w,
+            addr,
+            data,
+            pointers,
+            next_data_page,
+            root_arg_idx,
+            nested_data_addrs,
+            pointer_chain,
+        ),
         ArgValue::Filename(name) => {
             let mut data = name.as_bytes().to_vec();
             data.push(0);
@@ -307,6 +398,9 @@ fn emit_composite_copyin(
     data: &[u8],
     pointers: &[InlinePointerValue],
     next_data_page: &mut u64,
+    root_arg_idx: usize,
+    nested_data_addrs: &mut HashMap<PointerPathKey, u64>,
+    pointer_chain: &mut Vec<usize>,
 ) -> Result<(), ValidationError> {
     let mut patched = data.to_vec();
     for pointer in pointers {
@@ -317,6 +411,8 @@ fn emit_composite_copyin(
         let slot = patched.get_mut(pointer.offset..end).ok_or_else(|| {
             ValidationError::new("inline pointer slot falls outside composite data")
         })?;
+        let mut nested_chain = pointer_chain.clone();
+        nested_chain.push(pointer.offset);
         match pointer.value.as_ref() {
             ArgValue::Null => {
                 slot.copy_from_slice(&0u64.to_le_bytes());
@@ -324,13 +420,35 @@ fn emit_composite_copyin(
             ArgValue::OutPtr => {
                 let nested_addr = DATA_OFFSET + *next_data_page * PAGE_SIZE;
                 *next_data_page += 1;
+                nested_data_addrs.insert(
+                    PointerPathKey {
+                        arg_idx: root_arg_idx,
+                        offsets: nested_chain,
+                    },
+                    nested_addr,
+                );
                 slot.copy_from_slice(&nested_addr.to_le_bytes());
             }
             nested => {
                 let nested_addr = DATA_OFFSET + *next_data_page * PAGE_SIZE;
                 *next_data_page += 1;
+                nested_data_addrs.insert(
+                    PointerPathKey {
+                        arg_idx: root_arg_idx,
+                        offsets: nested_chain.clone(),
+                    },
+                    nested_addr,
+                );
                 slot.copy_from_slice(&nested_addr.to_le_bytes());
-                emit_arg_value_copyin(w, nested_addr, nested, next_data_page)?;
+                emit_arg_value_copyin(
+                    w,
+                    nested_addr,
+                    nested,
+                    next_data_page,
+                    root_arg_idx,
+                    nested_data_addrs,
+                    &mut nested_chain,
+                )?;
             }
         }
     }
@@ -528,7 +646,7 @@ mod tests {
         let copyouts: Vec<(u64, u64)> = events
             .iter()
             .filter_map(|event| match event {
-                ParsedEvent::Copyout { idx, size } => Some((*idx, *size)),
+                ParsedEvent::Copyout { idx, size, .. } => Some((*idx, *size)),
                 _ => None,
             })
             .collect();
@@ -611,6 +729,7 @@ mod tests {
                             offset: 0,
                             value: Box::new(ArgValue::Buffer(payload.clone())),
                         }],
+                        struct_layouts: Vec::new(),
                     },
                     ArgValue::Const(1),
                 ],
@@ -643,6 +762,126 @@ mod tests {
         assert_eq!(&root_copyin.1[8..16], &(payload.len() as u64).to_le_bytes());
     }
 
+    #[test]
+    fn nested_output_pointer_resources_copyout_from_nested_allocation() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                resource handle[intptr]
+                type inner {
+                    h handle
+                }
+                type wrapper {
+                    out ptr[out, inner]
+                }
+                syscall make@1 -> int(arg ptr[inout, wrapper])
+                syscall use@2 -> int(h handle)
+            "#,
+        )
+        .expect("nested output target should parse");
+
+        let prog = Program {
+            calls: vec![
+                Call {
+                    syscall_idx: 0,
+                    args: vec![ArgValue::Composite {
+                        data: vec![0; 8],
+                        pointers: vec![InlinePointerValue {
+                            offset: 0,
+                            value: Box::new(ArgValue::OutPtr),
+                        }],
+                        struct_layouts: Vec::new(),
+                    }],
+                },
+                Call {
+                    syscall_idx: 1,
+                    args: vec![ArgValue::ResultRef(ResultRef {
+                        call_idx: 0,
+                        result_idx: 0,
+                    })],
+                },
+            ],
+        };
+
+        let data = serialize_program(&prog, &descs)
+            .expect("program with nested output pointer resource should serialize");
+        let events = parse_exec_events(&data);
+        let root_copyin = events
+            .iter()
+            .find_map(|event| match event {
+                ParsedEvent::CopyinData { data, .. } if data.len() == 8 => Some(data.clone()),
+                _ => None,
+            })
+            .expect("root wrapper copyin should exist");
+        let nested_absolute_addr = u64::from_le_bytes(root_copyin[..8].try_into().unwrap());
+
+        let copyouts: Vec<(u64, u64, u64)> = events
+            .iter()
+            .filter_map(|event| match event {
+                ParsedEvent::Copyout { idx, addr, size } => Some((*idx, *addr, *size)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(copyouts, vec![(0, nested_absolute_addr - DATA_OFFSET, 8)]);
+
+        let result_args: Vec<(u64, u64)> = events
+            .iter()
+            .filter_map(|event| match event {
+                ParsedEvent::ResultArg {
+                    copyout_idx,
+                    default,
+                    ..
+                } => Some((*copyout_idx, *default)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(result_args, vec![(0, 0)]);
+    }
+
+    #[test]
+    fn test_proc_argument_encodes_pid_stride() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                syscall use_proc@1 -> int(id proc[100, 4])
+            "#,
+        )
+        .expect("proc-bearing target should parse");
+
+        let prog = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![ArgValue::Const(0)],
+            }],
+        };
+        let data = serialize_program(&prog, &descs).expect("proc program should serialize");
+        let events = parse_exec_events(&data);
+        let const_args = events
+            .iter()
+            .filter_map(|event| match event {
+                ParsedEvent::ConstArg { meta, value } => Some((*meta, *value)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(const_args, vec![(8 | (4 << 32), 100)]);
+
+        let default_prog = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![ArgValue::Const(PROC_DEFAULT_VALUE)],
+            }],
+        };
+        let default_data = serialize_program(&default_prog, &descs)
+            .expect("default proc program should serialize");
+        let default_events = parse_exec_events(&default_data);
+        let default_const_args = default_events
+            .iter()
+            .filter_map(|event| match event {
+                ParsedEvent::ConstArg { meta, value } => Some((*meta, *value)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(default_const_args, vec![(8, 0)]);
+    }
+
     #[derive(Debug, PartialEq, Eq)]
     enum ParsedEvent {
         CallReturnCopyout {
@@ -666,6 +905,7 @@ mod tests {
         },
         Copyout {
             idx: u64,
+            addr: u64,
             size: u64,
         },
     }
@@ -685,9 +925,9 @@ mod tests {
                 }
                 EXEC_INSTR_COPYOUT => {
                     let idx = read_exec_value(data, &mut index);
-                    let _addr = read_exec_value(data, &mut index);
+                    let addr = read_exec_value(data, &mut index);
                     let size = read_exec_value(data, &mut index);
-                    events.push(ParsedEvent::Copyout { idx, size });
+                    events.push(ParsedEvent::Copyout { idx, addr, size });
                 }
                 EXEC_INSTR_SET_PROPS => {
                     panic!("call properties are not expected in current tests");

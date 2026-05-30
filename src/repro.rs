@@ -749,13 +749,14 @@ fn format_program_arg(arg: &ArgValue, arg_type: &ArgType) -> String {
         }) => format!("result_from_call_{call_idx}_{result_idx}"),
         ArgValue::Filename(name) => format!("{name:?}"),
         ArgValue::Buffer(data) => format!("buf[{}]", data.len()),
-        ArgValue::Composite { data, pointers } => {
+        ArgValue::Composite { data, pointers, .. } => {
             format!("obj[{};+{}ptr]", data.len(), pointers.len())
         }
         ArgValue::Array {
             data,
             pointers,
             element_sizes,
+            ..
         } => format!(
             "arr[{};+{}ptr;{}elts]",
             data.len(),
@@ -1091,7 +1092,10 @@ fn default_arg_value_for_type(arg_type: &ArgType) -> Result<ArgValue, String> {
                 .or_else(|| range.map(|(min, _)| min))
                 .unwrap_or(0),
         )),
-        ArgType::Resource(resource) => Ok(ArgValue::Const(resource.default_value())),
+        ArgType::Proc { .. } => Ok(ArgValue::Const(0)),
+        ArgType::Resource(resource) | ArgType::OptionalResource(resource) => {
+            Ok(ArgValue::Const(resource.default_value()))
+        }
         ArgType::Len { .. } => Ok(ArgValue::Const(0)),
         ArgType::Filename => Ok(ArgValue::Filename("repro".to_string())),
         ArgType::String {
@@ -1151,6 +1155,16 @@ fn default_arg_value_for_type(arg_type: &ArgType) -> Result<ArgValue, String> {
 fn default_buffer_for_inner(arg_type: &ArgType) -> Result<Vec<u8>, String> {
     match arg_type {
         ArgType::Buffer { min_size, .. } => Ok(vec![0; *min_size]),
+        ArgType::Proc {
+            size,
+            values_start,
+            endian,
+            ..
+        } => Ok(program::encode_scalar_bytes_endian(
+            *size,
+            *values_start,
+            *endian,
+        )),
         ArgType::String {
             values,
             noz,
@@ -1184,9 +1198,9 @@ fn default_buffer_for_inner(arg_type: &ArgType) -> Result<Vec<u8>, String> {
             Ok(bytes)
         }
         ArgType::Vma { .. } => Ok(vec![0; 8]),
-        ArgType::Const { size, .. } | ArgType::Resource(program::ResourceDesc { size, .. }) => {
-            Ok(vec![0; *size])
-        }
+        ArgType::Const { size, .. }
+        | ArgType::Resource(program::ResourceDesc { size, .. })
+        | ArgType::OptionalResource(program::ResourceDesc { size, .. }) => Ok(vec![0; *size]),
         ArgType::Ptr { inner, .. } => default_buffer_for_inner(inner),
     }
 }

@@ -111,7 +111,10 @@ fn sample_syscall_names(
         .collect()
 }
 
-fn build_target_summary(description_path: Option<&str>, limit: usize) -> Result<TargetSummary, String> {
+fn build_target_summary(
+    description_path: Option<&str>,
+    limit: usize,
+) -> Result<TargetSummary, String> {
     let sample_limit = limit.max(1);
     let descs = program::load_syscall_descs(description_path)?;
     let enabled = program::transitively_enabled_syscalls(&descs);
@@ -170,7 +173,10 @@ fn build_target_summary(description_path: Option<&str>, limit: usize) -> Result<
         total_syscalls: descs.len(),
         transitively_enabled_syscalls: enabled.enabled.len(),
         transitively_generatable_syscalls: generatable.enabled.len(),
-        enabled_but_not_generatable_syscalls: enabled.enabled.len().saturating_sub(generatable.enabled.len()),
+        enabled_but_not_generatable_syscalls: enabled
+            .enabled
+            .len()
+            .saturating_sub(generatable.enabled.len()),
         explicitly_disabled_syscalls,
         no_generate_syscalls,
         automatic_helper_syscalls,
@@ -184,9 +190,7 @@ fn build_target_summary(description_path: Option<&str>, limit: usize) -> Result<
 
 fn run_target_summary_cli(args: &[String]) -> Result<(), String> {
     if args.len() > 2 {
-        return Err(
-            "Usage: target-summary [builtin|<description-path>] [limit]".to_string(),
-        );
+        return Err("Usage: target-summary [builtin|<description-path>] [limit]".to_string());
     }
 
     let (description_path, limit) = match args {
@@ -432,10 +436,16 @@ mod tests {
         assert_eq!(summary.source, "builtin:linux/amd64-minimal");
         assert_eq!(summary.total_syscalls, descs.len());
         assert_eq!(summary.transitively_enabled_syscalls, enabled.enabled.len());
-        assert_eq!(summary.transitively_generatable_syscalls, generatable.enabled.len());
+        assert_eq!(
+            summary.transitively_generatable_syscalls,
+            generatable.enabled.len()
+        );
         assert_eq!(
             summary.enabled_but_not_generatable_syscalls,
-            enabled.enabled.len().saturating_sub(generatable.enabled.len())
+            enabled
+                .enabled
+                .len()
+                .saturating_sub(generatable.enabled.len())
         );
         assert!(summary.enabled_sample.len() <= 3);
         assert!(summary.generatable_sample.len() <= 3);
