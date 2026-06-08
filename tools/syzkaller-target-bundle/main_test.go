@@ -92,6 +92,24 @@ func TestBuildBundleExportsSimpleFilteredSyscall(t *testing.T) {
 	}
 }
 
+func TestBuildBundleExportsCheckedInLinuxCoreManifest(t *testing.T) {
+	allowed, err := readAllowedSyscallsFile("../../data/target-bundles/linux-amd64-core.syscalls")
+	if err != nil {
+		t.Fatalf("readAllowedSyscallsFile failed: %v", err)
+	}
+
+	doc, err := buildBundle("linux", "amd64", allowed)
+	if err != nil {
+		t.Fatalf("buildBundle failed: %v", err)
+	}
+	if doc.ExportSummary.SkippedSyscalls != 0 {
+		t.Fatalf("expected core manifest to export without skips, got %+v", doc.ExportSummary)
+	}
+	if len(doc.Syscalls) != 41 {
+		t.Fatalf("expected 41 exported syscalls, got %d", len(doc.Syscalls))
+	}
+}
+
 func TestBuildBundleExportsResourceAndScalarSyscalls(t *testing.T) {
 	doc, err := buildBundle("linux", "amd64", []string{"close", "socket"})
 	if err != nil {
