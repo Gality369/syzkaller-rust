@@ -33,6 +33,8 @@ const DEFAULT_SMOKE_MAX_EXECS: u64 = 32;
 const DEFAULT_SMOKE_BUNDLE: &str = "data/target-bundles/linux-amd64-core.json";
 const DEFAULT_SMOKE_SUITE_DESCRIPTIONS: &[&str] = &[
     "descriptions/linux/file-subset.txt",
+    "descriptions/linux/path-info-subset.txt",
+    "descriptions/linux/dirent-subset.txt",
     "descriptions/linux/pipe-io-subset.txt",
     "descriptions/linux/msg-io-subset.txt",
     "descriptions/linux/recvmsg-io-subset.txt",
@@ -1396,6 +1398,8 @@ mod tests {
             descriptions,
             vec![
                 "descriptions/linux/file-subset.txt".to_string(),
+                "descriptions/linux/path-info-subset.txt".to_string(),
+                "descriptions/linux/dirent-subset.txt".to_string(),
                 "descriptions/linux/pipe-io-subset.txt".to_string(),
                 "descriptions/linux/msg-io-subset.txt".to_string(),
                 "descriptions/linux/recvmsg-io-subset.txt".to_string(),

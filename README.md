@@ -55,49 +55,115 @@ cargo build --release
 
 ## Configuration
 
-Edit `config.json`:
+Start from the checked-in template and keep your machine-specific paths in an
+untracked local file:
+
+```bash
+cp config.example.json config.local.json
+```
+
+Then edit `config.local.json`:
+
+`config.example.json` already includes the recommended Linux core bundle target:
+`data/target-bundles/linux-amd64-core.json`.
+
+`max_execs` is optional. When set, the manager exits cleanly after that many
+execution requests (including timed out ones), which is useful for bounded smoke tests and scripted
+end-to-end checks.
+
+`target_bundle` is also optional. When present, the runtime loads exported JSON
+target metadata instead of `syscall_descriptions`:
 
 ```json
 {
-    "workdir": "/path/to/workdir",
-    "kernel_obj": "/path/to/linux-6.8",
-    "image": "/path/to/bullseye.img",
-    "sshkey": "/path/to/bullseye.id_rsa",
-    "ssh_user": "root",
-    "executor": "/path/to/syz-executor",
-    "procs": 1,
-    "sandbox": "none",
-    "cover": true,
-    "syscall_timeout_ms": 500,
-    "program_timeout_ms": 5000,
-    "slowdown": 1,
-    "max_execs": 1,
-    "vm": {
-        "count": 1,
-        "kernel": "/path/to/bzImage",
-        "cpu": 2,
-        "mem": 2048,
-        "qemu": "qemu-system-x86_64",
-        "cmdline": "console=ttyS0 root=/dev/sda earlyprintk=serial net.ifnames=0"
-    }
+    "target_bundle": "data/target-bundles/linux-amd64-core.json"
 }
 ```
-
-`max_execs` is optional. When set, the manager exits cleanly after that many
-completed executions, which is useful for bounded smoke tests and scripted
-end-to-end checks.
 
 ## Running
 
 ```bash
-RUST_LOG=info ./target/release/syzkaller-rust config.json
+RUST_LOG=info ./target/release/syzkaller-rust config.local.json
 ```
 
 Log levels: `error` / `warn` / `info` / `debug`.
 
+## Smoke Run
+
+For a bounded end-to-end smoke run, use the dedicated CLI wrapper instead of
+editing `config.json` by hand:
+
+```bash
+RUST_LOG=info ./target/release/syzkaller-rust smoke config.local.json
+```
+
+By default this:
+
+- forces `max_execs=32`
+- uses `data/target-bundles/linux-amd64-core.json` when the config does not
+  already specify `target_bundle` or `syscall_descriptions`
+- validates the configured kernel/image/executor/QEMU paths before starting
+- runs inside a clean per-target workdir at
+  `<workdir>/smoke/<target-slug>`, resetting that directory before each run
+- prints a JSON summary after the bounded run completes
+
+That keeps bounded smoke corpus and crash artifacts separate from any longer
+running fuzz session that uses the base `workdir`.
+
+For a multi-target regression pass with isolated per-target workdirs, use the
+suite wrapper:
+
+```bash
+RUST_LOG=info ./target/release/syzkaller-rust smoke-suite config.local.json
+```
+
+By default this runs:
+
+- `descriptions/linux/file-subset.txt`
+- `descriptions/linux/path-info-subset.txt`
+- `descriptions/linux/dirent-subset.txt`
+- `descriptions/linux/pipe-io-subset.txt`
+- `descriptions/linux/msg-io-subset.txt`
+- `descriptions/linux/recvmsg-io-subset.txt`
+- `descriptions/linux/recvmmsg-io-subset.txt`
+- `descriptions/linux/dgram-io-subset.txt`
+- `descriptions/linux/socket-io-subset.txt`
+- `descriptions/linux/sockopt-buf-subset.txt`
+- `descriptions/linux/sock-ifreq-subset.txt`
+- `descriptions/linux/sock-ifconf-subset.txt`
+- `descriptions/linux/sock-ethtool-subset.txt`
+- `descriptions/linux/pipe-fionread-subset.txt`
+- `descriptions/linux/accept-connect-subset.txt`
+- `descriptions/linux/socket-subset.txt`
+- `descriptions/linux/image-subset.txt`
+- `descriptions/linux/mm-subset.txt`
+- `descriptions/linux/process-subset.txt`
+
+Each target gets its own clean workdir under `workdir/smoke-suite/<slug>`, so
+corpus and artifact summaries do not bleed across targets.
+
+You can override either one:
+
+```bash
+RUST_LOG=info ./target/release/syzkaller-rust smoke config.local.json 8
+RUST_LOG=info ./target/release/syzkaller-rust smoke config.local.json 8 descriptions/linux/socket-io-subset.txt
+RUST_LOG=info ./target/release/syzkaller-rust smoke config.local.json 1 descriptions/linux/image-subset.txt
+RUST_LOG=info ./target/release/syzkaller-rust smoke config.local.json 4 bundle:data/target-bundles/linux-amd64-core.json
+RUST_LOG=info ./target/release/syzkaller-rust smoke-suite config.local.json 4 descriptions/linux/mm-subset.txt descriptions/linux/process-subset.txt
+RUST_LOG=info ./target/release/syzkaller-rust smoke-suite config.local.json 1 descriptions/linux/socket-io-subset.txt
+```
+
 The following directories are created under `workdir/` at runtime:
 - `crashes/` — kernel crash reports (console output)
 - `timeouts/` — timed-out or executor-reported hanged programs, including their syscall shape and timeout-prone edge profile, for later triage
+
+Timeout artifacts also preserve the latest guest serial tail, and when available
+the `syz-executor` SSH stdout/stderr stream, so executor-side hangs can be
+triaged without rerunning the whole smoke target immediately.
+
+Timeout and hang artifacts now also include a lightweight per-request trace
+showing whether the manager observed `Executing`, opaque `State`, or
+`ExecResult` messages before the request stalled.
 
 ## FlatRPC Protocol
 
@@ -132,13 +198,40 @@ uint64  EXEC_INSTR_EOF   // !0u64 end marker
 
 > **Important**: `syscall_id` is the index into the executor's `syscalls[]` table for the target platform, **not** the Linux syscall number (NR). For example, `read` has syzkaller ID `5186` on linux/amd64 in the current bundled target, while its Linux NR is `0`.
 
-## Supported Syscalls
+## Target Bundles
 
-A minimal subset of ~20 syscalls for linux/amd64, covering filesystem operations, network sockets, and memory management:
+The repository now ships two checked-in Linux bundle fixtures:
 
-`openat`, `close`, `read`, `write`, `writev`, `sendmsg`, `sendmmsg`, `recvmsg`, `pipe2`, `dup3`, `socket`, `socketpair`, `listen`, `eventfd2`,  
-`mmap`, `munmap`, `mprotect`, `mkdirat`, `unlinkat`, `fstat`, `getcwd`,  
-`getpid`, `getuid`, `ioctl`
+- `data/target-bundles/linux-amd64-smoke.json`
+  - the narrow 27-syscall smoke seed used to prove out the original bundle path
+- `data/target-bundles/linux-amd64-core.json`
+  - the curated 41-syscall Linux core target that the bounded `smoke` command
+    now uses by default
+
+The `linux-amd64-core` target currently includes:
+
+`accept`, `bind`, `close`, `connect`, `dup3`, `eventfd2`, `fstat`, `getcwd`, `getegid`, `geteuid`, `getgid`, `getpgid`, `getpid`, `getsockopt`, `gettid`, `getuid`, `ioctl`, `listen`, `lseek`, `madvise`, `mkdirat`, `mmap`, `mprotect`, `mremap`, `msync`, `munmap`, `newfstatat`, `openat`, `pipe2`, `pread64`, `pwrite64`, `read`, `recvmsg`, `sendmmsg`, `sendmsg`, `setpgid`, `setsockopt`, `socket`, `socketpair`, `write`, `writev`
+
+To regenerate the curated core bundle from upstream syzkaller target metadata:
+
+```bash
+cd tools/syzkaller-target-bundle
+go run . \
+  --syscalls-file ../../data/target-bundles/linux-amd64-core.syscalls \
+  --output ../../data/target-bundles/linux-amd64-core.json
+```
+
+You can inspect bundle coverage without booting a VM:
+
+```bash
+cargo run --quiet -- target-summary bundle:data/target-bundles/linux-amd64-core.json 12
+```
+
+Recommended bounded Linux run:
+
+```bash
+RUST_LOG=info ./target/release/syzkaller-rust smoke config.local.json 128 bundle:data/target-bundles/linux-amd64-core.json
+```
 
 ## Description DSL
 
@@ -220,9 +313,58 @@ plus its sibling `socket-subset.txt.const`. That target now uses a structured
 
 For a more aggressive parser/executor target that also includes direct
 `buffer[in|out]` socket I/O shapes like `sendto$inet` and `recvfrom$inet`, see
-`descriptions/linux/socket-io-subset.txt`. That target currently keeps
-`recvfrom$inet` marked `no_generate` so bounded smoke runs can still exercise
-the parser and serializer without defaulting into a blocking receive loop.
+`descriptions/linux/socket-io-subset.txt`. That target is now a narrowed
+AF_INET datagram subset with `recvfrom$inet` kept `no_generate`, so bounded
+smoke runs can probe real inet serialization without immediately defaulting
+into a receive loop. It is back in the default `smoke-suite` matrix after
+fixing top-level bare `buffer[in]` exec encoding for `sendto$inet`; bounded
+smoke now runs cleanly on the current QEMU/manager setup.
+
+If you want the older, broader socket lifecycle pressure target, see
+`descriptions/linux/socket-io-stress-subset.txt`, which preserves the previous
+include-based `socket/bind/connect/listen/accept/sendto/recvfrom` mix for
+parser and resource-chain probing. It is still kept out of the default
+`smoke-suite` matrix to avoid overlap with the narrower socket targets, but the
+current bounded smoke path now runs it cleanly as a targeted stress check too.
+
+For a minimal generic sockopt data-path target that exercises direct
+`setsockopt(buffer[in])` / `getsockopt(buffer[out])` arguments on plain
+syscalls rather than typed pointer wrappers, see
+`descriptions/linux/sockopt-buf-subset.txt`.
+
+For a minimal socket ioctl data-path target that exercises `ptr[inout, ifreq]`
+style payloads on real network ioctls, see
+`descriptions/linux/sock-ifreq-subset.txt`.
+
+For a nested socket ioctl data-path target that exercises `ptr[inout, struct]`
+where the struct itself contains a nested `ptr[inout, buffer]`, see
+`descriptions/linux/sock-ifconf-subset.txt`.
+
+For a nested socket ioctl target that exercises `ptr[inout, ifreq]` where the
+payload field itself is a typed `ptr[inout, struct]`, see
+`descriptions/linux/sock-ethtool-subset.txt`.
+
+For a minimal top-level `buffer[inout]` target on a stable kernel interface,
+see `descriptions/linux/pipe-fionread-subset.txt`, which uses `pipe2` plus
+`ioctl(FIONREAD)` on the read end.
+
+For execution-side smoke coverage beyond files, sockets, and image helpers, the
+repository also includes:
+
+- `descriptions/linux/pipe-io-subset.txt` for `pipe2` / `writev` / `close`
+- `descriptions/linux/file-subset.txt` for `openat(O_RDWR|O_CREAT|O_TRUNC)` / `write(buffer[in])` / `pwrite64(buffer[in])` / `lseek(SEEK_SET)` / `read(buffer[out])` / `pread64(buffer[out])` / `readv(iovec_out)` / `preadv(iovec_out)` / `close`
+- `descriptions/linux/msg-io-subset.txt` for `socketpair` / `sendmsg` / `sendmmsg` / `close`
+- `descriptions/linux/recvmsg-io-subset.txt` for `socketpair` / `sendmsg` / `recvmsg(MSG_DONTWAIT)`
+- `descriptions/linux/recvmmsg-io-subset.txt` for `socketpair` / `sendmmsg` / `recvmmsg(MSG_DONTWAIT)`
+- `descriptions/linux/dgram-io-subset.txt` for `socketpair` / `sendto` / `recvfrom(MSG_DONTWAIT)`
+- `descriptions/linux/sockopt-buf-subset.txt` for generic `socketpair` / `setsockopt(buffer[in])` / `getsockopt(buffer[out])` / `close`
+- `descriptions/linux/sock-ifreq-subset.txt` for `socket$inet` / `ioctl(SIOCGIFINDEX)` / `ioctl(SIOCGIFMTU)` / `close` over a fixed `lo` ifreq payload
+- `descriptions/linux/sock-ifconf-subset.txt` for `socket$inet` / `ioctl(SIOCGIFCONF)` / `close` over an `ifconf`-style nested inout buffer payload
+- `descriptions/linux/sock-ethtool-subset.txt` for `socket$inet` / `ioctl(SIOCETHTOOL)` / `close` over `ifreq` payloads whose `ifr_data` field is a typed nested `ptr[inout, ethtool_drvinfo]`, `ptr[inout, ethtool_wolinfo]`, `ptr[inout, ethtool_regs]`, `ptr[inout, ethtool_eeprom]`, `ptr[inout, ethtool_tunable_u32]`, `ptr[inout, ethtool_value]`, `ptr[inout, ethtool_msglvl_value]`, `ptr[inout, ethtool_rx_csum_value]`, `ptr[inout, ethtool_tx_csum_value]`, `ptr[inout, ethtool_gro_value]`, `ptr[inout, ethtool_sg_value]`, `ptr[inout, ethtool_tso_value]`, `ptr[inout, ethtool_ufo_value]`, `ptr[inout, ethtool_gso_value]`, `ptr[inout, ethtool_flags_value]`, `ptr[inout, ethtool_pflags_value]`, `ptr[inout, ethtool_rxfh_indir_min]`, `ptr[inout, ethtool_rxfh_min]`, `ptr[inout, ethtool_rxfh_keyed]`, `ptr[inout, ethtool_rxnfc_hash_min]`, `ptr[inout, ethtool_rxnfc_rule_query_min]`, `ptr[inout, ethtool_rxnfc_tcp_v4_query_min]`, `ptr[inout, ethtool_rxnfc_tcp_v4_ext_query_min]`, `ptr[inout, ethtool_rxnfc_tcp_v4_mac_ext_query_min]`, `ptr[inout, ethtool_rxnfc_rss_query_min]`, `ptr[inout, ethtool_rxnfc_rings_min]`, `ptr[inout, ethtool_rxnfc_rule_cnt_min]`, `ptr[inout, ethtool_rxnfc_rule_locs_min]`, `ptr[inout, ethtool_pauseparam]`, `ptr[inout, ethtool_gstrings]`, `ptr[inout, ethtool_gfeatures]`, `ptr[inout, ethtool_channels]`, `ptr[inout, ethtool_coalesce]`, `ptr[inout, ethtool_ringparam]`, `ptr[inout, ethtool_modinfo]`, `ptr[inout, ethtool_module_eeprom]`, `ptr[inout, ethtool_eee]`, `ptr[inout, ethtool_ts_info]`, `ptr[inout, ethtool_link_settings_min]`, `ptr[inout, ethtool_sset_info]`, `ptr[inout, ethtool_stats]`, or `ptr[inout, ethtool_perm_addr]`
+- `descriptions/linux/pipe-fionread-subset.txt` for `pipe2` / `write` / `ioctl(FIONREAD, buffer[inout])` / `close`
+- `descriptions/linux/accept-connect-subset.txt` for nonblocking `socket/setsockopt(SO_REUSEADDR)/bind/listen/connect/accept/accept4/getsockname/getpeername/getsockopt(SO_ERROR)/shutdown/close` over loopback TCP
+- `descriptions/linux/mm-subset.txt` for `mmap` / `mprotect` / `madvise` / `msync` / `mremap` / `munmap`
+- `descriptions/linux/process-subset.txt` for `getpid` / `gettid` / `getpgid` / `setpgid`
 
 ## Known Limitations
 
