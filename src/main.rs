@@ -114,6 +114,12 @@ struct SmokeSuiteSummary {
     runs: Vec<SmokeSummary>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SmokeRunMetadata {
+    target_label: String,
+    workdir: PathBuf,
+}
+
 fn print_main_usage(program: &str) {
     eprintln!(
         "Usage:\n  {program} <config.json>\n  {program} smoke <config.json> [max_execs] [target]\n  {program} smoke-suite <config.json> [max_execs] [target ...]\n  {program} target-summary [builtin|bundle:<path>|<description-path>] [limit]\n  {program} repro-queue <command> ...\n  {program} repro-worker <command> ...\n\nSmoke commands:\n  {program} smoke <config.json>\n  {program} smoke <config.json> [max_execs]\n  {program} smoke <config.json> [max_execs] [target]\n  {program} smoke-suite <config.json>\n  {program} smoke-suite <config.json> [max_execs]\n  {program} smoke-suite <config.json> [max_execs] [target ...]\n\nTarget inspection commands:\n  {program} target-summary\n  {program} target-summary builtin [limit]\n  {program} target-summary bundle:<path> [limit]\n  {program} target-summary <description-path> [limit]\n\nRepro queue commands:\n  {program} repro-queue sync <workdir>\n  {program} repro-queue status <workdir> [limit]\n  {program} repro-queue peek <workdir>\n  {program} repro-queue claim <workdir> <worker_id> [lease_secs]\n  {program} repro-queue release <workdir> <artifact_type> <signature> <worker_id>\n  {program} repro-queue requeue <workdir> <artifact_type> <signature> <worker_id> <outcome>\n  {program} repro-queue attempt <workdir> <artifact_type> <signature> <outcome>\n\nRepro worker commands:\n  {program} repro-worker run-once <config.json> <worker_id> [lease_secs] [max_replay_attempts]\n  {program} repro-worker run-batch <config.json> <worker_id> [max_items] [lease_secs] [max_replay_attempts]"
@@ -444,6 +450,10 @@ fn build_smoke_summary(cfg: &config::Config) -> Result<SmokeSummary, String> {
     })
 }
 
+fn smoke_target_slug(target_label: &str) -> String {
+    smoke_suite_slug(target_label)
+}
+
 fn smoke_suite_slug(description: &str) -> String {
     let mut slug = description
         .chars()
@@ -470,6 +480,12 @@ fn smoke_suite_workdir(base_workdir: &str, description: &str) -> PathBuf {
     Path::new(base_workdir)
         .join("smoke-suite")
         .join(smoke_suite_slug(description))
+}
+
+fn smoke_workdir(base_workdir: &str, target_label: &str) -> PathBuf {
+    Path::new(base_workdir)
+        .join("smoke")
+        .join(smoke_target_slug(target_label))
 }
 
 fn reset_smoke_workdir(workdir: &Path) -> Result<(), String> {
@@ -512,6 +528,18 @@ fn resolve_smoke_suite_args(args: &[String]) -> Result<(Option<u64>, Vec<String>
     Ok((max_execs_override, descriptions))
 }
 
+fn derive_smoke_run_metadata(
+    cfg: &config::Config,
+    target_override: Option<&str>,
+) -> Result<SmokeRunMetadata, String> {
+    let target_source = target::TargetSource::from_config(cfg, target_override)?;
+    let target_label = target_source.display_label();
+    Ok(SmokeRunMetadata {
+        workdir: smoke_workdir(&cfg.workdir, &target_label),
+        target_label,
+    })
+}
+
 fn run_smoke_cli(args: &[String]) -> Result<(), String> {
     if args.is_empty() || args.len() > 3 {
         return Err("Usage: smoke <config.json> [max_execs] [target]".to_string());
@@ -525,24 +553,23 @@ fn run_smoke_cli(args: &[String]) -> Result<(), String> {
         None
     };
     let description_override = args.get(2).map(String::as_str);
-    let cfg = build_smoke_config(cfg, max_execs_override, description_override)?;
+    let mut cfg = build_smoke_config(cfg, max_execs_override, description_override)?;
+    let metadata = derive_smoke_run_metadata(&cfg, None)?;
+    cfg.workdir = metadata.workdir.display().to_string();
+    reset_smoke_workdir(&metadata.workdir)?;
     validate_smoke_prerequisites(&cfg)?;
 
     println!(
         "Starting smoke run: max_execs={} descriptions={} workdir={}",
         cfg.max_execs.unwrap_or(DEFAULT_SMOKE_MAX_EXECS),
-        cfg.syscall_descriptions
-            .as_deref()
-            .unwrap_or("builtin:linux/amd64-minimal"),
+        metadata.target_label,
         cfg.workdir
     );
 
     log::info!(
         "Starting smoke run with max_execs={} descriptions={}",
         cfg.max_execs.unwrap_or(DEFAULT_SMOKE_MAX_EXECS),
-        cfg.syscall_descriptions
-            .as_deref()
-            .unwrap_or("builtin:linux/amd64-minimal")
+        metadata.target_label
     );
 
     manager::run(cfg.clone()).map_err(|err| format!("Smoke run failed: {err}"))?;
@@ -820,8 +847,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_smoke_config, build_smoke_summary, build_target_summary, resolve_smoke_suite_args,
-        smoke_suite_workdir, validate_smoke_prerequisites, SmokeSummary, TargetDisabledSyscall,
+        build_smoke_config, build_smoke_summary, build_target_summary,
+        derive_smoke_run_metadata, resolve_smoke_suite_args, smoke_suite_workdir,
+        validate_smoke_prerequisites, SmokeSummary, TargetDisabledSyscall,
         DEFAULT_SMOKE_BUNDLE, DEFAULT_SMOKE_MAX_EXECS,
     };
     use crate::config::{Config, VmConfig};
@@ -1069,6 +1097,17 @@ mod tests {
         assert_eq!(summary.transitively_enabled_syscalls, 41);
         assert_eq!(summary.transitively_generatable_syscalls, 41);
         assert_eq!(summary.enabled_but_not_generatable_syscalls, 0);
+    }
+
+    #[test]
+    fn target_summary_loads_path_info_subset() {
+        let summary = build_target_summary(Some("descriptions/linux/path-info-subset.txt"), 2)
+            .expect("path-info subset should load");
+
+        assert_eq!(summary.source, "descriptions/linux/path-info-subset.txt");
+        assert_eq!(summary.total_syscalls, 3);
+        assert_eq!(summary.transitively_enabled_syscalls, 3);
+        assert_eq!(summary.transitively_generatable_syscalls, 3);
     }
 
     #[test]
@@ -1390,6 +1429,49 @@ mod tests {
         assert_ne!(mm, proc);
         assert!(mm.starts_with("/tmp/workdir/smoke-suite"));
         assert!(proc.starts_with("/tmp/workdir/smoke-suite"));
+    }
+
+    #[test]
+    fn smoke_run_label_prefers_bundle_source() {
+        let metadata = derive_smoke_run_metadata(
+            &test_config(),
+            Some("bundle:data/target-bundles/linux-amd64-core.json"),
+        )
+        .expect("bundle smoke metadata should resolve");
+
+        assert_eq!(
+            metadata.target_label,
+            "bundle:data/target-bundles/linux-amd64-core.json"
+        );
+    }
+
+    #[test]
+    fn smoke_workdir_uses_target_specific_subdirectory() {
+        let metadata = derive_smoke_run_metadata(
+            &test_config(),
+            Some("bundle:data/target-bundles/linux-amd64-core.json"),
+        )
+        .expect("bundle smoke metadata should resolve");
+
+        assert_eq!(
+            metadata.workdir,
+            PathBuf::from("/tmp/workdir")
+                .join("smoke")
+                .join("bundle-data-target-bundles-linux-amd64-core-json")
+        );
+    }
+
+    #[test]
+    fn smoke_summary_reports_resolved_bundle_source() {
+        let mut cfg = smoke_ready_config();
+        cfg.target_bundle = Some("data/target-bundles/linux-amd64-core.json".into());
+        cfg.syscall_descriptions = None;
+        let summary = build_smoke_summary(&cfg).expect("bundle smoke summary should build");
+
+        assert_eq!(
+            summary.descriptions,
+            "bundle:data/target-bundles/linux-amd64-core.json"
+        );
     }
 
     #[test]

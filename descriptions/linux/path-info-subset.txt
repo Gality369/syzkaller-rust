@@ -1,0 +1,9 @@
+const AT_FDCWD = -100
+
+type stat_buf_out {
+    bytes array[int8, 144]
+} [size[144]]
+
+getcwd(buf buffer[out], size bytesize[buf, intptr])
+newfstatat(dirfd const[AT_FDCWD, int32], path ptr[in, glob["/proc/self/exe"]], stat ptr[out, stat_buf_out], flags const[0, int32])
+readlinkat(dirfd const[AT_FDCWD, int32], path ptr[in, glob["/proc/self/cwd"]], buf buffer[out], bufsiz bytesize[buf, int32])
