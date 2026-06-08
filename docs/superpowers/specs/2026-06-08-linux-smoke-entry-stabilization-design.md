@@ -152,7 +152,6 @@ normal way to run Linux fuzzing.
 
 Concretely:
 
-- add a tracked `config.example.json` with placeholder paths
 - add a tracked `config.example.json` with example paths
 - extend `.gitignore` to ignore local runtime files such as:
   - `config.local.json`
