@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 
 const DEFAULT_TARGET_SUMMARY_LIMIT: usize = 10;
 const DEFAULT_SMOKE_MAX_EXECS: u64 = 32;
-const DEFAULT_SMOKE_DESCRIPTION: &str = "descriptions/linux/socket-subset.txt";
+const DEFAULT_SMOKE_BUNDLE: &str = "data/target-bundles/linux-amd64-core.json";
 const DEFAULT_SMOKE_SUITE_DESCRIPTIONS: &[&str] = &[
     "descriptions/linux/file-subset.txt",
     "descriptions/linux/pipe-io-subset.txt",
@@ -116,7 +116,7 @@ struct SmokeSuiteSummary {
 
 fn print_main_usage(program: &str) {
     eprintln!(
-        "Usage:\n  {program} <config.json>\n  {program} smoke <config.json> [max_execs] [description-path]\n  {program} smoke-suite <config.json> [max_execs] [description-path ...]\n  {program} target-summary [builtin|<description-path>] [limit]\n  {program} repro-queue <command> ...\n  {program} repro-worker <command> ...\n\nSmoke commands:\n  {program} smoke <config.json>\n  {program} smoke <config.json> [max_execs]\n  {program} smoke <config.json> [max_execs] [description-path]\n  {program} smoke-suite <config.json>\n  {program} smoke-suite <config.json> [max_execs]\n  {program} smoke-suite <config.json> [max_execs] [description-path ...]\n\nTarget inspection commands:\n  {program} target-summary\n  {program} target-summary builtin [limit]\n  {program} target-summary <description-path> [limit]\n\nRepro queue commands:\n  {program} repro-queue sync <workdir>\n  {program} repro-queue status <workdir> [limit]\n  {program} repro-queue peek <workdir>\n  {program} repro-queue claim <workdir> <worker_id> [lease_secs]\n  {program} repro-queue release <workdir> <artifact_type> <signature> <worker_id>\n  {program} repro-queue requeue <workdir> <artifact_type> <signature> <worker_id> <outcome>\n  {program} repro-queue attempt <workdir> <artifact_type> <signature> <outcome>\n\nRepro worker commands:\n  {program} repro-worker run-once <config.json> <worker_id> [lease_secs] [max_replay_attempts]\n  {program} repro-worker run-batch <config.json> <worker_id> [max_items] [lease_secs] [max_replay_attempts]"
+        "Usage:\n  {program} <config.json>\n  {program} smoke <config.json> [max_execs] [target]\n  {program} smoke-suite <config.json> [max_execs] [target ...]\n  {program} target-summary [builtin|bundle:<path>|<description-path>] [limit]\n  {program} repro-queue <command> ...\n  {program} repro-worker <command> ...\n\nSmoke commands:\n  {program} smoke <config.json>\n  {program} smoke <config.json> [max_execs]\n  {program} smoke <config.json> [max_execs] [target]\n  {program} smoke-suite <config.json>\n  {program} smoke-suite <config.json> [max_execs]\n  {program} smoke-suite <config.json> [max_execs] [target ...]\n\nTarget inspection commands:\n  {program} target-summary\n  {program} target-summary builtin [limit]\n  {program} target-summary bundle:<path> [limit]\n  {program} target-summary <description-path> [limit]\n\nRepro queue commands:\n  {program} repro-queue sync <workdir>\n  {program} repro-queue status <workdir> [limit]\n  {program} repro-queue peek <workdir>\n  {program} repro-queue claim <workdir> <worker_id> [lease_secs]\n  {program} repro-queue release <workdir> <artifact_type> <signature> <worker_id>\n  {program} repro-queue requeue <workdir> <artifact_type> <signature> <worker_id> <outcome>\n  {program} repro-queue attempt <workdir> <artifact_type> <signature> <outcome>\n\nRepro worker commands:\n  {program} repro-worker run-once <config.json> <worker_id> [lease_secs] [max_replay_attempts]\n  {program} repro-worker run-batch <config.json> <worker_id> [max_items] [lease_secs] [max_replay_attempts]"
     );
 }
 
@@ -168,10 +168,7 @@ fn sample_syscall_names(
         .collect()
 }
 
-fn build_target_summary(
-    target_arg: Option<&str>,
-    limit: usize,
-) -> Result<TargetSummary, String> {
+fn build_target_summary(target_arg: Option<&str>, limit: usize) -> Result<TargetSummary, String> {
     let sample_limit = limit.max(1);
     let source = match target_arg {
         Some(value) => target::TargetSource::from_cli_arg(value)?,
@@ -310,7 +307,9 @@ fn build_target_summary(
 
 fn run_target_summary_cli(args: &[String]) -> Result<(), String> {
     if args.len() > 2 {
-        return Err("Usage: target-summary [builtin|<description-path>] [limit]".to_string());
+        return Err(
+            "Usage: target-summary [builtin|bundle:<path>|<description-path>] [limit]".to_string(),
+        );
     }
 
     let (description_path, limit) = match args {
@@ -352,7 +351,7 @@ fn build_smoke_config(
             }
         }
     } else if cfg.target_bundle.is_none() && cfg.syscall_descriptions.is_none() {
-        cfg.syscall_descriptions = Some(DEFAULT_SMOKE_DESCRIPTION.to_string());
+        cfg.target_bundle = Some(DEFAULT_SMOKE_BUNDLE.to_string());
     }
     Ok(cfg)
 }
@@ -515,7 +514,7 @@ fn resolve_smoke_suite_args(args: &[String]) -> Result<(Option<u64>, Vec<String>
 
 fn run_smoke_cli(args: &[String]) -> Result<(), String> {
     if args.is_empty() || args.len() > 3 {
-        return Err("Usage: smoke <config.json> [max_execs] [description-path]".to_string());
+        return Err("Usage: smoke <config.json> [max_execs] [target]".to_string());
     }
 
     let cfg =
@@ -553,9 +552,7 @@ fn run_smoke_cli(args: &[String]) -> Result<(), String> {
 
 fn run_smoke_suite_cli(args: &[String]) -> Result<(), String> {
     if args.is_empty() {
-        return Err(
-            "Usage: smoke-suite <config.json> [max_execs] [description-path ...]".to_string(),
-        );
+        return Err("Usage: smoke-suite <config.json> [max_execs] [target ...]".to_string());
     }
 
     let base_cfg =
@@ -825,7 +822,7 @@ mod tests {
     use super::{
         build_smoke_config, build_smoke_summary, build_target_summary, resolve_smoke_suite_args,
         smoke_suite_workdir, validate_smoke_prerequisites, SmokeSummary, TargetDisabledSyscall,
-        DEFAULT_SMOKE_DESCRIPTION, DEFAULT_SMOKE_MAX_EXECS,
+        DEFAULT_SMOKE_BUNDLE, DEFAULT_SMOKE_MAX_EXECS,
     };
     use crate::config::{Config, VmConfig};
     use crate::program;
@@ -1036,8 +1033,7 @@ mod tests {
         let root = unique_temp_dir("target-summary-bundle");
         let bundle = write_test_bundle(&root);
         let source = format!("bundle:{}", bundle.display());
-        let summary =
-            build_target_summary(Some(&source), 5).expect("bundle summary should load");
+        let summary = build_target_summary(Some(&source), 5).expect("bundle summary should load");
 
         assert!(summary.source.starts_with("bundle:"));
         assert_eq!(summary.total_syscalls, 1);
@@ -1045,13 +1041,14 @@ mod tests {
 
     #[test]
     fn target_summary_accepts_checked_in_bundle_fixture() {
-        let summary = build_target_summary(
-            Some("bundle:data/target-bundles/linux-amd64-smoke.json"),
-            6,
-        )
-        .expect("checked-in bundle fixture should load");
+        let summary =
+            build_target_summary(Some("bundle:data/target-bundles/linux-amd64-smoke.json"), 6)
+                .expect("checked-in bundle fixture should load");
 
-        assert_eq!(summary.source, "bundle:data/target-bundles/linux-amd64-smoke.json");
+        assert_eq!(
+            summary.source,
+            "bundle:data/target-bundles/linux-amd64-smoke.json"
+        );
         assert!(summary.total_syscalls >= 27);
         assert!(summary.transitively_generatable_syscalls >= 20);
         assert!(summary.enabled_sample.len() <= 6);
@@ -1060,13 +1057,14 @@ mod tests {
 
     #[test]
     fn target_summary_accepts_checked_in_core_bundle_fixture() {
-        let summary = build_target_summary(
-            Some("bundle:data/target-bundles/linux-amd64-core.json"),
-            12,
-        )
-        .expect("core bundle summary should load");
+        let summary =
+            build_target_summary(Some("bundle:data/target-bundles/linux-amd64-core.json"), 12)
+                .expect("core bundle summary should load");
 
-        assert_eq!(summary.source, "bundle:data/target-bundles/linux-amd64-core.json");
+        assert_eq!(
+            summary.source,
+            "bundle:data/target-bundles/linux-amd64-core.json"
+        );
         assert_eq!(summary.total_syscalls, 41);
         assert_eq!(summary.transitively_enabled_syscalls, 41);
         assert_eq!(summary.transitively_generatable_syscalls, 41);
@@ -1303,10 +1301,8 @@ mod tests {
             .expect("default smoke config should build");
 
         assert_eq!(cfg.max_execs, Some(DEFAULT_SMOKE_MAX_EXECS));
-        assert_eq!(
-            cfg.syscall_descriptions.as_deref(),
-            Some(DEFAULT_SMOKE_DESCRIPTION)
-        );
+        assert_eq!(cfg.target_bundle.as_deref(), Some(DEFAULT_SMOKE_BUNDLE));
+        assert!(cfg.syscall_descriptions.is_none());
     }
 
     #[test]
