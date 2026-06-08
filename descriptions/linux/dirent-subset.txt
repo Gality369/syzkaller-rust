@@ -1,0 +1,7 @@
+const AT_FDCWD = -100
+
+resource fd[int32]: -1
+
+openat(dirfd const[AT_FDCWD, int32], path ptr[in, glob["/proc"]], flags const[0, int32], mode const[0, int32]) fd
+getdents64(fd fd, dirp buffer[out], count bytesize[dirp, int32])
+close(fd fd)

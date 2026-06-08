@@ -1111,6 +1111,17 @@ mod tests {
     }
 
     #[test]
+    fn target_summary_loads_dirent_subset() {
+        let summary = build_target_summary(Some("descriptions/linux/dirent-subset.txt"), 2)
+            .expect("dirent subset should load");
+
+        assert_eq!(summary.source, "descriptions/linux/dirent-subset.txt");
+        assert_eq!(summary.total_syscalls, 3);
+        assert_eq!(summary.transitively_enabled_syscalls, 3);
+        assert_eq!(summary.transitively_generatable_syscalls, 3);
+    }
+
+    #[test]
     fn target_summary_loads_execution_regression_subsets() {
         let file_summary = build_target_summary(Some("descriptions/linux/file-subset.txt"), 2)
             .expect("file subset should load");
