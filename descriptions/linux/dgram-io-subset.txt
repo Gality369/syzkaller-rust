@@ -1,0 +1,17 @@
+resource fd[4] = -1, 0, 1, 2, 3, 4
+resource sock_tx_dgram[fd]
+resource sock_rx_dgram[fd]
+
+const AF_UNIX = 1
+const SOCK_DGRAM = 2
+const MSG_DONTWAIT = 64
+flagset recv_flags[4] = MSG_DONTWAIT
+
+sock_dgram_pair {
+    tx sock_tx_dgram
+    rx sock_rx_dgram
+} [size[8]]
+
+socketpair(domain const[AF_UNIX], type const[SOCK_DGRAM], proto const[0], fds ptr[out, sock_dgram_pair]) int
+sendto(fd sock_tx_dgram, buf ptr[in, array[int8; 4:32]], len len[buf, int32], flags const[0], addr ptr[in, buffer[16:16], opt], addrlen len[addr]) int
+recvfrom(fd sock_rx_dgram, buf ptr[out, array[int8; 4:32]], len bytesize[buf, int32], flags flags[recv_flags], addr ptr[out, buffer[16:16], opt], addrlen len[addr]) int

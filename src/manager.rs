@@ -8,27 +8,297 @@ use crate::fuzzer;
 use crate::program;
 use crate::protocol;
 use crate::qemu::QemuInstance;
+use crate::target;
 
 use rand::SeedableRng;
 use std::collections::{HashMap, HashSet};
-use std::io;
+use std::io::{self, Read};
 use std::net::TcpListener;
 use std::path::Path;
+use std::process::Child;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const PROGRAM_SHAPE_BLOCK_THRESHOLD: u32 = 2;
 const TIMEOUT_SYSCALL_EDGE_BLOCK_THRESHOLD: u32 = 2;
 const TIMEOUT_SYSCALL_BLOCK_THRESHOLD: u32 = 3;
+const EXECUTOR_RETRY_STALL_THRESHOLD: i32 = 8;
+const EXECUTOR_RETRY_STALL_MIN_ELAPSED: Duration = Duration::from_secs(4);
 const AVOIDANCE_DECAY_INTERVAL: u64 = 16;
 const AVOIDANCE_MAX_DECAY_AMOUNT: u32 = 3;
 const AVOIDANCE_COMPACT_IDLE_EPOCHS: u64 = AVOIDANCE_DECAY_INTERVAL * 2;
 const AVOIDANCE_MAX_PERSISTED_WEAK_EDGES: usize = 8;
 const AVOIDANCE_MAX_PERSISTED_WEAK_SYSCALLS: usize = 8;
 
+struct ExecutorSshSession {
+    child: Child,
+    stdout_buf: Arc<Mutex<Vec<u8>>>,
+    stderr_buf: Arc<Mutex<Vec<u8>>>,
+    stdout_reader: Option<JoinHandle<()>>,
+    stderr_reader: Option<JoinHandle<()>>,
+}
+
+impl ExecutorSshSession {
+    fn new(mut child: Child) -> Self {
+        let stdout_buf = Arc::new(Mutex::new(Vec::new()));
+        let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+        let stdout_reader = child
+            .stdout
+            .take()
+            .map(|stdout| spawn_output_reader(stdout, stdout_buf.clone()));
+        let stderr_reader = child
+            .stderr
+            .take()
+            .map(|stderr| spawn_output_reader(stderr, stderr_buf.clone()));
+        Self {
+            child,
+            stdout_buf,
+            stderr_buf,
+            stdout_reader,
+            stderr_reader,
+        }
+    }
+
+    fn combined_output(&self) -> Vec<u8> {
+        let stdout = self.stdout_buf.lock().unwrap().clone();
+        let stderr = self.stderr_buf.lock().unwrap().clone();
+        combine_named_logs(&[
+            ("executor ssh stdout", stdout.as_slice()),
+            ("executor ssh stderr", stderr.as_slice()),
+        ])
+        .unwrap_or_default()
+    }
+}
+
+impl Drop for ExecutorSshSession {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(handle) = self.stdout_reader.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.stderr_reader.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn spawn_output_reader<R: Read + Send + 'static>(
+    mut reader: R,
+    output: Arc<Mutex<Vec<u8>>>,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    let mut buf = output.lock().unwrap();
+                    buf.extend_from_slice(&chunk[..read]);
+                    if buf.len() > 256 * 1024 {
+                        let drain = buf.len() - 128 * 1024;
+                        buf.drain(..drain);
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn combine_named_logs(sections: &[(&str, &[u8])]) -> Option<Vec<u8>> {
+    let mut combined = Vec::new();
+    for (name, data) in sections {
+        if data.is_empty() {
+            continue;
+        }
+        if !combined.is_empty() && !combined.ends_with(b"\n") {
+            combined.push(b'\n');
+        }
+        combined.extend_from_slice(format!("=== {} ===\n", name).as_bytes());
+        combined.extend_from_slice(data);
+        if !data.ends_with(b"\n") {
+            combined.push(b'\n');
+        }
+    }
+    if combined.is_empty() {
+        None
+    } else {
+        Some(combined)
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct RequestTrace {
+    events: Vec<RequestTraceEvent>,
+    read_timeouts: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequestTraceEvent {
+    at_ms: u128,
+    kind: RequestTraceEventKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RequestTraceEventKind {
+    SentExecRequest {
+        id: i64,
+        prog_bytes: usize,
+    },
+    Executing {
+        id: i64,
+        proc_id: i32,
+        try_: i32,
+        wait_duration: i64,
+    },
+    State {
+        summary: String,
+    },
+    ExecResult {
+        id: i64,
+        proc: i32,
+        hanged: bool,
+        output_len: usize,
+        error: String,
+        call_count: usize,
+        elapsed_ns: Option<u64>,
+        freshness: Option<u64>,
+    },
+}
+
+impl RequestTrace {
+    fn record_sent_exec_request(&mut self, at_ms: u128, id: i64, prog_bytes: usize) {
+        self.events.push(RequestTraceEvent {
+            at_ms,
+            kind: RequestTraceEventKind::SentExecRequest { id, prog_bytes },
+        });
+    }
+
+    fn record_executing(&mut self, at_ms: u128, data: &protocol::ExecutingData) {
+        self.events.push(RequestTraceEvent {
+            at_ms,
+            kind: RequestTraceEventKind::Executing {
+                id: data.id,
+                proc_id: data.proc_id,
+                try_: data.try_,
+                wait_duration: data.wait_duration,
+            },
+        });
+    }
+
+    fn record_state(&mut self, at_ms: u128, state: &[u8]) {
+        self.events.push(RequestTraceEvent {
+            at_ms,
+            kind: RequestTraceEventKind::State {
+                summary: summarize_state_payload(state),
+            },
+        });
+    }
+
+    fn record_exec_result(&mut self, at_ms: u128, result: &protocol::ExecResultData) {
+        let (call_count, elapsed_ns, freshness) = result
+            .info
+            .as_ref()
+            .map(|info| (info.calls.len(), Some(info.elapsed), Some(info.freshness)))
+            .unwrap_or((0, None, None));
+        self.events.push(RequestTraceEvent {
+            at_ms,
+            kind: RequestTraceEventKind::ExecResult {
+                id: result.id,
+                proc: result.proc,
+                hanged: result.hanged,
+                output_len: result.output.len(),
+                error: result.error.clone(),
+                call_count,
+                elapsed_ns,
+                freshness,
+            },
+        });
+    }
+
+    fn record_read_timeout(&mut self) {
+        self.read_timeouts = self.read_timeouts.saturating_add(1);
+    }
+
+    fn render(&self, final_reason: &str, final_at_ms: u128) -> Vec<u8> {
+        let mut lines = Vec::with_capacity(self.events.len() + 1);
+        lines.push(format!(
+            "final_reason={final_reason} at_ms={final_at_ms} read_timeouts={}",
+            self.read_timeouts
+        ));
+        for event in &self.events {
+            lines.push(event.render_line());
+        }
+        lines.join("\n").into_bytes()
+    }
+}
+
+impl RequestTraceEvent {
+    fn render_line(&self) -> String {
+        let prefix = format!("[t+{}ms]", self.at_ms);
+        match &self.kind {
+            RequestTraceEventKind::SentExecRequest { id, prog_bytes } => {
+                format!("{prefix} sent_exec_request id={id} prog_bytes={prog_bytes}")
+            }
+            RequestTraceEventKind::Executing {
+                id,
+                proc_id,
+                try_,
+                wait_duration,
+            } => format!(
+                "{prefix} executing id={id} proc={proc_id} try={try_} wait_duration_raw={wait_duration}"
+            ),
+            RequestTraceEventKind::State { summary } => {
+                format!("{prefix} state {summary}")
+            }
+            RequestTraceEventKind::ExecResult {
+                id,
+                proc,
+                hanged,
+                output_len,
+                error,
+                call_count,
+                elapsed_ns,
+                freshness,
+            } => {
+                let mut line = format!(
+                    "{prefix} exec_result id={id} proc={proc} hanged={hanged} output_len={output_len} error={error:?} calls={call_count}"
+                );
+                if let Some(elapsed_ns) = elapsed_ns {
+                    line.push_str(&format!(" elapsed_ns={elapsed_ns}"));
+                }
+                if let Some(freshness) = freshness {
+                    line.push_str(&format!(" freshness={freshness}"));
+                }
+                line
+            }
+        }
+    }
+}
+
+fn summarize_state_payload(data: &[u8]) -> String {
+    const MAX_PREFIX_BYTES: usize = 16;
+    if data.is_empty() {
+        return "len=0".to_string();
+    }
+    let prefix_len = data.len().min(MAX_PREFIX_BYTES);
+    let prefix_hex = data[..prefix_len]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if data.len() > MAX_PREFIX_BYTES {
+        format!("len={} hex={}...", data.len(), prefix_hex)
+    } else {
+        format!("len={} hex={}", data.len(), prefix_hex)
+    }
+}
+
 /// Main entry point: start VM, connect executor, run fuzz loop.
 pub fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
-    let descs = program::load_syscall_descs(cfg.syscall_descriptions.as_deref())
+    let loaded_target = target::load_target_from_config(&cfg, None)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let descs = loaded_target.descs;
     let availability = program::transitively_enabled_syscalls(&descs);
     let generatable = program::transitively_generatable_syscalls(&descs);
     if availability.enabled.is_empty() {
@@ -52,7 +322,8 @@ pub fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         .collect::<std::collections::HashSet<_>>();
     let availability_disabled_count = availability.disabled.len();
     log::info!(
-        "Loaded {} syscall descriptions ({} enabled, {} generatable, {} unavailable)",
+        "Loaded target {} with {} syscall descriptions ({} enabled, {} generatable, {} unavailable)",
+        loaded_target.source_label,
         descs.len(),
         availability.enabled.len(),
         generatable.enabled.len(),
@@ -191,6 +462,7 @@ pub fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut vm_index: usize = 0;
     let mut total_execs: u64 = 0;
+    let mut total_attempts: u64 = 0;
     let mut successful_execs_since_decay: u64 = 0;
     let mut last_stats = Instant::now();
     let mut blocked_programs = HashSet::new();
@@ -199,8 +471,8 @@ pub fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     // Outer loop: restart VM on crash or disconnect
     loop {
-        if exec_limit_reached(&cfg, total_execs) {
-            log::info!("Reached max_execs={}, stopping manager", total_execs);
+        if exec_limit_reached(&cfg, total_attempts) {
+            log::info!("Reached max_execs={}, stopping manager", total_attempts);
             return Ok(());
         }
         log::info!("=== Starting VM instance {} ===", vm_index);
@@ -223,6 +495,7 @@ pub fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             &mut timeout_syscall_last_failure_epoch,
             &mut rng,
             &mut total_execs,
+            &mut total_attempts,
             &mut successful_execs_since_decay,
             &mut last_stats,
             vm_index,
@@ -235,8 +508,8 @@ pub fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 log::error!("Instance {} failed: {}", vm_index, e);
             }
         }
-        if exec_limit_reached(&cfg, total_execs) {
-            log::info!("Reached max_execs={}, stopping manager", total_execs);
+        if exec_limit_reached(&cfg, total_attempts) {
+            log::info!("Reached max_execs={}, stopping manager", total_attempts);
             return Ok(());
         }
         vm_index += 1;
@@ -265,6 +538,7 @@ fn run_instance(
     timeout_syscall_last_failure_epoch: &mut HashMap<String, u64>,
     rng: &mut rand::rngs::StdRng,
     total_execs: &mut u64,
+    total_attempts: &mut u64,
     successful_execs_since_decay: &mut u64,
     last_stats: &mut Instant,
     vm_index: usize,
@@ -291,7 +565,8 @@ fn run_instance(
         vm_index, flatrpc_port
     );
     log::info!("Starting executor: {}", executor_cmd);
-    let mut _executor_ssh = vm.run_with_forward(cfg, flatrpc_port, &executor_cmd)?;
+    let executor_ssh =
+        ExecutorSshSession::new(vm.run_with_forward(cfg, flatrpc_port, &executor_cmd)?);
 
     // 5. Accept executor connection
     log::info!("Waiting for executor connection...");
@@ -473,6 +748,7 @@ fn run_instance(
             env_flags |= ExecEnv::Signal;
         }
         let exec_flags = ExecFlag::CollectSignal;
+        let request_flags = RequestFlag::ReturnError | RequestFlag::ReturnOutput;
 
         protocol::send_exec_request(
             &mut stream,
@@ -480,9 +756,11 @@ fn run_instance(
             &prog_data,
             env_flags,
             exec_flags,
+            request_flags,
             0,   // sandbox_arg
             &[], // all_signal (empty for now)
         )?;
+        *total_attempts += 1;
 
         executing_ids.insert(req_id);
 
@@ -491,6 +769,8 @@ fn run_instance(
         let mut got_result = false;
         let request_start = Instant::now();
         let request_timeout = Duration::from_secs(15);
+        let mut request_trace = RequestTrace::default();
+        request_trace.record_sent_exec_request(0, req_id, prog_data.len());
         while !got_result {
             if request_start.elapsed() > request_timeout {
                 log::warn!(
@@ -534,6 +814,17 @@ fn run_instance(
                     );
                 }
                 let timeout_profile = timeout_profile_desc(&prog, descs);
+                let timeout_serial = vm.get_serial_output();
+                let executor_ssh_output = executor_ssh.combined_output();
+                let request_trace_log = request_trace.render(
+                    "manager_request_timeout",
+                    request_start.elapsed().as_millis(),
+                );
+                let timeout_log = combine_named_logs(&[
+                    ("request trace", &request_trace_log),
+                    ("executor ssh", &executor_ssh_output),
+                    ("guest serial", &timeout_serial),
+                ]);
                 let repro = build_artifact_repro_info(
                     cfg,
                     vm_index,
@@ -545,13 +836,14 @@ fn run_instance(
                     Some(&prog_shape),
                     Some(&timeout_profile),
                 );
-                if let Err(e) = crash::save_timeout(
+                if let Err(e) = crash::save_timeout_with_log(
                     &cfg.workdir,
                     "manager_request_timeout",
                     &prog_desc,
                     &prog_shape,
                     &timeout_profile,
                     Some(&repro),
+                    timeout_log.as_deref(),
                 ) {
                     log::warn!("Failed to save timed-out program: {}", e);
                 }
@@ -585,15 +877,115 @@ fn run_instance(
                         || e.kind() == io::ErrorKind::TimedOut =>
                 {
                     // Read timeout, check if we should give up
+                    request_trace.record_read_timeout();
                     continue;
                 }
                 Err(e) => return Err(e.into()),
             };
             match msg {
                 protocol::ExecutorMsg::Executing(data) => {
+                    let elapsed = request_start.elapsed();
+                    request_trace.record_executing(elapsed.as_millis(), &data);
                     log::debug!("Executing: id={}, proc={}", data.id, data.proc_id);
+                    if executor_retry_stall_reached(data.try_, elapsed) {
+                        log::warn!(
+                            "Request {} entered executor retry stall at try={} after {:?}, restarting VM",
+                            req_id,
+                            data.try_,
+                            elapsed
+                        );
+                        *successful_execs_since_decay = 0;
+                        *avoidance_learning_epoch += 1;
+                        remember_blocked_program(blocked_programs, &prog);
+                        if note_shape_failure(blocked_shapes, shape_failures, &prog_shape) {
+                            log::info!(
+                                "Blocking program shape after repeated timeouts: {}",
+                                prog_shape
+                            );
+                        }
+                        for edge in note_timeout_edge_failures(
+                            blocked_timeout_edges,
+                            timeout_edge_failures,
+                            timeout_edge_last_failure_epoch,
+                            *avoidance_learning_epoch,
+                            &prog,
+                            descs,
+                        ) {
+                            log::info!(
+                                "Blocking timeout-prone syscall edge after repeated failures: {}",
+                                edge
+                            );
+                        }
+                        for syscall_name in note_timeout_syscall_failures(
+                            blocked_timeout_syscalls,
+                            timeout_syscall_failures,
+                            timeout_syscall_last_failure_epoch,
+                            *avoidance_learning_epoch,
+                            &prog,
+                            descs,
+                        ) {
+                            log::info!(
+                                "Blocking timeout-prone syscall after repeated failures: {}",
+                                syscall_name
+                            );
+                        }
+                        let timeout_profile = timeout_profile_desc(&prog, descs);
+                        let timeout_serial = vm.get_serial_output();
+                        let executor_ssh_output = executor_ssh.combined_output();
+                        let request_trace_log =
+                            request_trace.render("executor_retry_stall", elapsed.as_millis());
+                        let timeout_log = combine_named_logs(&[
+                            ("request trace", &request_trace_log),
+                            ("executor ssh", &executor_ssh_output),
+                            ("guest serial", &timeout_serial),
+                        ]);
+                        let repro = build_artifact_repro_info(
+                            cfg,
+                            vm_index,
+                            *total_execs,
+                            "timeout",
+                            "executor_retry_stall",
+                            &prog_desc,
+                            Some(&prog),
+                            Some(&prog_shape),
+                            Some(&timeout_profile),
+                        );
+                        if let Err(e) = crash::save_timeout_with_log(
+                            &cfg.workdir,
+                            "executor_retry_stall",
+                            &prog_desc,
+                            &prog_shape,
+                            &timeout_profile,
+                            Some(&repro),
+                            timeout_log.as_deref(),
+                        ) {
+                            log::warn!("Failed to save retry-stalled program: {}", e);
+                        }
+                        if let Err(e) = save_avoidance_state(
+                            avoidance_path,
+                            *avoidance_learning_epoch,
+                            timeout_edge_failures,
+                            timeout_syscall_failures,
+                            timeout_edge_last_failure_epoch,
+                            timeout_syscall_last_failure_epoch,
+                        ) {
+                            log::warn!(
+                                "Failed to persist avoidance snapshot {}: {}",
+                                avoidance_path.display(),
+                                e
+                            );
+                        }
+                        *choice_table = rebuild_choice_table(
+                            descs,
+                            corpus,
+                            timeout_edge_failures,
+                            timeout_syscall_failures,
+                        );
+                        return Err("executor retry stall".into());
+                    }
                 }
                 protocol::ExecutorMsg::ExecResult(result) => {
+                    request_trace.record_exec_result(request_start.elapsed().as_millis(), &result);
                     got_result = true;
                     executing_ids.remove(&result.id);
                     *total_execs += 1;
@@ -644,6 +1036,18 @@ fn run_instance(
                             );
                         }
                         let timeout_profile = timeout_profile_desc(&prog, descs);
+                        let serial = vm.get_serial_output();
+                        let executor_ssh_output = executor_ssh.combined_output();
+                        let request_trace_log = request_trace.render(
+                            "executor_reported_hang",
+                            request_start.elapsed().as_millis(),
+                        );
+                        let timeout_log = combine_named_logs(&[
+                            ("request trace", &request_trace_log),
+                            ("executor output", &result.output),
+                            ("executor ssh", &executor_ssh_output),
+                            ("guest serial", &serial),
+                        ]);
                         let repro = build_artifact_repro_info(
                             cfg,
                             vm_index,
@@ -655,13 +1059,14 @@ fn run_instance(
                             Some(&prog_shape),
                             Some(&timeout_profile),
                         );
-                        if let Err(e) = crash::save_timeout(
+                        if let Err(e) = crash::save_timeout_with_log(
                             &cfg.workdir,
                             "executor_reported_hang",
                             &prog_desc,
                             &prog_shape,
                             &timeout_profile,
                             Some(&repro),
+                            timeout_log.as_deref(),
                         ) {
                             log::warn!("Failed to save hanged program: {}", e);
                         }
@@ -804,13 +1209,14 @@ fn run_instance(
                         }
                     }
 
-                    if exec_limit_reached(cfg, *total_execs) {
-                        log::info!("Reached max_execs={}, ending fuzz loop", total_execs);
+                    if exec_limit_reached(cfg, *total_attempts) {
+                        log::info!("Reached max_execs={}, ending fuzz loop", total_attempts);
                         return Ok(());
                     }
                 }
-                protocol::ExecutorMsg::State(_) => {
-                    log::debug!("Received state message (ignored)");
+                protocol::ExecutorMsg::State(data) => {
+                    request_trace.record_state(request_start.elapsed().as_millis(), &data);
+                    log::debug!("Received state message: {}", summarize_state_payload(&data));
                 }
             }
         }
@@ -1011,6 +1417,7 @@ fn build_artifact_repro_info(
         signature: String::new(),
         manager_instance: vm_index,
         total_execs,
+        target_bundle: cfg.target_bundle.clone(),
         syscall_descriptions: cfg.syscall_descriptions.clone(),
         executor: cfg.executor.clone(),
         sandbox: cfg.sandbox.clone(),
@@ -1253,17 +1660,22 @@ fn exec_limit_reached(cfg: &Config, total_execs: u64) -> bool {
     cfg.max_execs.is_some_and(|limit| total_execs >= limit)
 }
 
+fn executor_retry_stall_reached(try_: i32, elapsed: Duration) -> bool {
+    try_ >= EXECUTOR_RETRY_STALL_THRESHOLD && elapsed >= EXECUTOR_RETRY_STALL_MIN_ELAPSED
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         blocked_timeout_edges_for_program, blocked_timeout_syscalls_for_program,
         compact_avoidance_state, exec_limit_reached, maybe_decay_avoidance, note_shape_failure,
         note_timeout_edge_failures, note_timeout_syscall_failures, program_is_blocked,
-        remember_blocked_program, timeout_prone_edges_in_program,
-        timeout_prone_syscalls_in_program, AVOIDANCE_COMPACT_IDLE_EPOCHS, AVOIDANCE_DECAY_INTERVAL,
-        AVOIDANCE_MAX_PERSISTED_WEAK_EDGES, AVOIDANCE_MAX_PERSISTED_WEAK_SYSCALLS,
-        PROGRAM_SHAPE_BLOCK_THRESHOLD, TIMEOUT_SYSCALL_BLOCK_THRESHOLD,
-        TIMEOUT_SYSCALL_EDGE_BLOCK_THRESHOLD,
+        remember_blocked_program, summarize_state_payload, timeout_prone_edges_in_program,
+        timeout_prone_syscalls_in_program, RequestTrace, AVOIDANCE_COMPACT_IDLE_EPOCHS,
+        AVOIDANCE_DECAY_INTERVAL, AVOIDANCE_MAX_PERSISTED_WEAK_EDGES,
+        AVOIDANCE_MAX_PERSISTED_WEAK_SYSCALLS, EXECUTOR_RETRY_STALL_MIN_ELAPSED,
+        EXECUTOR_RETRY_STALL_THRESHOLD, PROGRAM_SHAPE_BLOCK_THRESHOLD,
+        TIMEOUT_SYSCALL_BLOCK_THRESHOLD, TIMEOUT_SYSCALL_EDGE_BLOCK_THRESHOLD,
     };
     use crate::avoidance::AvoidanceState;
     use crate::config::{Config, VmConfig};
@@ -1271,7 +1683,9 @@ mod tests {
         ArgType, BufferDir, Call, LengthKind, LengthTarget, LengthTargetRoot, Program, PtrDir,
         ResourceDesc, ReturnType, ScalarEndian, SyscallAttrs, SyscallDesc,
     };
+    use crate::protocol::{CallInfoData, ExecResultData, ExecutingData, ProgInfoData};
     use std::collections::{HashMap, HashSet};
+    use std::time::Duration;
 
     fn test_config(max_execs: Option<u64>) -> Config {
         Config {
@@ -1281,6 +1695,7 @@ mod tests {
             sshkey: "/tmp/key".into(),
             ssh_user: "root".into(),
             executor: "/tmp/syz-executor".into(),
+            target_bundle: None,
             syscall_descriptions: None,
             procs: 1,
             sandbox: "none".into(),
@@ -1959,5 +2374,87 @@ mod tests {
         assert!(state.timeout_syscall_failures.contains_key("syscall-07"));
         assert!(!state.timeout_syscall_failures.contains_key("syscall-08"));
         assert!(!state.timeout_syscall_failures.contains_key("syscall-09"));
+    }
+
+    #[test]
+    fn summarize_state_payload_limits_hex_prefix() {
+        assert_eq!(summarize_state_payload(&[]), "len=0");
+        assert_eq!(
+            summarize_state_payload(&[0x12, 0x34, 0xab, 0xcd]),
+            "len=4 hex=1234abcd"
+        );
+        assert_eq!(
+            summarize_state_payload(&[
+                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+                0x0e, 0x0f, 0x10,
+            ]),
+            "len=17 hex=000102030405060708090a0b0c0d0e0f..."
+        );
+    }
+
+    #[test]
+    fn request_trace_render_includes_message_progress() {
+        let mut trace = RequestTrace::default();
+        trace.record_sent_exec_request(0, 7, 96);
+        trace.record_executing(
+            2,
+            &ExecutingData {
+                id: 7,
+                proc_id: 1,
+                try_: 0,
+                wait_duration: 42,
+            },
+        );
+        trace.record_state(4, &[0xde, 0xad, 0xbe, 0xef]);
+        trace.record_read_timeout();
+        trace.record_read_timeout();
+        trace.record_exec_result(
+            9,
+            &ExecResultData {
+                id: 7,
+                proc: 1,
+                output: vec![1, 2, 3],
+                hanged: false,
+                error: "oops".to_string(),
+                info: Some(ProgInfoData {
+                    calls: vec![CallInfoData {
+                        flags: 1,
+                        error: 0,
+                        signal: vec![11, 22],
+                        cover: vec![33],
+                    }],
+                    elapsed: 1234,
+                    freshness: 9,
+                }),
+            },
+        );
+
+        let rendered = String::from_utf8(trace.render("manager_request_timeout", 15_000))
+            .expect("trace should be utf-8");
+        assert!(
+            rendered.contains("final_reason=manager_request_timeout at_ms=15000 read_timeouts=2")
+        );
+        assert!(rendered.contains("[t+0ms] sent_exec_request id=7 prog_bytes=96"));
+        assert!(rendered.contains("[t+2ms] executing id=7 proc=1 try=0 wait_duration_raw=42"));
+        assert!(rendered.contains("[t+4ms] state len=4 hex=deadbeef"));
+        assert!(rendered.contains(
+            "[t+9ms] exec_result id=7 proc=1 hanged=false output_len=3 error=\"oops\" calls=1 elapsed_ns=1234 freshness=9"
+        ));
+    }
+
+    #[test]
+    fn executor_retry_stall_guard_waits_for_threshold_and_min_elapsed() {
+        assert!(!super::executor_retry_stall_reached(
+            EXECUTOR_RETRY_STALL_THRESHOLD - 1,
+            EXECUTOR_RETRY_STALL_MIN_ELAPSED
+        ));
+        assert!(!super::executor_retry_stall_reached(
+            EXECUTOR_RETRY_STALL_THRESHOLD,
+            EXECUTOR_RETRY_STALL_MIN_ELAPSED - Duration::from_millis(1)
+        ));
+        assert!(super::executor_retry_stall_reached(
+            EXECUTOR_RETRY_STALL_THRESHOLD,
+            EXECUTOR_RETRY_STALL_MIN_ELAPSED
+        ));
     }
 }

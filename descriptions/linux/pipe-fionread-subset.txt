@@ -1,0 +1,15 @@
+const FIONREAD = 0x541B
+
+resource fd[4] = -1, 0, 1, 2, 3, 4
+resource fd_pipe_read[fd]
+resource fd_pipe_write[fd]
+
+pipe_pair {
+    read_end fd_pipe_read
+    write_end fd_pipe_write
+} [size[8]]
+
+pipe2$typed@4854(fds ptr[out, pipe_pair], flags const[0]) int
+write(fd fd_pipe_write, buf buffer[in], count len[buf, int32]) int
+ioctl$pipe_FIONREAD@960(fd fd_pipe_read, cmd const[FIONREAD, intptr], arg buffer[inout]) int
+close(fd fd) int

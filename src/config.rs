@@ -11,6 +11,9 @@ pub struct Config {
     #[serde(default = "default_ssh_user")]
     pub ssh_user: String,
     pub executor: String,
+    /// Optional exported target bundle override.
+    #[serde(default)]
+    pub target_bundle: Option<String>,
     /// Optional syscall description override. May point to a single file or a directory of fragments.
     #[serde(default)]
     pub syscall_descriptions: Option<String>,

@@ -1,6 +1,11 @@
 use crate::program::*;
+use crate::special;
+use flate2::read::ZlibDecoder;
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Write};
 
 const MAX_CALLS: usize = 10;
 const MIN_CALLS: usize = 1;
@@ -33,6 +38,117 @@ fn shift_inline_struct_layout(mut layout: InlineStructLayout, delta: usize) -> I
         *end += delta;
     }
     layout
+}
+
+fn align_inline_offset(value: usize, align: usize) -> Option<usize> {
+    if align <= 1 {
+        Some(value)
+    } else {
+        value
+            .checked_add(align - 1)
+            .map(|rounded| rounded & !(align - 1))
+    }
+}
+
+fn inline_field_alignment(
+    field: &ArgType,
+    packed: bool,
+    bitfield_info: Option<BitfieldFieldInfo>,
+) -> Option<usize> {
+    if packed {
+        return Some(1);
+    }
+    match bitfield_info {
+        Some(info) => Some(info.unit_size),
+        None => arg_type_alignment(field),
+    }
+}
+
+fn write_inline_bytes_at(out: &mut InlineObject, base: usize, bytes: &[u8]) -> Option<()> {
+    let end = base.checked_add(bytes.len())?;
+    if out.data.len() < end {
+        out.data.resize(end, 0);
+    }
+    out.data.get_mut(base..end)?.copy_from_slice(bytes);
+    Some(())
+}
+
+fn merge_inline_child_at(out: &mut InlineObject, base: usize, child: InlineObject) -> Option<()> {
+    write_inline_bytes_at(out, base, &child.data)?;
+    out.pointers
+        .extend(child.pointers.into_iter().map(|mut pointer| {
+            pointer.offset += base;
+            pointer
+        }));
+    out.struct_layouts.extend(
+        child
+            .struct_layouts
+            .into_iter()
+            .map(|layout| shift_inline_struct_layout(layout, base)),
+    );
+    Some(())
+}
+
+fn generate_overlay_prefix_inline_object(
+    fields: &[ArgType],
+    overlay_start: usize,
+    packed: bool,
+    desc: &SyscallDesc,
+    generated_args: &[ArgValue],
+    rng: &mut impl Rng,
+) -> Option<InlineObject> {
+    let bitfield_info = compute_bitfield_field_info(fields)?;
+    let mut out = InlineObject::default();
+    let mut idx = 0usize;
+    while idx < overlay_start {
+        if let Some(info) = bitfield_info[idx] {
+            let mut storage = vec![0; info.unit_size];
+            let base =
+                compute_struct_field_offset(fields, idx, false, packed, Some(overlay_start))?;
+            let mut group_idx = idx;
+            loop {
+                let group_info = bitfield_info[group_idx]?;
+                if group_idx >= overlay_start {
+                    return None;
+                }
+                match &fields[group_idx] {
+                    ArgType::Const {
+                        size,
+                        values,
+                        range,
+                        endian: _,
+                        allow_any,
+                        bitfield_bits,
+                    } => {
+                        let value = choose_scalar_const_value(
+                            *size,
+                            values,
+                            *range,
+                            *allow_any,
+                            *bitfield_bits,
+                            rng,
+                        );
+                        encode_bitfield_storage_value(&mut storage, group_info, value)?;
+                    }
+                    ArgType::Len { .. } => {}
+                    _ => return None,
+                }
+                if group_info.is_last_in_group {
+                    break;
+                }
+                group_idx += 1;
+            }
+            write_inline_bytes_at(&mut out, base, &storage)?;
+            idx = group_idx + 1;
+            continue;
+        }
+
+        let child = generate_inline_object_raw(&fields[idx], desc, generated_args, rng)?;
+        let base = compute_struct_field_offset(fields, idx, false, packed, Some(overlay_start))?;
+        merge_inline_child_at(&mut out, base, child)?;
+        idx += 1;
+    }
+    Some(out)
 }
 
 fn bitfield_value_limit(bits: u8) -> u64 {
@@ -186,6 +302,7 @@ pub fn generate_with_choice_table_and_edge_bias(
 
         let desc = &descs[syscall_idx];
         let args = generate_args(desc, &available_resources, rng);
+        consume_call_resources(desc, &args, &mut available_resources);
 
         let call_idx = calls.len();
         for (result_idx, output) in resource_outputs(desc).into_iter().enumerate() {
@@ -228,9 +345,17 @@ fn choose_syscall_for_generation(
         enabled_syscalls,
         timeout_edge_failures,
     );
-    let ready_consumers =
+    let ready_consumers_all =
         resource_consumers_for_available_inputs(descs, enabled_syscalls, available_resources);
-    if !ready_consumers.is_empty() && rng.gen_bool(0.6) {
+    let preferred_ready_consumers =
+        prefer_non_terminal_resource_consumers(descs, ready_consumers_all.clone());
+    let ready_consumers = prefer_breaking_repeated_ready_consumers(
+        descs,
+        previous_syscall_idx,
+        &ready_consumers_all,
+        preferred_ready_consumers,
+    );
+    if !ready_consumers.is_empty() {
         let preferred_ready = prefer_low_penalty_candidates(
             descs,
             previous_syscall_idx,
@@ -241,13 +366,22 @@ fn choose_syscall_for_generation(
     }
 
     let candidate = choice_table.choose_subset(&preferred_enabled, previous_syscall_idx, rng);
+    if !ready_consumers.is_empty() && is_terminal_resource_syscall(&descs[candidate]) {
+        let preferred_ready = prefer_low_penalty_candidates(
+            descs,
+            previous_syscall_idx,
+            &ready_consumers,
+            timeout_edge_failures,
+        );
+        return choice_table.choose_subset(&preferred_ready, previous_syscall_idx, rng);
+    }
     let fallback_producers = resource_producers_for_missing_inputs(
         descs,
         enabled_syscalls,
         &descs[candidate],
         available_resources,
     );
-    if !fallback_producers.is_empty() && rng.gen_bool(0.7) {
+    if !fallback_producers.is_empty() {
         let preferred_fallback = prefer_low_penalty_candidates(
             descs,
             previous_syscall_idx,
@@ -260,6 +394,80 @@ fn choose_syscall_for_generation(
     }
 }
 
+fn is_terminal_resource_syscall(desc: &SyscallDesc) -> bool {
+    desc.name == "close"
+}
+
+fn prefer_non_terminal_resource_consumers(
+    descs: &[SyscallDesc],
+    candidates: Vec<usize>,
+) -> Vec<usize> {
+    let filtered = candidates
+        .iter()
+        .copied()
+        .filter(|&syscall_idx| !is_terminal_resource_syscall(&descs[syscall_idx]))
+        .collect::<Vec<_>>();
+    if filtered.is_empty() {
+        candidates
+    } else {
+        filtered
+    }
+}
+
+fn invalidate_result_ref(
+    available_resources: &mut HashMap<String, Vec<ResultRef>>,
+    result_ref: &ResultRef,
+) {
+    available_resources.retain(|_, values| {
+        values.retain(|candidate| candidate != result_ref);
+        !values.is_empty()
+    });
+}
+
+fn consume_call_resources(
+    desc: &SyscallDesc,
+    args: &[ArgValue],
+    available_resources: &mut HashMap<String, Vec<ResultRef>>,
+) {
+    if !is_terminal_resource_syscall(desc) {
+        return;
+    }
+    for arg in args {
+        if let ArgValue::ResultRef(result_ref) = arg {
+            invalidate_result_ref(available_resources, result_ref);
+        }
+    }
+}
+
+fn prefer_breaking_repeated_ready_consumers(
+    descs: &[SyscallDesc],
+    previous_syscall_idx: Option<usize>,
+    ready_consumers_all: &[usize],
+    preferred_ready: Vec<usize>,
+) -> Vec<usize> {
+    let Some(previous_syscall_idx) = previous_syscall_idx else {
+        return preferred_ready;
+    };
+    if preferred_ready.is_empty()
+        || !preferred_ready
+            .iter()
+            .all(|&syscall_idx| syscall_idx == previous_syscall_idx)
+    {
+        return preferred_ready;
+    }
+
+    let terminal_consumers = ready_consumers_all
+        .iter()
+        .copied()
+        .filter(|&syscall_idx| is_terminal_resource_syscall(&descs[syscall_idx]))
+        .collect::<Vec<_>>();
+    if terminal_consumers.is_empty() {
+        preferred_ready
+    } else {
+        terminal_consumers
+    }
+}
+
 /// Generate arguments for a syscall.
 fn generate_args(
     desc: &SyscallDesc,
@@ -267,8 +475,8 @@ fn generate_args(
     rng: &mut impl Rng,
 ) -> Vec<ArgValue> {
     let mut args = Vec::with_capacity(desc.args.len());
-    for arg_type in &desc.args {
-        let arg_value = generate_arg(desc, &args, arg_type, available_resources, rng);
+    for (arg_idx, arg_type) in desc.args.iter().enumerate() {
+        let arg_value = generate_arg(desc, arg_idx, &args, arg_type, available_resources, rng);
         args.push(arg_value);
     }
     repair_generated_top_level_derived_args(desc, &mut args);
@@ -329,6 +537,7 @@ fn repair_generated_top_level_derived_args(desc: &SyscallDesc, args: &mut [ArgVa
 /// Generate a single argument value.
 fn generate_arg(
     desc: &SyscallDesc,
+    arg_idx: usize,
     generated_args: &[ArgValue],
     arg_type: &ArgType,
     available_resources: &HashMap<String, Vec<ResultRef>>,
@@ -343,12 +552,7 @@ fn generate_arg(
             ..
         } => {
             if !values.is_empty() {
-                // Pick from valid values, occasionally mutate
-                if rng.gen_bool(0.9) {
-                    ArgValue::Const(values[rng.gen_range(0..values.len())])
-                } else {
-                    ArgValue::Const(random_value_for_size(*size, rng))
-                }
+                ArgValue::Const(values[rng.gen_range(0..values.len())])
             } else if let Some((min, max)) = range {
                 if min <= max {
                     ArgValue::Const(rng.gen_range(*min..=*max))
@@ -373,7 +577,20 @@ fn generate_arg(
             let value = derive_target_length(desc, generated_args, target, *kind).unwrap_or(0);
             ArgValue::Const(scale_length_value(value, *scale) as u64)
         }
-        ArgType::Resource(resource) | ArgType::OptionalResource(resource) => {
+        ArgType::Resource(resource) => {
+            if let Some(available) = available_resources
+                .get(&resource.kind)
+                .filter(|values| !values.is_empty())
+            {
+                return ArgValue::ResultRef(available[rng.gen_range(0..available.len())].clone());
+            }
+            if !resource.values.is_empty() {
+                ArgValue::Const(resource.values[rng.gen_range(0..resource.values.len())])
+            } else {
+                ArgValue::Const(0)
+            }
+        }
+        ArgType::OptionalResource(resource) => {
             if let Some(available) = available_resources
                 .get(&resource.kind)
                 .filter(|values| !values.is_empty())
@@ -399,9 +616,11 @@ fn generate_arg(
                 return ArgValue::Null;
             }
             match dir {
-                PtrDir::Out => ArgValue::OutPtr,
+                PtrDir::Out => {
+                    generate_reserved_pointer_arg_value(inner, desc, generated_args, rng)
+                }
                 PtrDir::In | PtrDir::InOut => {
-                    generate_pointer_arg_value(desc, generated_args, inner, dir, rng)
+                    generate_pointer_arg_value(desc, arg_idx, generated_args, inner, dir, rng)
                 }
             }
         }
@@ -470,6 +689,7 @@ fn generate_arg(
 
 fn generate_pointer_arg_value(
     desc: &SyscallDesc,
+    arg_idx: usize,
     generated_args: &[ArgValue],
     inner: &ArgType,
     dir: &PtrDir,
@@ -481,6 +701,9 @@ fn generate_pointer_arg_value(
             max_size,
             dir,
         } => {
+            if let Some(seed) = special::special_buffer_arg_bytes(&desc.name, arg_idx) {
+                return ArgValue::Buffer(seed.to_vec());
+            }
             let size = rng.gen_range(*min_size..=*max_size);
             let mut data = vec![0u8; size];
             if *dir != BufferDir::Out {
@@ -527,6 +750,11 @@ fn generate_pointer_arg_value(
         } => ArgValue::Buffer(generate_string_bytes(
             values, *noz, *fixed_len, *filename, rng,
         )),
+        ArgType::Filename => {
+            let mut data = random_filename(rng).into_bytes();
+            data.push(0);
+            ArgValue::Buffer(data)
+        }
         ArgType::Array {
             inner: array_inner,
             min_len,
@@ -596,6 +824,16 @@ fn generate_array_arg_value(
     Some(array_inline_arg_value(elements))
 }
 
+fn choose_reserved_array_len(min_len: usize, max_len: usize, rng: &mut impl Rng) -> usize {
+    if max_len == 0 {
+        0
+    } else if min_len == max_len {
+        min_len
+    } else {
+        rng.gen_range(min_len.max(1)..=max_len)
+    }
+}
+
 fn generate_reserved_inline_arg_value(
     arg_type: &ArgType,
     desc: &SyscallDesc,
@@ -624,11 +862,7 @@ fn generate_reserved_array_arg_value(
     generated_args: &[ArgValue],
     rng: &mut impl Rng,
 ) -> Option<ArgValue> {
-    let len = if min_len == max_len {
-        min_len
-    } else {
-        rng.gen_range(min_len..=max_len)
-    };
+    let len = choose_reserved_array_len(min_len, max_len, rng);
     let mut elements = Vec::with_capacity(len);
     for _ in 0..len {
         let mut object = generate_reserved_inline_object_raw(inner, desc, generated_args, rng)?;
@@ -760,8 +994,17 @@ fn generate_inline_object_raw(
             overlay_start,
             ..
         } => {
-            if overlay_start.is_some() {
-                return None;
+            if let Some(overlay_start) = *overlay_start {
+                let mut out = generate_overlay_prefix_inline_object(
+                    fields,
+                    overlay_start,
+                    *packed,
+                    desc,
+                    generated_args,
+                    rng,
+                )?;
+                out.data.resize(*size, 0);
+                return Some(out);
             }
             let mut out = InlineObject::default();
             let mut field_ranges = Vec::with_capacity(fields.len());
@@ -769,8 +1012,12 @@ fn generate_inline_object_raw(
             let mut idx = 0usize;
             while idx < fields.len() {
                 if let Some(info) = bitfield_info[idx] {
-                    let base = if *packed && *varlen {
-                        out.data.len()
+                    let base = if *varlen {
+                        let field_align =
+                            inline_field_alignment(&fields[idx], *packed, bitfield_info[idx])?;
+                        let field_offset = align_inline_offset(out.data.len(), field_align)?;
+                        out.data.resize(field_offset, 0);
+                        field_offset
                     } else {
                         let field_offset = compute_struct_field_offset(
                             fields,
@@ -819,15 +1066,18 @@ fn generate_inline_object_raw(
                         }
                         group_idx += 1;
                     }
-                    out.data.extend_from_slice(&storage);
+                    write_inline_bytes_at(&mut out, base, &storage)?;
                     idx = group_idx + 1;
                     continue;
                 }
 
                 let field = &fields[idx];
                 let child = generate_inline_object_raw(field, desc, generated_args, rng)?;
-                let base = if *packed && *varlen {
-                    out.data.len()
+                let base = if *varlen {
+                    let field_align = inline_field_alignment(field, *packed, bitfield_info[idx])?;
+                    let field_offset = align_inline_offset(out.data.len(), field_align)?;
+                    out.data.resize(field_offset, 0);
+                    field_offset
                 } else {
                     let field_offset =
                         compute_struct_field_offset(fields, idx, *varlen, *packed, *overlay_start)?;
@@ -836,18 +1086,7 @@ fn generate_inline_object_raw(
                 };
                 let end = base.checked_add(child.data.len())?;
                 field_ranges.push((base, end));
-                out.data.extend_from_slice(&child.data);
-                out.pointers
-                    .extend(child.pointers.into_iter().map(|mut pointer| {
-                        pointer.offset += base;
-                        pointer
-                    }));
-                out.struct_layouts.extend(
-                    child
-                        .struct_layouts
-                        .into_iter()
-                        .map(|layout| shift_inline_struct_layout(layout, base)),
-                );
+                merge_inline_child_at(&mut out, base, child)?;
                 idx += 1;
             }
             if !*varlen {
@@ -972,7 +1211,7 @@ fn generate_inline_object_raw(
                     generate_reserved_pointer_arg_value(inner, desc, generated_args, rng)
                 }
                 PtrDir::In | PtrDir::InOut => {
-                    generate_pointer_arg_value(desc, generated_args, inner, dir, rng)
+                    generate_pointer_arg_value(desc, usize::MAX, generated_args, inner, dir, rng)
                 }
             };
             object.pointers.push(InlinePointerValue {
@@ -1063,9 +1302,14 @@ fn generate_reserved_pointer_arg_value(
                     PtrDir::Out => {
                         generate_reserved_pointer_arg_value(nested_inner, desc, generated_args, rng)
                     }
-                    PtrDir::In | PtrDir::InOut => {
-                        generate_pointer_arg_value(desc, generated_args, nested_inner, dir, rng)
-                    }
+                    PtrDir::In | PtrDir::InOut => generate_pointer_arg_value(
+                        desc,
+                        usize::MAX,
+                        generated_args,
+                        nested_inner,
+                        dir,
+                        rng,
+                    ),
                 }
             }
         }
@@ -1126,11 +1370,7 @@ fn generate_reserved_inline_object_raw(
             min_len,
             max_len,
         } => {
-            let len = if min_len == max_len {
-                *min_len
-            } else {
-                rng.gen_range(*min_len..=*max_len)
-            };
+            let len = choose_reserved_array_len(*min_len, *max_len, rng);
             let mut out = InlineObject::default();
             for _ in 0..len {
                 let child = generate_reserved_inline_object_raw(inner, desc, generated_args, rng)?;
@@ -1159,17 +1399,18 @@ fn generate_reserved_inline_object_raw(
             overlay_start,
             ..
         } => {
-            if overlay_start.is_some() {
-                return None;
-            }
             let mut out = InlineObject::default();
             let mut field_ranges = Vec::with_capacity(fields.len());
             let bitfield_info = compute_bitfield_field_info(fields)?;
             let mut idx = 0usize;
             while idx < fields.len() {
                 if let Some(info) = bitfield_info[idx] {
-                    let base = if *packed && *varlen {
-                        out.data.len()
+                    let base = if *varlen {
+                        let field_align =
+                            inline_field_alignment(&fields[idx], *packed, bitfield_info[idx])?;
+                        let field_offset = align_inline_offset(out.data.len(), field_align)?;
+                        out.data.resize(field_offset, 0);
+                        field_offset
                     } else {
                         let field_offset = compute_struct_field_offset(
                             fields,
@@ -1195,15 +1436,18 @@ fn generate_reserved_inline_object_raw(
                         }
                         group_idx += 1;
                     }
-                    out.data.resize(base.checked_add(info.unit_size)?, 0);
+                    write_inline_bytes_at(&mut out, base, &vec![0; info.unit_size])?;
                     idx = group_idx + 1;
                     continue;
                 }
 
                 let field = &fields[idx];
                 let child = generate_reserved_inline_object_raw(field, desc, generated_args, rng)?;
-                let base = if *packed && *varlen {
-                    out.data.len()
+                let base = if *varlen {
+                    let field_align = inline_field_alignment(field, *packed, bitfield_info[idx])?;
+                    let field_offset = align_inline_offset(out.data.len(), field_align)?;
+                    out.data.resize(field_offset, 0);
+                    field_offset
                 } else {
                     let field_offset =
                         compute_struct_field_offset(fields, idx, *varlen, *packed, *overlay_start)?;
@@ -1212,18 +1456,7 @@ fn generate_reserved_inline_object_raw(
                 };
                 let end = base.checked_add(child.data.len())?;
                 field_ranges.push((base, end));
-                out.data.extend_from_slice(&child.data);
-                out.pointers
-                    .extend(child.pointers.into_iter().map(|mut pointer| {
-                        pointer.offset += base;
-                        pointer
-                    }));
-                out.struct_layouts.extend(
-                    child
-                        .struct_layouts
-                        .into_iter()
-                        .map(|layout| shift_inline_struct_layout(layout, base)),
-                );
+                merge_inline_child_at(&mut out, base, child)?;
                 idx += 1;
             }
             if !*varlen {
@@ -1308,7 +1541,7 @@ fn generate_reserved_inline_object_raw(
                     generate_reserved_pointer_arg_value(inner, desc, generated_args, rng)
                 }
                 PtrDir::In | PtrDir::InOut => {
-                    generate_pointer_arg_value(desc, generated_args, inner, dir, rng)
+                    generate_pointer_arg_value(desc, usize::MAX, generated_args, inner, dir, rng)
                 }
             };
             object.pointers.push(InlinePointerValue {
@@ -1419,6 +1652,10 @@ fn patch_inline_len_fields(
                     while !bitfield_info[group_end]?.is_last_in_group {
                         group_end += 1;
                     }
+                    if overlay_start.is_some_and(|start| idx >= start) {
+                        idx = group_end + 1;
+                        continue;
+                    }
                     let unit_offset = ranges[idx].0;
                     let unit_end = if ranges[group_end].1 > unit_offset {
                         ranges[group_end].1
@@ -1471,6 +1708,10 @@ fn patch_inline_len_fields(
                     continue;
                 }
 
+                if overlay_start.is_some_and(|start| idx >= start) {
+                    idx += 1;
+                    continue;
+                }
                 let field = &fields[idx];
                 let (offset, end) = ranges[idx];
                 let snapshot = data.to_vec();
@@ -1896,6 +2137,10 @@ fn mutate_buffer(prog: &mut Program, descs: &[SyscallDesc], rng: &mut impl Rng) 
         if data.is_empty() {
             return;
         }
+        if try_mutate_special_buffer_arg(&desc.name, arg_idx, data, rng) {
+            repair_generated_top_level_derived_args(desc, &mut call.args);
+            return;
+        }
         let op = rng.gen_range(0..3);
         match op {
             0 => {
@@ -1919,6 +2164,75 @@ fn mutate_buffer(prog: &mut Program, descs: &[SyscallDesc], rng: &mut impl Rng) 
             _ => {}
         }
     }
+}
+
+fn try_mutate_special_buffer_arg(
+    desc_name: &str,
+    arg_idx: usize,
+    data: &mut Vec<u8>,
+    rng: &mut impl Rng,
+) -> bool {
+    let Some(seed) = special::special_buffer_arg_bytes(desc_name, arg_idx) else {
+        return false;
+    };
+    if data.is_empty() && seed.is_empty() {
+        return false;
+    }
+
+    let mut raw = decompress_zlib_bytes(data)
+        .or_else(|| decompress_zlib_bytes(seed))
+        .unwrap_or_default();
+    if raw.is_empty() {
+        return false;
+    }
+
+    match rng.gen_range(0..4) {
+        0 => {
+            let pos = rng.gen_range(0..raw.len());
+            raw[pos] ^= 1u8 << rng.gen_range(0..8);
+        }
+        1 => {
+            let pos = rng.gen_range(0..raw.len());
+            let len = rng.gen_range(1..=raw.len().saturating_sub(pos).min(16));
+            for byte in &mut raw[pos..pos + len] {
+                *byte = rng.gen();
+            }
+        }
+        2 => {
+            let pos = rng.gen_range(0..raw.len());
+            raw[pos] = [0, 0xff, 0x7f, 0x80, 0x41][rng.gen_range(0..5)];
+        }
+        3 => {
+            if raw.len() > 1 && rng.gen_bool(0.5) {
+                raw.remove(rng.gen_range(0..raw.len()));
+            } else if raw.len() < (4 << 20) {
+                raw.insert(rng.gen_range(0..=raw.len()), rng.gen());
+            }
+        }
+        _ => {}
+    }
+
+    let Some(compressed) = compress_zlib_bytes(&raw) else {
+        return false;
+    };
+    *data = compressed;
+    true
+}
+
+fn decompress_zlib_bytes(data: &[u8]) -> Option<Vec<u8>> {
+    if data.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut decoder = ZlibDecoder::new(data);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).ok()?;
+    Some(out)
+}
+
+fn compress_zlib_bytes(data: &[u8]) -> Option<Vec<u8>> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(data).ok()?;
+    encoder.finish().ok()
 }
 
 /// Splice: take calls from a fresh program and merge.
@@ -2005,24 +2319,76 @@ fn resource_producers_for_missing_inputs(
     desc: &SyscallDesc,
     available_resources: &HashMap<String, Vec<ResultRef>>,
 ) -> Vec<usize> {
+    let enabled_syscalls = enabled_syscalls.iter().copied().collect::<HashSet<_>>();
     let mut producers = Vec::new();
-    let mut seen = HashSet::new();
-
+    let mut seen_syscalls = HashSet::new();
+    let mut visiting_resources = HashSet::new();
     for resource in input_resources(desc) {
-        let is_available = available_resources
-            .get(&resource.kind)
-            .is_some_and(|values| !values.is_empty());
-        if is_available {
-            continue;
-        }
-        for syscall_idx in resource_constructor_syscalls(descs, &resource) {
-            if enabled_syscalls.contains(&syscall_idx) && seen.insert(syscall_idx) {
-                producers.push(syscall_idx);
-            }
-        }
+        collect_next_step_resource_producers(
+            descs,
+            &enabled_syscalls,
+            &resource,
+            available_resources,
+            &mut visiting_resources,
+            &mut seen_syscalls,
+            &mut producers,
+        );
     }
 
     producers
+}
+
+fn collect_next_step_resource_producers(
+    descs: &[SyscallDesc],
+    enabled_syscalls: &HashSet<usize>,
+    required: &ResourceDesc,
+    available_resources: &HashMap<String, Vec<ResultRef>>,
+    visiting_resources: &mut HashSet<String>,
+    seen_syscalls: &mut HashSet<usize>,
+    producers: &mut Vec<usize>,
+) {
+    let is_available = available_resources
+        .get(&required.kind)
+        .is_some_and(|values| !values.is_empty());
+    if is_available || !visiting_resources.insert(required.kind.clone()) {
+        return;
+    }
+
+    for syscall_idx in resource_constructor_syscalls(descs, required) {
+        if !enabled_syscalls.contains(&syscall_idx) {
+            continue;
+        }
+
+        let missing_inputs = input_resources(&descs[syscall_idx])
+            .into_iter()
+            .filter(|resource| {
+                !available_resources
+                    .get(&resource.kind)
+                    .is_some_and(|values| !values.is_empty())
+            })
+            .collect::<Vec<_>>();
+
+        if missing_inputs.is_empty() {
+            if seen_syscalls.insert(syscall_idx) {
+                producers.push(syscall_idx);
+            }
+            continue;
+        }
+
+        for missing in missing_inputs {
+            collect_next_step_resource_producers(
+                descs,
+                enabled_syscalls,
+                &missing,
+                available_resources,
+                visiting_resources,
+                seen_syscalls,
+                producers,
+            );
+        }
+    }
+
+    visiting_resources.remove(&required.kind);
 }
 
 fn resource_consumers_for_available_inputs(
@@ -2116,6 +2482,7 @@ fn available_resources_before(
 ) -> HashMap<String, Vec<ResultRef>> {
     let mut resources = HashMap::new();
     for (index, call) in calls[..upto].iter().enumerate() {
+        let desc = &descs[call.syscall_idx];
         for (result_idx, output) in resource_outputs(&descs[call.syscall_idx])
             .into_iter()
             .enumerate()
@@ -2129,6 +2496,7 @@ fn available_resources_before(
                 },
             );
         }
+        consume_call_resources(desc, &call.args, &mut resources);
     }
     resources
 }
@@ -2191,6 +2559,7 @@ fn repair_result_refs(prog: &mut Program, descs: &[SyscallDesc]) {
                 },
             );
         }
+        consume_call_resources(desc, &prog.calls[call_idx].args, &mut available_resources);
     }
 }
 
@@ -2275,6 +2644,7 @@ mod tests {
                 },
             ],
             field_names: vec!["a".into(), "b".into()],
+            field_dirs: vec![None, None],
             size: 8,
             varlen: false,
             packed: false,
@@ -2295,6 +2665,7 @@ mod tests {
                 },
             ],
             field_names: vec!["a".into(), "b".into()],
+            field_dirs: vec![None, None],
             size: 4,
             varlen: true,
             packed: false,
@@ -2380,6 +2751,68 @@ mod tests {
             }
             assert_eq!(args[3], ArgValue::Const(8));
         }
+    }
+
+    #[test]
+    fn generates_input_filename_pointers_as_filenames() {
+        let descs = vec![SyscallDesc {
+            name: "open_like".into(),
+            id: 1,
+            arg_names: vec!["dirfd".into(), "path".into(), "flags".into()],
+            args: vec![
+                ArgType::Const {
+                    size: 4,
+                    values: vec![0],
+                    range: None,
+                    endian: ScalarEndian::Native,
+                    allow_any: false,
+                    bitfield_bits: None,
+                },
+                ArgType::Ptr {
+                    inner: Box::new(ArgType::Filename),
+                    dir: PtrDir::In,
+                    optional: false,
+                },
+                ArgType::Const {
+                    size: 4,
+                    values: vec![1],
+                    range: None,
+                    endian: ScalarEndian::Native,
+                    allow_any: false,
+                    bitfield_bits: None,
+                },
+            ],
+            ret: ReturnType::Int,
+            attrs: SyscallAttrs::default(),
+        }];
+        let desc = &descs[0];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x0f11_e123);
+
+        let path = generate_arg(
+            desc,
+            1,
+            &[ArgValue::Const(0)],
+            &desc.args[1],
+            &HashMap::new(),
+            &mut rng,
+        );
+
+        match &path {
+            ArgValue::Buffer(data) => {
+                assert!(data.len() >= 2);
+                assert_eq!(data.last().copied(), Some(0));
+            }
+            other => panic!("expected filename pointer input buffer, got {:?}", other),
+        }
+
+        Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![ArgValue::Const(0), path, ArgValue::Const(1)],
+            }],
+        }
+        .validate(&descs)
+        .expect("generated filename-pointer program should validate");
     }
 
     #[test]
@@ -2476,6 +2909,7 @@ mod tests {
         };
         let arg = generate_arg(
             &desc,
+            0,
             &[],
             &ArgType::Const {
                 size: 8,
@@ -2490,6 +2924,35 @@ mod tests {
         );
 
         assert!(matches!(arg, ArgValue::Const(_)));
+    }
+
+    #[test]
+    fn const_value_sets_stay_within_allowed_values_during_generation() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xc0a5_7eed);
+        let desc = SyscallDesc {
+            name: "const_set".into(),
+            id: 1,
+            arg_names: vec!["value".into()],
+            args: vec![ArgType::Const {
+                size: 4,
+                values: vec![2, 64],
+                range: None,
+                endian: ScalarEndian::Native,
+                allow_any: false,
+                bitfield_bits: None,
+            }],
+            ret: ReturnType::Int,
+            attrs: SyscallAttrs::default(),
+        };
+
+        for _ in 0..64 {
+            let arg = generate_arg(&desc, 0, &[], &desc.args[0], &HashMap::new(), &mut rng);
+            assert!(
+                matches!(arg, ArgValue::Const(2 | 64)),
+                "expected generated constant to stay inside explicit value set, got {:?}",
+                arg
+            );
+        }
     }
 
     #[test]
@@ -2550,6 +3013,43 @@ mod tests {
     }
 
     #[test]
+    fn reserved_output_resource_arrays_stay_nonempty_for_len_fixups() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                resource handle[4] = -1
+                type out_ids {
+                    ids ptr[out, array[handle]]
+                    count len[ids, int32]
+                }
+                syscall make@1 -> int(arg ptr[inout, out_ids])
+            "#,
+        )
+        .expect("reserved output array target should parse");
+        let desc = &descs[0];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x0a11_0ced);
+
+        for _ in 0..8 {
+            let args = generate_args(desc, &HashMap::new(), &mut rng);
+            match &args[0] {
+                ArgValue::Composite { data, pointers, .. } => {
+                    assert_eq!(pointers.len(), 1);
+                    let count = decode_scalar_bytes_endian(&data[8..12], ScalarEndian::Native);
+                    assert!((1..=4).contains(&count));
+                    match pointers[0].value.as_ref() {
+                        ArgValue::Buffer(buf)
+                        | ArgValue::Composite { data: buf, .. }
+                        | ArgValue::Array { data: buf, .. } => {
+                            assert!(buf.len() >= 4);
+                        }
+                        other => panic!("unexpected nested output array value: {:?}", other),
+                    }
+                }
+                other => panic!("unexpected generated make arg: {:?}", other),
+            }
+        }
+    }
+
+    #[test]
     fn generates_structured_sockaddr_bytes_and_matching_length() {
         let descs = crate::description::parse_syscall_descs(
             r#"
@@ -2596,6 +3096,51 @@ mod tests {
     }
 
     #[test]
+    fn required_resources_prefer_materialized_results_over_special_values() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                resource fd[4] = -1, 0, 1, 2
+                resource sock_in[fd]
+                const AF_INET = 2
+                const MSG_DONTWAIT = 64
+                type sockaddr_storage buffer[16:16]
+                socket$inet(domain const[AF_INET, int32], typ const[2, int32], proto const[0, int32]) sock_in
+                sendto$inet(fd sock_in, buf buffer[in], len bytesize[buf, int32], flags const[MSG_DONTWAIT, int32], addr ptr[in, sockaddr_storage], addrlen len[addr, int32])
+            "#,
+        )
+        .expect("sendto target should parse");
+        let desc = &descs[1];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x50cc_e700);
+        let mut available_resources = HashMap::new();
+        register_available_resource(
+            &mut available_resources,
+            match &descs[0].ret {
+                ReturnType::Resource(resource) => resource,
+                other => panic!("unexpected socket return: {:?}", other),
+            },
+            ResultRef {
+                call_idx: 0,
+                result_idx: 0,
+            },
+        );
+
+        for _ in 0..32 {
+            let args = generate_args(desc, &available_resources, &mut rng);
+            assert!(
+                matches!(
+                    args[0],
+                    ArgValue::ResultRef(ResultRef {
+                        call_idx: 0,
+                        result_idx: 0
+                    })
+                ),
+                "expected sendto fd to reuse materialized socket resource, got {:?}",
+                args[0]
+            );
+        }
+    }
+
+    #[test]
     fn generates_buffer_lengths_for_len_and_bytesize() {
         let descs = crate::description::parse_syscall_descs(
             r#"
@@ -2629,6 +3174,49 @@ mod tests {
     }
 
     #[test]
+    fn generates_top_level_output_pointer_lengths_for_variable_buffers() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                resource fd[4] = -1, 0
+                syscall recv@1(fd fd, buf ptr[out, array[int8, 4:32]], len bytesize[buf, int32])
+            "#,
+        )
+        .expect("recv target should parse");
+        let desc = &descs[0];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x600d_f00d);
+        let mut available_resources = HashMap::new();
+        register_available_resource(
+            &mut available_resources,
+            match &desc.args[0] {
+                ArgType::Resource(resource) | ArgType::OptionalResource(resource) => resource,
+                other => panic!("unexpected recv fd arg: {:?}", other),
+            },
+            ResultRef {
+                call_idx: 0,
+                result_idx: 0,
+            },
+        );
+
+        let args = generate_args(desc, &available_resources, &mut rng);
+        let buf_len = match &args[1] {
+            ArgValue::Buffer(data) => data.len() as u64,
+            ArgValue::Array { data, .. } => data.len() as u64,
+            ArgValue::Composite { data, .. } => data.len() as u64,
+            other => panic!("unexpected recv buf arg: {:?}", other),
+        };
+        assert!(buf_len >= 4 && buf_len <= 32);
+        assert!(matches!(args[2], ArgValue::Const(v) if v == buf_len));
+
+        let prog = Program {
+            calls: vec![Call {
+                syscall_idx: 0,
+                args: vec![ArgValue::Const(0), args[1].clone(), args[2].clone()],
+            }],
+        };
+        validate_program(&prog, &descs).expect("generated recv program should validate");
+    }
+
+    #[test]
     fn missing_sock_input_prefers_sock_constructor() {
         let descs = crate::description::parse_syscall_descs(
             r#"
@@ -2648,6 +3236,59 @@ mod tests {
             &descs[1],
             &HashMap::new(),
         );
+        assert_eq!(producers, vec![0]);
+    }
+
+    #[test]
+    fn generation_never_starts_with_missing_resource_consumer_when_constructor_exists() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                resource fd[4] = -1, 0
+                resource sock[fd] = -1, 0
+                syscall socket@1 -> sock(const[4; 2], const[4; 1], const[4; 0])
+                syscall accept@2 -> int(sock, ptr[out, array[int8, 4]], ptr[inout, int32])
+                syscall close@3 -> int(fd)
+            "#,
+        )
+        .expect("test target should parse");
+        let choice_table = SyscallChoiceTable::build(&descs, &[]);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xace0_0001);
+
+        for _ in 0..32 {
+            let choice = choose_syscall_for_generation(
+                &descs,
+                &choice_table,
+                None,
+                &HashMap::new(),
+                &HashMap::new(),
+                &mut rng,
+            );
+            assert_eq!(choice, 0);
+        }
+    }
+
+    #[test]
+    fn missing_recursive_resource_input_falls_back_to_root_constructor() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                resource fd[4] = -1, 0
+                resource sock[fd] = -1, 0
+                resource listener[sock] = -1, 0
+                syscall socket@1 -> sock(const[4; 2], const[4; 1], const[4; 0])
+                syscall mark_listener@2 -> listener(sock)
+                syscall accept@3 -> int(listener)
+            "#,
+        )
+        .expect("test target should parse");
+
+        let availability = transitively_enabled_syscalls(&descs);
+        let producers = resource_producers_for_missing_inputs(
+            &descs,
+            &availability.enabled,
+            &descs[2],
+            &HashMap::new(),
+        );
+
         assert_eq!(producers, vec![0]);
     }
 
@@ -2688,6 +3329,69 @@ mod tests {
             assert!(!prog.calls.is_empty());
             assert!(prog.calls.iter().all(|call| call.syscall_idx == 0));
         }
+    }
+
+    #[test]
+    fn generation_uses_seed_backed_compressed_images() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                syz_read_part_table(size len[img], img ptr[in, compressed_image]) (no_generate)
+            "#,
+        )
+        .expect("seed-backed helper target should parse");
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x1357_2468);
+
+        let prog = generate(&descs, &mut rng);
+        assert!(!prog.calls.is_empty());
+        assert!(prog.calls.iter().all(|call| call.syscall_idx == 0));
+        assert_eq!(prog.calls[0].args.len(), 2);
+
+        match (&prog.calls[0].args[0], &prog.calls[0].args[1]) {
+            (ArgValue::Const(size), ArgValue::Buffer(data)) => {
+                assert!(!data.is_empty());
+                assert_eq!(*size as usize, data.len());
+            }
+            other => panic!("unexpected generated args: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn special_compressed_image_mutation_keeps_program_valid() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                syz_read_part_table(size len[img], img ptr[in, compressed_image]) (no_generate)
+            "#,
+        )
+        .expect("seed-backed helper target should parse");
+        let desc = &descs[0];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x2468_1357);
+        let mut prog = generate(&descs, &mut rng);
+
+        let original_data = match &prog.calls[0].args[1] {
+            ArgValue::Buffer(data) => data.clone(),
+            other => panic!("unexpected generated image arg: {:?}", other),
+        };
+        let original_raw =
+            decompress_zlib_bytes(&original_data).expect("seeded image should decompress");
+
+        let ArgValue::Buffer(data) = &mut prog.calls[0].args[1] else {
+            panic!("expected top-level image buffer");
+        };
+        assert!(try_mutate_special_buffer_arg(&desc.name, 1, data, &mut rng));
+        repair_generated_top_level_derived_args(desc, &mut prog.calls[0].args);
+
+        let ArgValue::Const(size) = prog.calls[0].args[0] else {
+            panic!("expected derived len arg");
+        };
+        let ArgValue::Buffer(data) = &prog.calls[0].args[1] else {
+            panic!("expected mutated image buffer");
+        };
+        let mutated_raw =
+            decompress_zlib_bytes(data).expect("mutated image should still decompress");
+
+        assert_eq!(size as usize, data.len());
+        assert_ne!(mutated_raw, original_raw);
+        validate_program(&prog, &descs).expect("mutated image helper program should validate");
     }
 
     #[test]
@@ -2791,6 +3495,161 @@ mod tests {
             );
             assert_ne!(choice, 2);
         }
+    }
+
+    #[test]
+    fn ready_resource_consumers_prefer_non_terminal_calls_over_close() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                resource fd[4] = -1, 0
+                resource sock[fd] = -1, 0
+                syscall socket@1 -> sock(const[4; 2], const[4; 1], const[4; 0])
+                syscall sendto@2 -> int(fd sock, buf buffer[in], len len[buf, int32])
+                syscall close@3 -> int(fd)
+            "#,
+        )
+        .expect("test target should parse");
+        let choice_table = SyscallChoiceTable::build(&descs, &[]);
+        let mut available_resources = HashMap::new();
+        register_available_resource(
+            &mut available_resources,
+            match &descs[0].ret {
+                ReturnType::Resource(resource) => resource,
+                other => panic!("unexpected socket return: {:?}", other),
+            },
+            ResultRef {
+                call_idx: 0,
+                result_idx: 0,
+            },
+        );
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5150_c10e);
+
+        for _ in 0..32 {
+            let choice = choose_syscall_for_generation(
+                &descs,
+                &choice_table,
+                Some(0),
+                &available_resources,
+                &HashMap::new(),
+                &mut rng,
+            );
+            assert_eq!(choice, 1);
+        }
+    }
+
+    #[test]
+    fn repeated_single_nonterminal_ready_consumer_yields_to_close() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                resource fd[4] = -1, 0
+                resource sock[fd] = -1, 0
+                syscall socket@1 -> sock(const[4; 2], const[4; 1], const[4; 0])
+                syscall sendto@2 -> int(fd sock, buf buffer[in], len len[buf, int32])
+                syscall close@3 -> int(fd)
+            "#,
+        )
+        .expect("test target should parse");
+        let choice_table = SyscallChoiceTable::build(&descs, &[]);
+        let mut available_resources = HashMap::new();
+        register_available_resource(
+            &mut available_resources,
+            match &descs[0].ret {
+                ReturnType::Resource(resource) => resource,
+                other => panic!("unexpected socket return: {:?}", other),
+            },
+            ResultRef {
+                call_idx: 0,
+                result_idx: 0,
+            },
+        );
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xc105_e0ff);
+
+        for _ in 0..32 {
+            let choice = choose_syscall_for_generation(
+                &descs,
+                &choice_table,
+                Some(1),
+                &available_resources,
+                &HashMap::new(),
+                &mut rng,
+            );
+            assert_eq!(choice, 2);
+        }
+    }
+
+    #[test]
+    fn available_resources_before_drops_closed_results() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                resource fd[4] = -1, 0
+                resource sock[fd] = -1, 0
+                syscall socket@1 -> sock(const[4; 2], const[4; 1], const[4; 0])
+                syscall close@2 -> int(fd)
+            "#,
+        )
+        .expect("test target should parse");
+        let prog = Program {
+            calls: vec![
+                Call {
+                    syscall_idx: 0,
+                    args: vec![ArgValue::Const(2), ArgValue::Const(1), ArgValue::Const(0)],
+                },
+                Call {
+                    syscall_idx: 1,
+                    args: vec![ArgValue::ResultRef(ResultRef {
+                        call_idx: 0,
+                        result_idx: 0,
+                    })],
+                },
+            ],
+        };
+
+        let available = available_resources_before(&prog.calls, &descs, prog.calls.len());
+        assert!(available.values().all(|values| values.is_empty()));
+        assert!(available.is_empty());
+    }
+
+    #[test]
+    fn repair_result_refs_after_removal_drops_closed_resources() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                resource fd[4] = -1, 0
+                resource sock[fd] = -1, 0
+                syscall socket@1 -> sock(const[4; 2], const[4; 1], const[4; 0])
+                syscall close@2 -> int(fd)
+                syscall sendto@3 -> int(fd sock, buf buffer[in], len len[buf, int32])
+            "#,
+        )
+        .expect("test target should parse");
+        let mut prog = Program {
+            calls: vec![
+                Call {
+                    syscall_idx: 0,
+                    args: vec![ArgValue::Const(2), ArgValue::Const(1), ArgValue::Const(0)],
+                },
+                Call {
+                    syscall_idx: 1,
+                    args: vec![ArgValue::ResultRef(ResultRef {
+                        call_idx: 0,
+                        result_idx: 0,
+                    })],
+                },
+                Call {
+                    syscall_idx: 2,
+                    args: vec![
+                        ArgValue::ResultRef(ResultRef {
+                            call_idx: 0,
+                            result_idx: 0,
+                        }),
+                        ArgValue::Buffer(vec![1, 2, 3]),
+                        ArgValue::Const(3),
+                    ],
+                },
+            ],
+        };
+
+        repair_result_refs(&mut prog, &descs);
+        assert_eq!(prog.calls[2].args[0], ArgValue::Const(u64::MAX));
     }
 
     #[test]
@@ -3399,6 +4258,46 @@ mod tests {
             assert_eq!(data.len() % 8, 0);
             assert_eq!(decode_scalar_bytes(&data[..8]) as usize, data.len());
             assert_eq!(prog.calls[0].args[2], ArgValue::Const(data.len() as u64));
+        }
+    }
+
+    #[test]
+    fn generates_out_overlay_structs_without_clobbering_input_prefix() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                type overlay_args {
+                    kind int32[1:10]
+                    devid int32 (out_overlay)
+                    magic int32
+                } [size[8]]
+                syscall use_overlay@1 -> int(arg ptr[inout, overlay_args], arglen len[arg, intptr])
+            "#,
+        )
+        .expect("overlay target should parse");
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x0a11_0a77);
+
+        for _ in 0..8 {
+            let prog = generate(&descs, &mut rng);
+            prog.validate(&descs)
+                .expect("generated program with out_overlay struct should validate");
+
+            let data = match &prog.calls[0].args[0] {
+                ArgValue::Buffer(data) => data,
+                ArgValue::Composite {
+                    data,
+                    pointers,
+                    struct_layouts,
+                } => {
+                    assert!(pointers.is_empty());
+                    assert!(struct_layouts.is_empty());
+                    data
+                }
+                other => panic!("unexpected generated overlay arg: {:?}", other),
+            };
+            assert_eq!(data.len(), 8);
+            assert!((1..=10).contains(&(decode_scalar_bytes(&data[..4]) as usize)));
+            assert_eq!(decode_scalar_bytes(&data[4..8]), 0);
+            assert_eq!(prog.calls[0].args[1], ArgValue::Const(8));
         }
     }
 

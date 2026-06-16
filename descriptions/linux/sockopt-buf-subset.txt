@@ -1,0 +1,16 @@
+include <linux/socket.h>
+
+resource fd[4] = -1, 0, 1, 2, 3, 4
+resource sock[fd]
+
+type sock_pair {
+    left sock
+    right sock
+} [size[8]]
+
+type sockopt_word buffer[4:4]
+
+socketpair(domain const[AF_UNIX], type const[SOCK_STREAM], proto const[0], fds ptr[out, sock_pair]) int
+setsockopt(fd sock, level const[SOL_SOCKET, int32], optname const[SO_SNDBUF, int32], optval sockopt_word, optlen len[optval, int32]) int
+getsockopt(fd sock, level const[SOL_SOCKET, int32], optname const[SO_TYPE, int32], optval sockopt_word, optlen ptr[inout, len[optval, int32]]) int
+close(fd fd) int

@@ -1,0 +1,780 @@
+const AF_INET = 2
+const SOCK_DGRAM = 2
+const SIOCETHTOOL = 35142
+const ETHTOOL_GDRVINFO = 3
+const ETHTOOL_GREGS = 4
+const ETHTOOL_GWOL = 5
+const ETHTOOL_GMSGLVL = 7
+const ETHTOOL_GLINK = 10
+const ETHTOOL_GEEPROM = 11
+const ETHTOOL_GCOALESCE = 14
+const ETHTOOL_GRINGPARAM = 16
+const ETHTOOL_GPAUSEPARAM = 18
+const ETHTOOL_GRXFH = 41
+const ETHTOOL_GRXCLSRULE = 47
+const ETHTOOL_GRXRINGS = 45
+const ETHTOOL_GRXCLSRLCNT = 46
+const ETHTOOL_GRXCLSRLALL = 48
+const ETHTOOL_GRXCSUM = 20
+const ETHTOOL_GTXCSUM = 22
+const ETHTOOL_GSG = 24
+const ETHTOOL_GSTRINGS = 27
+const ETHTOOL_GSTATS = 29
+const ETHTOOL_GTSO = 30
+const ETHTOOL_GPERMADDR = 32
+const ETHTOOL_GUFO = 33
+const ETHTOOL_GGSO = 35
+const ETHTOOL_GFLAGS = 37
+const ETHTOOL_GPFLAGS = 39
+const ETHTOOL_GGRO = 43
+const ETHTOOL_GRXFHINDIR = 56
+const ETHTOOL_GRSSH = 70
+const ETHTOOL_GFEATURES = 58
+const ETHTOOL_GCHANNELS = 60
+const ETHTOOL_GEEE = 68
+const ETHTOOL_GTUNABLE = 72
+const ETHTOOL_GET_TS_INFO = 65
+const ETHTOOL_GMODULEINFO = 66
+const ETHTOOL_GMODULEEEPROM = 67
+const ETHTOOL_GSSET_INFO = 55
+const ETHTOOL_GLINKSETTINGS = 76
+const ETHTOOL_TX_COPYBREAK = 2
+const ETHTOOL_TUNABLE_U32 = 3
+const ETH_SS_STATS = 1
+const ETH_SS_STATS_MASK = 2
+const FLOW_RSS = 536870912
+const TCP_V4_FLOW = 1
+const TCP_V4_FLOW_EXT = -2147483647
+const TCP_V4_FLOW_MAC_EXT = 1073741825
+
+resource fd[4] = -1, 0, 1, 2, 3, 4
+resource sock[fd]
+
+devnames = "lo"
+
+type devname string[devnames, 16]
+
+type ethtool_drvinfo {
+    cmd const[ETHTOOL_GDRVINFO, int32]
+    driver array[int8, 32]
+    version array[int8, 32]
+    fw_version array[int8, 32]
+    bus_info array[int8, 32]
+    erom_version array[int8, 32]
+    reserved2 array[int8, 12]
+    n_priv_flags int32
+    n_stats int32
+    testinfo_len int32
+    eedump_len int32
+    regdump_len int32
+}
+
+type ethtool_value {
+    cmd const[ETHTOOL_GLINK, int32]
+    data int32
+}
+
+type ethtool_msglvl_value {
+    cmd const[ETHTOOL_GMSGLVL, int32]
+    data int32
+}
+
+type ethtool_rx_csum_value {
+    cmd const[ETHTOOL_GRXCSUM, int32]
+    data int32
+}
+
+type ethtool_tx_csum_value {
+    cmd const[ETHTOOL_GTXCSUM, int32]
+    data int32
+}
+
+type ethtool_gro_value {
+    cmd const[ETHTOOL_GGRO, int32]
+    data int32
+}
+
+type ethtool_sg_value {
+    cmd const[ETHTOOL_GSG, int32]
+    data int32
+}
+
+type ethtool_tso_value {
+    cmd const[ETHTOOL_GTSO, int32]
+    data int32
+}
+
+type ethtool_ufo_value {
+    cmd const[ETHTOOL_GUFO, int32]
+    data int32
+}
+
+type ethtool_gso_value {
+    cmd const[ETHTOOL_GGSO, int32]
+    data int32
+}
+
+type ethtool_flags_value {
+    cmd const[ETHTOOL_GFLAGS, int32]
+    data int32
+}
+
+type ethtool_rxfh_indir_min {
+    cmd const[ETHTOOL_GRXFHINDIR, int32]
+    size len[ring_index, int32]
+    ring_index array[int32, 1:4]
+}
+
+type ethtool_rxfh_min {
+    cmd const[ETHTOOL_GRSSH, int32]
+    rss_context const[0, int32]
+    indir_size len[rss_config, int32]
+    key_size const[0, int32]
+    hfunc const[0, int8]
+    rsvd8_0 const[0, int8]
+    rsvd8_1 const[0, int8]
+    rsvd8_2 const[0, int8]
+    rsvd32 const[0, int32]
+    rss_config array[int32, 1:4]
+}
+
+type ethtool_rxfh_keyed {
+    cmd const[ETHTOOL_GRSSH, int32]
+    rss_context const[0, int32]
+    indir_size len[rss_config, int32]
+    key_size len[key, int32]
+    hfunc const[0, int8]
+    rsvd8_0 const[0, int8]
+    rsvd8_1 const[0, int8]
+    rsvd8_2 const[0, int8]
+    rsvd32 const[0, int32]
+    rss_config array[int32, 1:4]
+    key array[int8, 4:16]
+}
+
+type ethtool_pflags_value {
+    cmd const[ETHTOOL_GPFLAGS, int32]
+    data int32
+}
+
+type ethtool_wolinfo {
+    cmd const[ETHTOOL_GWOL, int32]
+    supported int32
+    wolopts int32
+    sopass array[int8, 6]
+}
+
+type ethtool_regs {
+    cmd const[ETHTOOL_GREGS, int32]
+    version int32
+    len len[data, int32]
+    data array[int8, 32:128]
+}
+
+type ethtool_eeprom {
+    cmd const[ETHTOOL_GEEPROM, int32]
+    magic int32
+    offset int32
+    len len[data, int32]
+    data array[int8, 32:128]
+}
+
+type ethtool_tunable_u32 {
+    cmd const[ETHTOOL_GTUNABLE, int32]
+    id const[ETHTOOL_TX_COPYBREAK, int32]
+    type_id const[ETHTOOL_TUNABLE_U32, int32]
+    len len[data, int32]
+    data array[int8, 4]
+}
+
+type ethtool_tcpip4_spec_min {
+    ip4src int32
+    ip4dst int32
+    psrc int16
+    pdst int16
+    tos int8
+    pad array[const[0, int8], 3]
+}
+
+type ethtool_flow_union_tcp_v4_min {
+    tcp ethtool_tcpip4_spec_min
+    pad array[const[0, int8], 36]
+}
+
+type ethtool_flow_ext_min {
+    padding array[const[0, int8], 2]
+    h_dest array[int8, 6]
+    vlan_etype int16
+    vlan_tci int16
+    data array[int32, 2]
+}
+
+type ethtool_rx_flow_spec_query_min {
+    flow_type const[0, int32]
+    payload array[const[0, int8], 148]
+    ring_cookie const[0, int64]
+    location int32
+    pad array[const[0, int8], 4]
+}
+
+type ethtool_rx_flow_spec_tcp_v4_query_min {
+    flow_type const[TCP_V4_FLOW, int32]
+    h_u ethtool_flow_union_tcp_v4_min
+    h_ext array[const[0, int8], 20]
+    m_u array[const[0, int8], 52]
+    m_ext array[const[0, int8], 20]
+    align_pad array[const[0, int8], 4]
+    ring_cookie const[0, int64]
+    location int32
+    pad array[const[0, int8], 4]
+}
+
+type ethtool_rx_flow_spec_tcp_v4_ext_query_min {
+    flow_type const[TCP_V4_FLOW_EXT, int32]
+    h_u ethtool_flow_union_tcp_v4_min
+    h_ext ethtool_flow_ext_min
+    m_u array[const[0, int8], 52]
+    m_ext ethtool_flow_ext_min
+    align_pad array[const[0, int8], 4]
+    ring_cookie const[0, int64]
+    location int32
+    pad array[const[0, int8], 4]
+}
+
+type ethtool_rx_flow_spec_tcp_v4_mac_ext_query_min {
+    flow_type const[TCP_V4_FLOW_MAC_EXT, int32]
+    h_u ethtool_flow_union_tcp_v4_min
+    h_ext ethtool_flow_ext_min
+    m_u array[const[0, int8], 52]
+    m_ext ethtool_flow_ext_min
+    align_pad array[const[0, int8], 4]
+    ring_cookie const[0, int64]
+    location int32
+    pad array[const[0, int8], 4]
+}
+
+type ethtool_rx_flow_spec_rss_query_min {
+    flow_type const[FLOW_RSS, int32]
+    payload array[const[0, int8], 148]
+    ring_cookie const[0, int64]
+    location int32
+    pad array[const[0, int8], 4]
+}
+
+type ethtool_rxnfc_hash_min {
+    cmd const[ETHTOOL_GRXFH, int32]
+    flow_type const[0, int32]
+    data const[0, int64]
+    fs array[const[0, int8], 168]
+    rule_cnt const[0, int32]
+}
+
+type ethtool_rxnfc_rule_query_min {
+    cmd const[ETHTOOL_GRXCLSRULE, int32]
+    flow_type const[0, int32]
+    data const[0, int64]
+    fs ethtool_rx_flow_spec_query_min
+    rule_cnt const[0, int32]
+}
+
+type ethtool_rxnfc_tcp_v4_query_min {
+    cmd const[ETHTOOL_GRXCLSRULE, int32]
+    flow_type const[TCP_V4_FLOW, int32]
+    data const[0, int64]
+    fs ethtool_rx_flow_spec_tcp_v4_query_min
+    rule_cnt const[0, int32]
+}
+
+type ethtool_rxnfc_tcp_v4_ext_query_min {
+    cmd const[ETHTOOL_GRXCLSRULE, int32]
+    flow_type const[TCP_V4_FLOW_EXT, int32]
+    data const[0, int64]
+    fs ethtool_rx_flow_spec_tcp_v4_ext_query_min
+    rule_cnt const[0, int32]
+}
+
+type ethtool_rxnfc_tcp_v4_mac_ext_query_min {
+    cmd const[ETHTOOL_GRXCLSRULE, int32]
+    flow_type const[TCP_V4_FLOW_MAC_EXT, int32]
+    data const[0, int64]
+    fs ethtool_rx_flow_spec_tcp_v4_mac_ext_query_min
+    rule_cnt const[0, int32]
+}
+
+type ethtool_rxnfc_rss_query_min {
+    cmd const[ETHTOOL_GRXCLSRULE, int32]
+    flow_type const[FLOW_RSS, int32]
+    data const[0, int64]
+    fs ethtool_rx_flow_spec_rss_query_min
+    rss_context int32
+}
+
+type ethtool_rxnfc_rings_min {
+    cmd const[ETHTOOL_GRXRINGS, int32]
+    flow_type const[0, int32]
+    data const[0, int64]
+    fs array[const[0, int8], 168]
+    rule_cnt const[0, int32]
+}
+
+type ethtool_rxnfc_rule_cnt_min {
+    cmd const[ETHTOOL_GRXCLSRLCNT, int32]
+    flow_type const[0, int32]
+    data const[0, int64]
+    fs array[const[0, int8], 168]
+    rule_cnt const[0, int32]
+}
+
+type ethtool_rxnfc_rule_locs_min {
+    cmd const[ETHTOOL_GRXCLSRLALL, int32]
+    flow_type const[0, int32]
+    data const[0, int64]
+    fs array[const[0, int8], 168]
+    rule_cnt len[rule_locs, int32]
+    rule_locs array[int32, 1:4]
+}
+
+type ethtool_pauseparam {
+    cmd const[ETHTOOL_GPAUSEPARAM, int32]
+    autoneg int32
+    rx_pause int32
+    tx_pause int32
+}
+
+type ethtool_perm_addr {
+    cmd const[ETHTOOL_GPERMADDR, int32]
+    size len[data, int32]
+    data array[int8, 6:32]
+}
+
+type ethtool_stats {
+    cmd const[ETHTOOL_GSTATS, int32]
+    n_stats len[data, int32]
+    data array[int64, 1:4]
+}
+
+type ethtool_gstrings {
+    cmd const[ETHTOOL_GSTRINGS, int32]
+    string_set const[ETH_SS_STATS, int32]
+    len len[data, int32]
+    data array[int8, 32:128]
+}
+
+type ethtool_sset_info {
+    cmd const[ETHTOOL_GSSET_INFO, int32]
+    reserved const[0, int32]
+    sset_mask const[ETH_SS_STATS_MASK, int64]
+    data array[int32, 1:4]
+}
+
+type ethtool_get_features_block {
+    available const[0, int32]
+    requested const[0, int32]
+    active const[0, int32]
+    never_changed const[0, int32]
+}
+
+type ethtool_gfeatures {
+    cmd const[ETHTOOL_GFEATURES, int32]
+    size len[features, int32]
+    features array[ethtool_get_features_block, 1:4]
+}
+
+type ethtool_channels {
+    cmd const[ETHTOOL_GCHANNELS, int32]
+    max_rx int32
+    max_tx int32
+    max_other int32
+    max_combined int32
+    rx_count int32
+    tx_count int32
+    other_count int32
+    combined_count int32
+}
+
+type ethtool_coalesce {
+    cmd const[ETHTOOL_GCOALESCE, int32]
+    rx_coalesce_usecs int32
+    rx_max_coalesced_frames int32
+    rx_coalesce_usecs_irq int32
+    rx_max_coalesced_frames_irq int32
+    tx_coalesce_usecs int32
+    tx_max_coalesced_frames int32
+    tx_coalesce_usecs_irq int32
+    tx_max_coalesced_frames_irq int32
+    stats_block_coalesce_usecs int32
+    use_adaptive_rx_coalesce int32
+    use_adaptive_tx_coalesce int32
+    pkt_rate_low int32
+    rx_coalesce_usecs_low int32
+    rx_max_coalesced_frames_low int32
+    tx_coalesce_usecs_low int32
+    tx_max_coalesced_frames_low int32
+    pkt_rate_high int32
+    rx_coalesce_usecs_high int32
+    rx_max_coalesced_frames_high int32
+    tx_coalesce_usecs_high int32
+    tx_max_coalesced_frames_high int32
+    rate_sample_interval int32
+}
+
+type ethtool_ringparam {
+    cmd const[ETHTOOL_GRINGPARAM, int32]
+    rx_max_pending int32
+    rx_mini_max_pending int32
+    rx_jumbo_max_pending int32
+    tx_max_pending int32
+    rx_pending int32
+    rx_mini_pending int32
+    rx_jumbo_pending int32
+    tx_pending int32
+}
+
+type ethtool_modinfo {
+    cmd const[ETHTOOL_GMODULEINFO, int32]
+    type int32
+    eeprom_len int32
+    reserved array[const[0, int32], 8]
+}
+
+type ethtool_module_eeprom {
+    cmd const[ETHTOOL_GMODULEEEPROM, int32]
+    magic int32
+    offset int32
+    len len[data, int32]
+    data array[int8, 32:128]
+}
+
+type ethtool_eee {
+    cmd const[ETHTOOL_GEEE, int32]
+    supported int32
+    advertised int32
+    lp_advertised int32
+    eee_active int32
+    eee_enabled int32
+    tx_lpi_enabled int32
+    tx_lpi_timer int32
+    reserved array[int32, 2]
+}
+
+type ethtool_ts_info {
+    cmd const[ETHTOOL_GET_TS_INFO, int32]
+    so_timestamping const[0, int32]
+    phc_index const[0, int32]
+    tx_types const[0, int32]
+    tx_reserved array[const[0, int32], 3]
+    rx_filters const[0, int32]
+    rx_reserved array[const[0, int32], 3]
+}
+
+type ethtool_link_settings_min {
+    cmd const[ETHTOOL_GLINKSETTINGS, int32]
+    speed int32
+    duplex int8
+    port int8
+    phy_address int8
+    autoneg int8
+    mdio_support int8
+    eth_tp_mdix int8
+    eth_tp_mdix_ctrl int8
+    link_mode_masks_nwords len[link_mode_masks, int8]
+    reserved array[const[0, int32], 8]
+    link_mode_masks array[int32, 1:4]
+}
+
+type ifreq_ethtool {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_drvinfo]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_value {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_value]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_msglvl_value {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_msglvl_value]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_rx_csum_value {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_rx_csum_value]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_tx_csum_value {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_tx_csum_value]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_gro_value {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_gro_value]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_sg_value {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_sg_value]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_tso_value {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_tso_value]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_ufo_value {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_ufo_value]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_gso_value {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_gso_value]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_flags_value {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_flags_value]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_pflags_value {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_pflags_value]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_rxfh_indir_min {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_rxfh_indir_min]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_rxfh_min {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_rxfh_min]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_rxfh_keyed {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_rxfh_keyed]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_wolinfo {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_wolinfo]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_regs {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_regs]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_eeprom {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_eeprom]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_tunable_u32 {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_tunable_u32]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_rxnfc_hash_min {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_rxnfc_hash_min]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_rxnfc_rule_query_min {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_rxnfc_rule_query_min]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_rxnfc_tcp_v4_query_min {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_rxnfc_tcp_v4_query_min]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_rxnfc_tcp_v4_ext_query_min {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_rxnfc_tcp_v4_ext_query_min]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_rxnfc_tcp_v4_mac_ext_query_min {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_rxnfc_tcp_v4_mac_ext_query_min]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_rxnfc_rss_query_min {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_rxnfc_rss_query_min]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_rxnfc_rings_min {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_rxnfc_rings_min]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_rxnfc_rule_cnt_min {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_rxnfc_rule_cnt_min]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_rxnfc_rule_locs_min {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_rxnfc_rule_locs_min]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_pauseparam {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_pauseparam]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_perm_addr {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_perm_addr]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_stats {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_stats]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_gstrings {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_gstrings]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_sset_info {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_sset_info]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_gfeatures {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_gfeatures]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_channels {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_channels]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_coalesce {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_coalesce]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_ringparam {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_ringparam]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_modinfo {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_modinfo]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_module_eeprom {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_module_eeprom]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_eee {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_eee]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_ts_info {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_ts_info]
+    pad array[int8, 16]
+} [size[40]]
+
+type ifreq_ethtool_link_settings {
+    ifr_name devname
+    ifr_data ptr[inout, ethtool_link_settings_min]
+    pad array[int8, 16]
+} [size[40]]
+
+socket$inet(domain const[AF_INET], type const[SOCK_DGRAM, int32], proto const[0, int32]) sock
+ioctl$sock_SIOCETHTOOL_GDRVINFO@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool]) int
+ioctl$sock_SIOCETHTOOL_GWOL@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_wolinfo]) int
+ioctl$sock_SIOCETHTOOL_GMSGLVL@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_msglvl_value]) int
+ioctl$sock_SIOCETHTOOL_GREGS@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_regs]) int
+ioctl$sock_SIOCETHTOOL_GEEPROM@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_eeprom]) int
+ioctl$sock_SIOCETHTOOL_GTUNABLE@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_tunable_u32]) int
+ioctl$sock_SIOCETHTOOL_GRXFH@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_rxnfc_hash_min]) int
+ioctl$sock_SIOCETHTOOL_GRXCLSRULE@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_rxnfc_rule_query_min]) int
+ioctl$sock_SIOCETHTOOL_GRXCLSRULE_TCP_V4@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_rxnfc_tcp_v4_query_min]) int
+ioctl$sock_SIOCETHTOOL_GRXCLSRULE_TCP_V4_EXT@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_rxnfc_tcp_v4_ext_query_min]) int
+ioctl$sock_SIOCETHTOOL_GRXCLSRULE_TCP_V4_MAC_EXT@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_rxnfc_tcp_v4_mac_ext_query_min]) int
+ioctl$sock_SIOCETHTOOL_GRXCLSRULE_RSS@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_rxnfc_rss_query_min]) int
+ioctl$sock_SIOCETHTOOL_GRXRINGS@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_rxnfc_rings_min]) int
+ioctl$sock_SIOCETHTOOL_GRXCLSRLCNT@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_rxnfc_rule_cnt_min]) int
+ioctl$sock_SIOCETHTOOL_GRXCLSRLALL@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_rxnfc_rule_locs_min]) int
+ioctl$sock_SIOCETHTOOL_GLINK@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_value]) int
+ioctl$sock_SIOCETHTOOL_GPAUSEPARAM@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_pauseparam]) int
+ioctl$sock_SIOCETHTOOL_GRXCSUM@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_rx_csum_value]) int
+ioctl$sock_SIOCETHTOOL_GTXCSUM@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_tx_csum_value]) int
+ioctl$sock_SIOCETHTOOL_GSG@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_sg_value]) int
+ioctl$sock_SIOCETHTOOL_GSTRINGS@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_gstrings]) int
+ioctl$sock_SIOCETHTOOL_GTSO@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_tso_value]) int
+ioctl$sock_SIOCETHTOOL_GUFO@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_ufo_value]) int
+ioctl$sock_SIOCETHTOOL_GGSO@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_gso_value]) int
+ioctl$sock_SIOCETHTOOL_GFLAGS@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_flags_value]) int
+ioctl$sock_SIOCETHTOOL_GPFLAGS@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_pflags_value]) int
+ioctl$sock_SIOCETHTOOL_GGRO@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_gro_value]) int
+ioctl$sock_SIOCETHTOOL_GRXFHINDIR@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_rxfh_indir_min]) int
+ioctl$sock_SIOCETHTOOL_GRSSH@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_rxfh_min]) int
+ioctl$sock_SIOCETHTOOL_GRSSH_KEYED@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_rxfh_keyed]) int
+ioctl$sock_SIOCETHTOOL_GFEATURES@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_gfeatures]) int
+ioctl$sock_SIOCETHTOOL_GCHANNELS@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_channels]) int
+ioctl$sock_SIOCETHTOOL_GCOALESCE@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_coalesce]) int
+ioctl$sock_SIOCETHTOOL_GRINGPARAM@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_ringparam]) int
+ioctl$sock_SIOCETHTOOL_GMODULEINFO@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_modinfo]) int
+ioctl$sock_SIOCETHTOOL_GMODULEEEPROM@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_module_eeprom]) int
+ioctl$sock_SIOCETHTOOL_GEEE@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_eee]) int
+ioctl$sock_SIOCETHTOOL_GET_TS_INFO@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_ts_info]) int
+ioctl$sock_SIOCETHTOOL_GLINKSETTINGS@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_link_settings]) int
+ioctl$sock_SIOCETHTOOL_GSSET_INFO@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_sset_info]) int
+ioctl$sock_SIOCETHTOOL_GSTATS@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_stats]) int
+ioctl$sock_SIOCETHTOOL_GPERMADDR@960(fd sock, cmd const[SIOCETHTOOL, intptr], arg ptr[inout, ifreq_ethtool_perm_addr]) int
+close(fd fd) int

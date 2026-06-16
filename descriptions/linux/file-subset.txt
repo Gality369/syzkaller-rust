@@ -1,0 +1,20 @@
+const AT_FDCWD = -100
+const OPEN_RDWR_CREATE_TRUNC = 578
+const SEEK_SET = 0
+
+resource fd[int32]: -1
+
+type iovec_out {
+    base ptr[out, array[int8, 4:16]]
+    len len[base, intptr]
+} [size[16]]
+
+openat(dirfd const[AT_FDCWD, int32], file filename, flags const[OPEN_RDWR_CREATE_TRUNC, int32], mode const[0o600, int32]) fd
+write(fd fd, buf buffer[in], count len[buf, int32])
+pwrite64(fd fd, buf buffer[in], count len[buf, int32], pos const[0, int64])
+lseek(fd fd, offset const[0, int64], whence const[SEEK_SET, int32])
+read(fd fd, buf buffer[out], count bytesize[buf, int32])
+pread64(fd fd, buf buffer[out], count bytesize[buf, int32], pos const[0, int64])
+readv(fd fd, vec ptr[in, array[iovec_out, 1:2]], vlen len[vec, intptr])
+preadv(fd fd, vec ptr[in, array[iovec_out, 1:2]], vlen len[vec, intptr], off_low const[0, int32], off_high const[0, int32])
+close(fd fd)

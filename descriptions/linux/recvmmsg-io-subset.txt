@@ -1,0 +1,58 @@
+resource fd[4] = -1, 0, 1, 2, 3, 4
+resource sock_tx_batch[fd]
+resource sock_rx_batch[fd]
+
+const AF_UNIX = 1
+const SOCK_DGRAM = 2
+const MSG_DONTWAIT = 64
+constset zero_4[4] = 0
+flagset recv_flags[4] = MSG_DONTWAIT
+
+type iovec_in {
+    base ptr[in; array[int8; 4:16]]
+    len len[base, intptr]
+} [size[16]]
+
+type iovec_out {
+    base ptr[out; array[int8; 4:16]]
+    len len[base, intptr]
+} [size[16]]
+
+type send_msghdr {
+    msg_name ptr[in, buffer[16:16], opt]
+    msg_namelen len[msg_name, int32]
+    msg_iov ptr[in, array[iovec_in; 1:2]]
+    msg_iovlen len[msg_iov, intptr]
+    msg_control ptr[in, array[int8; 0:16], opt]
+    msg_controllen bytesize[msg_control, intptr]
+    msg_flags const[zero_4]
+} [size[56]]
+
+type recv_msghdr {
+    msg_name ptr[out, buffer[16:16], opt]
+    msg_namelen len[msg_name, int32]
+    msg_iov ptr[in, array[iovec_out; 1:2]]
+    msg_iovlen len[msg_iov, intptr]
+    msg_control ptr[out, array[int8; 0:16], opt]
+    msg_controllen bytesize[msg_control, intptr]
+    msg_flags const[zero_4]
+} [size[56]]
+
+type send_mmsghdr {
+    msg_hdr send_msghdr
+    msg_len const[zero_4]
+} [size[64]]
+
+type recv_mmsghdr {
+    msg_hdr recv_msghdr
+    msg_len const[zero_4]
+} [size[64]]
+
+sock_batch_pair {
+    tx sock_tx_batch
+    rx sock_rx_batch
+} [size[8]]
+
+socketpair(domain const[AF_UNIX], type const[SOCK_DGRAM], proto const[0], fds ptr[out, sock_batch_pair]) int
+sendmmsg(fd sock_tx_batch, msgvec ptr[in, array[send_mmsghdr; 1:2]], vlen len[msgvec, int32], flags const[0]) int
+recvmmsg(fd sock_rx_batch, msgvec ptr[in, array[recv_mmsghdr; 1:2]], vlen len[msgvec, int32], flags flags[recv_flags], timeout ptr[in, buffer[16:16], opt]) int

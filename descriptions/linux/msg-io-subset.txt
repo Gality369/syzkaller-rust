@@ -1,0 +1,38 @@
+resource fd[4] = -1, 0, 1, 2, 3, 4
+resource sock[fd] = -1, 0, 1, 2, 3, 4
+
+const AF_UNIX = 1
+const SOCK_DGRAM = 2
+constset zero_4[4] = 0
+
+type iovec {
+    base ptr[in; array[int8; 4:8]]
+    len len[base, intptr]
+} [size[16]]
+
+type cmsghdr_like {
+    cmsg_len bytesize[parent, intptr]
+    cmsg_level const[zero_4]
+    cmsg_type const[zero_4]
+    data array[int8; 0:16]
+} [varlen, align[8]]
+
+type send_msghdr {
+    msg_name ptr[in, buffer[16:16], opt]
+    msg_namelen len[msg_name, int32]
+    msg_iov ptr[in, array[iovec; 1:2]]
+    msg_iovlen len[msg_iov, intptr]
+    msg_control ptr[in, array[cmsghdr_like; 1:2], opt]
+    msg_controllen bytesize[msg_control, intptr]
+    msg_flags const[zero_4]
+} [size[56]]
+
+type send_mmsghdr {
+    msg_hdr send_msghdr
+    msg_len const[zero_4]
+} [size[64]]
+
+socketpair(domain const[AF_UNIX], type const[SOCK_DGRAM], proto const[0], fds ptr[out, array[sock, 2]]) int
+sendmsg(fd sock, msg ptr[in, send_msghdr], flags const[0]) int
+sendmmsg(fd sock, msgvec ptr[in, array[send_mmsghdr, 1:2]], vlen len[msgvec, int32], flags const[0]) int
+close(fd fd) int

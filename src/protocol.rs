@@ -99,6 +99,7 @@ pub fn send_exec_request(
     prog_data: &[u8],
     env_flags: ExecEnv,
     exec_flags: ExecFlag,
+    request_flags: RequestFlag,
     sandbox_arg: i64,
     all_signal: &[i32],
 ) -> io::Result<()> {
@@ -119,7 +120,7 @@ pub fn send_exec_request(
         avoid: 0,
         data: Some(data_vec),
         exec_opts: Some(exec_opts),
-        flags: RequestFlag::empty(),
+        flags: request_flags,
         all_signal: signal_vec,
     };
     let exec_off = ExecRequestRaw::create(&mut builder, &exec_args);

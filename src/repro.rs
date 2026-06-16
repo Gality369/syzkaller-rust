@@ -5,6 +5,7 @@ use crate::flatrpc_generated::rpc::*;
 use crate::program::{self, ArgType, ArgValue, Call, Program, ResultRef, SyscallDesc};
 use crate::protocol;
 use crate::qemu::QemuInstance;
+use crate::target;
 use serde::Serialize;
 use std::io;
 use std::io::Write;
@@ -112,6 +113,7 @@ struct ReproAttemptRecord {
 #[derive(Debug, Clone)]
 struct ReplayArtifact {
     repro_path: Option<String>,
+    target_bundle: Option<String>,
     syscall_descriptions: Option<String>,
     program_text: String,
     program_ir: Option<Program>,
@@ -306,11 +308,18 @@ pub fn run_repro_worker_once_with_attempts(
             .unwrap_or("<program file fallback>")
     );
 
-    let descs = match program::load_syscall_descs(
-        cfg.syscall_descriptions
-            .as_deref()
-            .or(artifact.syscall_descriptions.as_deref()),
+    let descs = match match (
+        artifact.target_bundle.as_deref(),
+        artifact.syscall_descriptions.as_deref(),
     ) {
+        (Some(bundle), _) => target::load_target(target::TargetSource::BundlePath(bundle.into()))
+            .map(|loaded| loaded.descs),
+        (None, Some(path)) => {
+            target::load_target(target::TargetSource::DescriptionPath(path.into()))
+                .map(|loaded| loaded.descs)
+        }
+        (None, None) => target::load_target_from_config(&cfg, None).map(|loaded| loaded.descs),
+    } {
         Ok(descs) => descs,
         Err(err) => {
             report.worker_error = Some(err);
@@ -788,6 +797,7 @@ fn build_latest_minimize_seed_repro_info(
             signature: entry.signature.clone(),
             manager_instance: 0,
             total_execs: 0,
+            target_bundle: cfg.target_bundle.clone(),
             syscall_descriptions: cfg.syscall_descriptions.clone(),
             executor: cfg.executor.clone(),
             sandbox: cfg.sandbox.clone(),
@@ -811,6 +821,7 @@ fn build_latest_minimize_seed_repro_info(
     repro.artifact_type = entry.artifact_type.clone();
     repro.summary = entry.summary.clone();
     repro.signature = entry.signature.clone();
+    repro.target_bundle = repro.target_bundle.or_else(|| cfg.target_bundle.clone());
     repro.syscall_descriptions = repro
         .syscall_descriptions
         .or_else(|| cfg.syscall_descriptions.clone());
@@ -895,11 +906,13 @@ fn load_replay_artifact(
                 format!("failed to parse repro info {}: {}", path.display(), err),
             )
         })?;
+        let target_bundle = repro.target_bundle.clone();
         let syscall_descriptions = repro.syscall_descriptions.clone();
         let program_text = repro.program.clone();
         let program_ir = repro.program_ir.clone();
         return Ok(ReplayArtifact {
             repro_path: Some(path.display().to_string()),
+            target_bundle,
             syscall_descriptions,
             program_text,
             program_ir,
@@ -911,6 +924,7 @@ fn load_replay_artifact(
     let program_text = std::fs::read_to_string(&program_path)?;
     Ok(ReplayArtifact {
         repro_path: None,
+        target_bundle: None,
         syscall_descriptions: None,
         program_text,
         program_ir: None,
@@ -1295,12 +1309,14 @@ fn replay_once(
         env_flags |= ExecEnv::Signal;
     }
     let exec_flags = ExecFlag::CollectSignal;
+    let request_flags = RequestFlag::ReturnError | RequestFlag::ReturnOutput;
     protocol::send_exec_request(
         &mut session.stream,
         0,
         prog_data,
         env_flags,
         exec_flags,
+        request_flags,
         0,
         &[],
     )?;
@@ -1593,6 +1609,7 @@ mod tests {
         };
         let artifact = ReplayArtifact {
             repro_path: None,
+            target_bundle: None,
             syscall_descriptions: None,
             program_text: "0. definitely_not_a_real_syscall()\n".to_string(),
             program_ir: Some(prog.clone()),
@@ -1973,6 +1990,7 @@ mod tests {
         };
         let artifact = ReplayArtifact {
             repro_path: Some("/tmp/repro.json".to_string()),
+            target_bundle: None,
             syscall_descriptions: Some("descriptions/linux/socket-subset.txt".to_string()),
             program_text: "0. socket$inet(0x2, 0x1, 0x0)\n".to_string(),
             program_ir: Some(prog.clone()),
@@ -1985,6 +2003,7 @@ mod tests {
             sshkey: "/tmp/key".to_string(),
             ssh_user: "root".to_string(),
             executor: "/tmp/syz-executor".to_string(),
+            target_bundle: None,
             syscall_descriptions: Some("descriptions/linux/socket-subset.txt".to_string()),
             procs: 1,
             sandbox: "none".to_string(),

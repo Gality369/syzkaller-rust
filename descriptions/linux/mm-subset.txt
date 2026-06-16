@@ -1,0 +1,28 @@
+include <linux/mman.h>
+
+const PROT_READ = 0x1
+const PROT_WRITE = 0x2
+const MAP_PRIVATE = 0x02
+const MAP_ANONYMOUS = 0x20
+const MADV_NORMAL = 0
+const MADV_RANDOM = 1
+const MADV_SEQUENTIAL = 2
+const MADV_DONTNEED = 4
+const MS_ASYNC = 1
+const MS_INVALIDATE = 2
+const MREMAP_MAYMOVE = 1
+
+flagset mmap_prot[4] = PROT_READ, PROT_WRITE, PROT_READ|PROT_WRITE
+flagset mmap_flags[4] = MAP_PRIVATE|MAP_ANONYMOUS
+flagset madvise_flags[4] = MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, MADV_DONTNEED
+flagset msync_flags[4] = 0, MS_ASYNC, MS_INVALIDATE, MS_ASYNC|MS_INVALIDATE
+flagset mremap_flags[4] = 0, MREMAP_MAYMOVE
+constset minus_one_4[4] = -1
+constset zero_8[8] = 0
+
+mmap(addr vma[1:4], len len[addr], prot flags[mmap_prot], flags flags[mmap_flags], fd const[minus_one_4], offset const[zero_8])
+mprotect(addr vma[1:4], len len[addr], prot flags[mmap_prot])
+madvise(addr vma[1:4], len len[addr], advice flags[madvise_flags])
+msync(addr vma[1:4], len len[addr], f flags[msync_flags])
+mremap(addr vma[1:4], len len[addr], newlen len[newaddr], flags flags[mremap_flags], newaddr vma[1:6])
+munmap(addr vma[1:4], len len[addr])

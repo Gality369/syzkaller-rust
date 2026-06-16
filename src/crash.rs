@@ -286,6 +286,9 @@ pub struct ArtifactReproInfo {
     pub signature: String,
     pub manager_instance: usize,
     pub total_execs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_bundle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub syscall_descriptions: Option<String>,
     pub executor: String,
     pub sandbox: String,
@@ -442,6 +445,26 @@ pub fn save_timeout(
     profile_desc: &str,
     repro_info: Option<&ArtifactReproInfo>,
 ) -> std::io::Result<()> {
+    save_timeout_with_log(
+        workdir,
+        reason,
+        program_desc,
+        shape_desc,
+        profile_desc,
+        repro_info,
+        None,
+    )
+}
+
+pub fn save_timeout_with_log(
+    workdir: &str,
+    reason: &str,
+    program_desc: &str,
+    shape_desc: &str,
+    profile_desc: &str,
+    repro_info: Option<&ArtifactReproInfo>,
+    log_output: Option<&[u8]>,
+) -> std::io::Result<()> {
     let timeout_dir = std::path::Path::new(workdir).join("timeouts");
     std::fs::create_dir_all(&timeout_dir)?;
 
@@ -458,6 +481,9 @@ pub fn save_timeout(
     std::fs::write(timeout_subdir.join("program"), program_desc.as_bytes())?;
     std::fs::write(timeout_subdir.join("shape"), shape_desc.as_bytes())?;
     std::fs::write(timeout_subdir.join("profile"), profile_desc.as_bytes())?;
+    if let Some(log_output) = log_output {
+        std::fs::write(timeout_subdir.join("log"), log_output)?;
+    }
     let metadata = update_artifact_metadata(
         &timeout_subdir,
         "timeout",
@@ -483,7 +509,7 @@ pub fn save_timeout(
     snapshot_first_seen_files(
         &timeout_subdir,
         metadata.occurrences,
-        &["reason", "program", "shape", "profile", "repro.json"],
+        &["reason", "program", "shape", "profile", "log", "repro.json"],
     )?;
     update_artifact_catalog(
         std::path::Path::new(workdir),
@@ -493,7 +519,7 @@ pub fn save_timeout(
             &metadata,
             "reason",
             "program",
-            None,
+            log_output.map(|_| "log"),
             Some("shape"),
             Some("profile"),
             repro_written.then_some("repro.json"),
@@ -899,8 +925,14 @@ pub fn sync_artifact_catalog(workdir: &str) -> std::io::Result<ArtifactCatalogSy
         "program",
         Some("log"),
     )?;
-    let (timeout_entries, skipped_timeouts) =
-        scan_artifact_catalog_entries(workdir, "timeout", "timeouts", "reason", "program", None)?;
+    let (timeout_entries, skipped_timeouts) = scan_artifact_catalog_entries(
+        workdir,
+        "timeout",
+        "timeouts",
+        "reason",
+        "program",
+        Some("log"),
+    )?;
     let mut entries = crash_entries;
     entries.extend(timeout_entries);
     let report = ArtifactCatalogSyncReport {
@@ -1528,8 +1560,8 @@ mod tests {
         normalize_summary, peek_repro_queue_entry_at, record_repro_queue_attempt,
         record_repro_queue_attempt_at, relative_artifact_path, release_repro_queue_claim,
         requeue_repro_queue_claim, requeue_repro_queue_claim_at, save_crash, save_timeout,
-        sync_artifact_catalog, ArtifactCatalog, ArtifactMetadata, ArtifactReproInfo,
-        ArtifactReproQueue,
+        save_timeout_with_log, sync_artifact_catalog, ArtifactCatalog, ArtifactMetadata,
+        ArtifactReproInfo, ArtifactReproQueue,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1572,6 +1604,7 @@ mod tests {
             signature: signature.to_string(),
             manager_instance: 0,
             total_execs: 7,
+            target_bundle: None,
             syscall_descriptions: Some("/tmp/socket-subset.txt".to_string()),
             executor: "/tmp/syz-executor".to_string(),
             sandbox: "none".to_string(),
@@ -1607,7 +1640,8 @@ mod tests {
             "",
         ]);
 
-        save_timeout(
+        let log = b"[   12.345678] INFO: task hung for more than 120 seconds\n";
+        save_timeout_with_log(
             workdir.to_str().expect("temp path should be utf-8"),
             "executor_reported_hang",
             program,
@@ -1621,6 +1655,7 @@ mod tests {
                 Some("socket$inet"),
                 Some("socket$inet->connect$inet"),
             )),
+            Some(log),
         )
         .expect("timeout artifact should save");
 
@@ -1643,6 +1678,7 @@ mod tests {
             std::fs::read_to_string(timeout_subdir.join("shape")).expect("shape file should exist");
         let profile = std::fs::read_to_string(timeout_subdir.join("profile"))
             .expect("profile file should exist");
+        let timeout_log = std::fs::read(timeout_subdir.join("log")).expect("log file should exist");
         let metadata = std::fs::read_to_string(timeout_subdir.join("metadata.json"))
             .expect("metadata file should exist");
         let metadata: ArtifactMetadata =
@@ -1657,6 +1693,7 @@ mod tests {
         assert_eq!(first_program, program);
         assert_eq!(shape, "socket$inet");
         assert_eq!(profile, "socket$inet->connect$inet");
+        assert_eq!(timeout_log, log);
         assert_eq!(metadata.artifact_type, "timeout");
         assert_eq!(metadata.summary, "executor_reported_hang");
         assert_eq!(metadata.normalized_summary, "executor_reported_hang");
@@ -1673,6 +1710,14 @@ mod tests {
         assert_eq!(catalog.version, 2);
         assert_eq!(catalog.entries.len(), 1);
         assert_eq!(catalog.entries[0].artifact_type, "timeout");
+        assert_eq!(
+            catalog.entries[0].log_path.as_deref(),
+            Some(relative_artifact_path(&workdir, &timeout_subdir.join("log")).as_str())
+        );
+        assert_eq!(
+            catalog.entries[0].preferred_log_path.as_deref(),
+            Some(relative_artifact_path(&workdir, &timeout_subdir.join("first_log")).as_str())
+        );
         assert_eq!(
             catalog.entries[0].directory,
             relative_artifact_path(&workdir, &timeout_subdir)
@@ -2689,22 +2734,24 @@ mod tests {
         let workdir = unique_temp_dir("artifact-catalog-sync");
         std::fs::create_dir_all(&workdir).expect("temp workdir should be creatable");
 
-        save_timeout(
+        save_timeout_with_log(
             workdir.to_str().expect("temp path should be utf-8"),
             "manager_request_timeout",
             "0. socket$inet(0x2, 0x2, 0x0)\n1. connect$inet(...)\n",
             "socket$inet",
             "socket$inet->connect$inet",
             None,
+            Some(b"timeout log one\n"),
         )
         .expect("timeout artifact should save");
-        save_timeout(
+        save_timeout_with_log(
             workdir.to_str().expect("temp path should be utf-8"),
             "manager_request_timeout",
             "0. socket$inet(0x2, 0x2, 0x0)\n1. connect$inet(...)\n2. close(...)\n",
             "socket$inet",
             "socket$inet->connect$inet",
             None,
+            Some(b"timeout log two\n"),
         )
         .expect("timeout artifact should save");
         save_crash(
@@ -2745,6 +2792,29 @@ mod tests {
                 .clone()
                 .expect("rebuilt timeout entry should preserve first-program path")
         );
+        assert_eq!(
+            timeout_entry.log_path.as_deref(),
+            Some(
+                relative_artifact_path(
+                    &workdir,
+                    &workdir
+                        .join("timeouts")
+                        .join(format!(
+                            "manager_request_timeout_{}",
+                            artifact_signature(&[
+                                "timeout",
+                                "manager_request_timeout",
+                                "socket$inet",
+                                "socket$inet->connect$inet",
+                                "",
+                            ])
+                        ))
+                        .join("log")
+                )
+                .as_str()
+            )
+        );
+        assert!(timeout_entry.preferred_log_path.is_some());
         let crash_entry = catalog
             .entries
             .iter()

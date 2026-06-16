@@ -1,1 +1,4 @@
 /target
+/workdir
+/config.local.json
+config.json

@@ -1,0 +1,6 @@
+resource pid[int32]: 0, -1
+
+getpid() pid (automatic_helper)
+gettid() pid (automatic_helper)
+getpgid(pid pid) pid (automatic_helper)
+setpgid(pid pid, pgid pid)

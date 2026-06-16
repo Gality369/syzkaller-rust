@@ -11,6 +11,9 @@ use std::sync::OnceLock;
 
 const TARGET_ARCH: &str = "amd64";
 const TARGET_PTR_SIZE: u64 = 8;
+const KNOWN_CONST_FILE_ARCHES: &[&str] = &[
+    "386", "amd64", "arm", "arm64", "mips64le", "ppc64le", "riscv64", "s390x", "loong64",
+];
 
 fn builtin_consts() -> HashMap<String, u64> {
     HashMap::from([
@@ -213,6 +216,7 @@ struct TemplateField {
 #[derive(Debug, Clone, Copy, Default)]
 struct FieldAttrs {
     overlay: bool,
+    dir: Option<PtrDir>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -388,6 +392,10 @@ fn parse_path(
         eprintln!("parse_path: file {}", resolved.display());
     }
 
+    if resolved.extension() == Some(OsStr::new("const")) && !const_file_matches_target(&resolved) {
+        return Ok(());
+    }
+
     let input = fs::read_to_string(&resolved).map_err(|err| {
         format!(
             "failed to read description file {}: {}",
@@ -404,7 +412,7 @@ fn parse_path(
         return Ok(());
     }
 
-    if let Some(const_sibling) = sibling_const_path(&resolved) {
+    for const_sibling in sibling_const_paths(&resolved) {
         if const_sibling.exists() {
             parse_path(&const_sibling, state, visited)?;
         }
@@ -495,7 +503,7 @@ fn prescan_path_definitions(
         if !file_meta_allows_target(&lines, &source)? {
             return Ok(());
         }
-        if let Some(const_sibling) = sibling_const_path(&resolved) {
+        for const_sibling in sibling_const_paths(&resolved) {
             if const_sibling.exists() {
                 prescan_path_definitions(&const_sibling, state, visited)?;
             }
@@ -506,6 +514,9 @@ fn prescan_path_definitions(
     }
 
     if resolved.extension() == Some(OsStr::new("const")) {
+        if !const_file_matches_target(&resolved) {
+            return Ok(());
+        }
         let input = fs::read_to_string(&resolved).map_err(|err| {
             format!(
                 "failed to read description file {}: {}",
@@ -586,12 +597,15 @@ fn collect_prescan_files(
             err
         )
     })?;
+    if resolved.extension() == Some(OsStr::new("const")) && !const_file_matches_target(&resolved) {
+        return Ok(());
+    }
     if resolved.extension() == Some(OsStr::new("txt")) {
         let lines = input.lines().collect::<Vec<_>>();
         if !file_meta_allows_target(&lines, &resolved.display().to_string())? {
             return Ok(());
         }
-        if let Some(const_sibling) = sibling_const_path(&resolved) {
+        for const_sibling in sibling_const_paths(&resolved) {
             if const_sibling.exists() {
                 collect_prescan_files(&const_sibling, files, visited)?;
             }
@@ -1502,12 +1516,36 @@ fn path_sort_key(path: &Path) -> (u8, String, u8, String) {
     )
 }
 
-fn sibling_const_path(path: &Path) -> Option<PathBuf> {
+fn sibling_const_paths(path: &Path) -> Vec<PathBuf> {
     if path.extension() != Some(OsStr::new("txt")) {
-        return None;
+        return Vec::new();
     }
-    let file_name = path.file_name()?.to_str()?;
-    Some(path.with_file_name(format!("{}.const", file_name)))
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
+    let Some(stem) = path.file_stem().and_then(|name| name.to_str()) else {
+        return vec![path.with_file_name(format!("{}.const", file_name))];
+    };
+
+    let mut out = vec![path.with_file_name(format!("{}.const", file_name))];
+    let arch_specific = path.with_file_name(format!("{}_{}.const", stem, TARGET_ARCH));
+    if !out.contains(&arch_specific) {
+        out.push(arch_specific);
+    }
+    out
+}
+
+fn const_file_arch_suffix(path: &Path) -> Option<&'static str> {
+    let stem = path.file_stem()?.to_str()?;
+    KNOWN_CONST_FILE_ARCHES.iter().copied().find(|arch| {
+        stem.strip_suffix(arch)
+            .is_some_and(|prefix| prefix.ends_with('_'))
+    })
+}
+
+fn const_file_matches_target(path: &Path) -> bool {
+    path.extension() != Some(OsStr::new("const"))
+        || const_file_arch_suffix(path).is_none_or(|arch| arch == TARGET_ARCH)
 }
 
 fn parse_const_file(
@@ -2280,7 +2318,17 @@ fn parse_field_attrs(text: &str) -> FieldAttrs {
     let inner = text.trim().strip_suffix(')').unwrap_or(text.trim());
     for attr in split_top_level(inner, ',') {
         match attr.trim() {
-            "out_overlay" | "in_overlay" => attrs.overlay = true,
+            "out_overlay" => {
+                attrs.overlay = true;
+                attrs.dir = Some(PtrDir::Out);
+            }
+            "in_overlay" => {
+                attrs.overlay = true;
+                attrs.dir = Some(PtrDir::In);
+            }
+            "out" => attrs.dir = Some(PtrDir::Out),
+            "inout" => attrs.dir = Some(PtrDir::InOut),
+            "in" => attrs.dir = Some(PtrDir::In),
             _ => {}
         }
     }
@@ -2331,6 +2379,10 @@ fn build_struct_arg_type(
         .enumerate()
         .map(|(idx, field)| (field.name.clone(), idx))
         .collect::<HashMap<_, _>>();
+    let field_dirs = fields
+        .iter()
+        .map(|field| field.attrs.dir)
+        .collect::<Vec<_>>();
     let mut parsed_fields = Vec::new();
     for field in fields {
         let type_text = bindings
@@ -2374,6 +2426,7 @@ fn build_struct_arg_type(
                 if let Some((truncated_fields, truncated_field_names)) =
                     truncate_zero_suffixed_varlen_struct_fields(fields, &parsed_fields, packed)
                 {
+                    let truncated_field_count = truncated_field_names.len();
                     parsed_field_names = truncated_field_names;
                     let (field_prefix_size, has_var_tail) =
                         crate::program::struct_layout_prefix_size(
@@ -2387,6 +2440,7 @@ fn build_struct_arg_type(
                         type_name: type_name.map(str::to_string),
                         fields: truncated_fields,
                         field_names: parsed_field_names,
+                        field_dirs: field_dirs[..truncated_field_count].to_vec(),
                         size: declared_size.unwrap_or(field_prefix_size),
                         varlen: has_var_tail,
                         packed,
@@ -2420,6 +2474,7 @@ fn build_struct_arg_type(
         type_name: type_name.map(str::to_string),
         fields: parsed_fields,
         field_names: parsed_field_names,
+        field_dirs,
         size,
         varlen: has_var_tail,
         packed,
@@ -2451,6 +2506,7 @@ fn build_union_arg_type(
         .collect::<HashMap<_, _>>();
     let mut parsed_fields = Vec::new();
     let mut parsed_field_names = Vec::new();
+    let mut parsed_field_dirs = Vec::new();
     let mut skipped_recursive_fields = false;
     for field in fields {
         let type_text = bindings
@@ -2554,12 +2610,14 @@ fn build_union_arg_type(
             Err(err) => return Err(err),
         };
         parsed_field_names.push(field.name.clone());
+        parsed_field_dirs.push(field.attrs.dir);
         parsed_fields.push(arg_type);
     }
     if parsed_fields.is_empty() {
         if attrs.varlen && skipped_recursive_fields {
             parsed_fields.push(ArgType::Void);
             parsed_field_names.push("void".to_string());
+            parsed_field_dirs.push(None);
         } else {
             return Err(format!(
                 "line {}: union must retain at least one field after recursive field filtering",
@@ -2616,6 +2674,7 @@ fn build_union_arg_type(
         type_name: type_name.map(str::to_string),
         fields: parsed_fields,
         field_names: parsed_field_names,
+        field_dirs: parsed_field_dirs,
         size,
         varlen: attrs.varlen,
         packed: attrs.packed,
@@ -2679,6 +2738,7 @@ fn coerce_opaque_arg_to_fixed_size(field: &ArgType) -> Option<ArgType> {
             type_name,
             fields,
             field_names,
+            field_dirs,
             size,
             packed,
             align,
@@ -2699,6 +2759,7 @@ fn coerce_opaque_arg_to_fixed_size(field: &ArgType) -> Option<ArgType> {
                 type_name: type_name.clone(),
                 fields,
                 field_names: field_names.clone(),
+                field_dirs: field_dirs.clone(),
                 size: (*size).max(field_prefix_size),
                 varlen: false,
                 packed: *packed,
@@ -2710,6 +2771,7 @@ fn coerce_opaque_arg_to_fixed_size(field: &ArgType) -> Option<ArgType> {
             type_name,
             fields,
             field_names,
+            field_dirs,
             size,
             packed,
             align,
@@ -2733,6 +2795,7 @@ fn coerce_opaque_arg_to_fixed_size(field: &ArgType) -> Option<ArgType> {
                 type_name: type_name.clone(),
                 fields,
                 field_names: field_names.clone(),
+                field_dirs: field_dirs.clone(),
                 size: (*size).max(rounded_size),
                 varlen: false,
                 packed: *packed,
@@ -2814,6 +2877,7 @@ fn annotate_named_arg_type(arg_type: ArgType, type_name: &str) -> ArgType {
             type_name: _,
             fields,
             field_names,
+            field_dirs,
             size,
             varlen,
             packed,
@@ -2823,6 +2887,7 @@ fn annotate_named_arg_type(arg_type: ArgType, type_name: &str) -> ArgType {
             type_name: Some(type_name.to_string()),
             fields,
             field_names,
+            field_dirs,
             size,
             varlen,
             packed,
@@ -2833,6 +2898,7 @@ fn annotate_named_arg_type(arg_type: ArgType, type_name: &str) -> ArgType {
             type_name: _,
             fields,
             field_names,
+            field_dirs,
             size,
             varlen,
             packed,
@@ -2841,6 +2907,7 @@ fn annotate_named_arg_type(arg_type: ArgType, type_name: &str) -> ArgType {
             type_name: Some(type_name.to_string()),
             fields,
             field_names,
+            field_dirs,
             size,
             varlen,
             packed,
@@ -2877,6 +2944,7 @@ fn instantiate_template(
             type_name: Some(template.name.clone()),
             fields: vec![ArgType::Void],
             field_names: vec!["void".to_string()],
+            field_dirs: vec![None],
             size: 0,
             varlen: false,
             packed: false,
@@ -3240,8 +3308,7 @@ fn parse_name_and_id_or_lookup<'a>(
             line_no
         ));
     }
-    let lookup_name = text.split('$').next().unwrap_or(text);
-    if let Some(id) = builtin_linux_amd64_syscall_id(lookup_name) {
+    if let Some(id) = builtin_linux_amd64_syscall_id(text) {
         *next_synthetic_syscall_id = (*next_synthetic_syscall_id).max(id + 1);
         return Ok((text, id));
     }
@@ -3267,46 +3334,27 @@ fn is_valid_syscall_name(text: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
 }
 
-fn builtin_linux_amd64_syscall_id(name: &str) -> Option<u64> {
-    Some(match name {
-        "openat" => 4304,
-        "accept" => 0,
-        "accept4" => 11,
-        "bind" => 90,
-        "close" => 248,
-        "connect" => 256,
-        "getpeername" => 526,
-        "read" => 5186,
-        "getsockname" => 563,
-        "getsockopt" => 577,
-        "recvfrom" => 5511,
-        "recvmmsg" => 5527,
-        "recvmsg" => 5530,
-        "sendmmsg" => 5673,
-        "sendmsg" => 5682,
-        "sendto" => 6688,
-        "setsockopt" => 6751,
-        "shutdown" => 7173,
-        "write" => 7616,
-        "writev" => 8027,
-        "pipe2" => 4854,
-        "dup3" => 301,
-        "socket" => 7181,
-        "socketpair" => 7261,
-        "listen" => 4062,
-        "eventfd2" => 322,
-        "mmap" => 4170,
-        "munmap" => 4287,
-        "mprotect" => 4243,
-        "mkdirat" => 4152,
-        "unlinkat" => 7588,
-        "fstat" => 484,
-        "getcwd" => 509,
-        "getpid" => 543,
-        "getuid" => 862,
-        "ioctl" => 960,
-        _ => return None,
+fn linux_amd64_syscall_ids() -> &'static HashMap<&'static str, u64> {
+    static IDS: OnceLock<HashMap<&'static str, u64>> = OnceLock::new();
+    IDS.get_or_init(|| {
+        include_str!("../data/linux_amd64_syscalls.tsv")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let (name, id) = line
+                    .split_once('\t')
+                    .unwrap_or_else(|| panic!("malformed linux_amd64_syscalls.tsv entry: {line}"));
+                let id = id.parse::<u64>().unwrap_or_else(|err| {
+                    panic!("invalid linux_amd64_syscalls.tsv id for {name}: {err}")
+                });
+                (name, id)
+            })
+            .collect()
     })
+}
+
+fn builtin_linux_amd64_syscall_id(name: &str) -> Option<u64> {
+    linux_amd64_syscall_ids().get(name).copied()
 }
 
 fn parse_return_type(
@@ -5273,20 +5321,47 @@ mod tests {
             dir.join("sys.txt"),
             r#"
                 resource fd[int32]: -1
-                syz_execute_func(text ptr[in, text[target]]) (disabled)
-                creat(file ptr[in, filename], mode int32) fd
+                syz_totally_fake(text ptr[in, text[target]]) (disabled)
+                made_up_call(fd fd)
                 close(fd fd)
             "#,
         )
         .unwrap();
 
         let descs = parse_syscall_descs_from_path(&dir).expect("path loading should assign IDs");
-        assert_eq!(descs[0].name, "syz_execute_func");
+        assert_eq!(descs[0].name, "syz_totally_fake");
         assert_eq!(descs[0].id, 0);
-        assert_eq!(descs[1].name, "creat");
+        assert_eq!(descs[1].name, "made_up_call");
         assert_eq!(descs[1].id, 1);
         assert_eq!(descs[2].name, "close");
         assert_eq!(descs[2].id, 248);
+    }
+
+    #[test]
+    fn path_loading_uses_executor_ids_for_known_linux_helpers() {
+        let dir = temp_description_dir("known-helper-ids");
+        fs::write(
+            dir.join("sys.txt"),
+            r#"
+                resource fd[4] = -1, 0, 1, 2, 3, 4
+                resource pid[int32]
+                syz_execute_func(text ptr[in, text[target]]) (disabled)
+                syz_clone(flags int64, stack buffer[in], stack_len len[stack], parentid ptr[out, int32], childtid ptr[out, int32], tls buffer[in]) pid
+                syz_mount_image$ext4(fs ptr[in, string["ext4"]], dir ptr[in, filename], flags int64, opts ptr[in, string], chdir bool8, size len[img], img ptr[in, compressed_image]) fd
+            "#,
+        )
+        .unwrap();
+
+        let descs =
+            parse_syscall_descs_from_path(&dir).expect("known helpers should resolve executor IDs");
+        let ids: HashMap<_, _> = descs
+            .iter()
+            .map(|desc| (desc.name.as_str(), desc.id))
+            .collect();
+
+        assert_eq!(ids.get("syz_execute_func"), Some(&7321));
+        assert_eq!(ids.get("syz_clone"), Some(&7316));
+        assert_eq!(ids.get("syz_mount_image$ext4"), Some(&7434));
     }
 
     #[test]
@@ -5426,7 +5501,9 @@ mod tests {
 
         assert_eq!(descs.len(), 2);
         assert_eq!(descs[0].name, "socket$inet");
-        assert_eq!(descs[0].id, 7181);
+        assert_eq!(descs[0].id, 7192);
+        assert_eq!(descs[1].name, "bind$inet");
+        assert_eq!(descs[1].id, 102);
         match &descs[0].args[0] {
             ArgType::Const {
                 size,
@@ -6406,7 +6483,7 @@ mod tests {
     }
 
     #[test]
-    fn structs_can_coerce_multiple_buffer_fields_to_pointers() {
+    fn structs_can_retain_multiple_variable_buffer_fields() {
         let descs = parse_syscall_descs(
             r#"
                 opaque_slots {
@@ -6419,9 +6496,10 @@ mod tests {
         .unwrap();
 
         match &descs[0].args[0] {
-            ArgType::Struct { fields, .. } => {
-                assert!(matches!(fields[0], ArgType::Ptr { .. }));
-                assert!(matches!(fields[1], ArgType::Ptr { .. }));
+            ArgType::Struct { fields, varlen, .. } => {
+                assert!(*varlen);
+                assert!(matches!(fields[0], ArgType::Buffer { .. }));
+                assert!(matches!(fields[1], ArgType::Buffer { .. }));
             }
             other => panic!("unexpected opaque_slots arg: {:?}", other),
         }
@@ -6485,6 +6563,31 @@ mod tests {
 
         assert!(matches!(descs[0].args[0], ArgType::OptionalResource(_)));
         assert!(matches!(descs[0].args[1], ArgType::Const { size: 2, .. }));
+    }
+
+    #[test]
+    fn parses_field_level_out_directions_on_structs() {
+        let descs = parse_syscall_descs(
+            r#"
+                resource handle[int32] = -1
+                type alloc_arg {
+                    flags int32
+                    out_id handle (out)
+                }
+                syscall alloc@1 -> int(arg ptr[in, alloc_arg])
+            "#,
+        )
+        .unwrap();
+
+        match &descs[0].args[0] {
+            ArgType::Ptr { inner, .. } => match inner.as_ref() {
+                ArgType::Struct { field_dirs, .. } => {
+                    assert_eq!(field_dirs, &vec![None, Some(PtrDir::Out)]);
+                }
+                other => panic!("unexpected alloc arg payload: {:?}", other),
+            },
+            other => panic!("unexpected alloc arg: {:?}", other),
+        }
     }
 
     #[test]
@@ -7094,6 +7197,46 @@ mod tests {
     }
 
     #[test]
+    fn auto_loads_target_arch_const_sibling_and_skips_other_arches() {
+        let dir = temp_description_dir("sibling-arch-const");
+        let base = dir.join("socket.txt");
+        fs::write(
+            dir.join("socket_amd64.const"),
+            concat!(
+                "# Code generated by syz-sysgen. DO NOT EDIT.\n",
+                "AF_UNIX = 1\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("socket_arm64.const"),
+            concat!(
+                "# Code generated by syz-sysgen. DO NOT EDIT.\n",
+                "AF_UNIX = 99\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &base,
+            concat!(
+                "resource sock[4] = -1, 0\n",
+                "constset unix_domain[4] = AF_UNIX\n",
+                "syscall socket@1 -> sock(const[unix_domain], int32, int32)\n",
+            ),
+        )
+        .unwrap();
+
+        let descs = parse_syscall_descs_from_path(&base).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(descs.len(), 1);
+        match &descs[0].args[0] {
+            ArgType::Const { values, .. } => assert_eq!(values, &vec![1]),
+            other => panic!("unexpected domain arg: {:?}", other),
+        }
+    }
+
+    #[test]
     fn parses_directory_fragments_in_sorted_order() {
         let dir = temp_description_dir("directory");
         fs::write(dir.join("00-resources.txt"), "resource fd[4] = -1, 0\n").unwrap();
@@ -7166,6 +7309,98 @@ mod tests {
         match &descs[0].args[0] {
             ArgType::Const { values, .. } => assert_eq!(values, &vec![1]),
             other => panic!("unexpected domain arg: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn directory_loading_uses_target_arch_const_before_matching_txt() {
+        let dir = temp_description_dir("directory-arch-const-order");
+        fs::write(
+            dir.join("dev_tlk_device_amd64.const"),
+            concat!(
+                "TE_IOCTL_OPEN_CLIENT_SESSION = 1\n",
+                "TE_IOCTL_CLOSE_CLIENT_SESSION = 2\n",
+                "TE_IOCTL_LAUNCH_OPERATION = 3\n",
+                "TE_PARAM_TYPE_NONE = 0\n",
+                "TE_PARAM_TYPE_INT_RO = 1\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("dev_tlk_device_arm64.const"),
+            concat!(
+                "TE_IOCTL_OPEN_CLIENT_SESSION = 11\n",
+                "TE_IOCTL_CLOSE_CLIENT_SESSION = 12\n",
+                "TE_IOCTL_LAUNCH_OPERATION = 13\n",
+                "TE_PARAM_TYPE_NONE = 10\n",
+                "TE_PARAM_TYPE_INT_RO = 11\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("dev_tlk_device.txt"),
+            concat!(
+                "resource fd[int32] = -1\n",
+                "resource fd_tlk[fd]\n",
+                "resource te_session_id[int32]\n",
+                "te_oper_param_type_flags = TE_PARAM_TYPE_NONE, TE_PARAM_TYPE_INT_RO\n",
+                "openat$tlk_device(fd const[0, int32], file ptr[in, string[\"/dev/tlk_device\"]], flags int32) fd_tlk\n",
+                "ioctl$TE_IOCTL_OPEN_CLIENT_SESSION(fd fd_tlk, cmd const[TE_IOCTL_OPEN_CLIENT_SESSION], arg ptr[inout, te_opensession])\n",
+                "ioctl$TE_IOCTL_CLOSE_CLIENT_SESSION(fd fd_tlk, cmd const[TE_IOCTL_CLOSE_CLIENT_SESSION], arg ptr[inout, te_closesession])\n",
+                "ioctl$TE_IOCTL_LAUNCH_OPERATION(fd fd_tlk, cmd const[TE_IOCTL_LAUNCH_OPERATION], arg ptr[inout, te_launchop])\n",
+                "te_opensession {\n",
+                "    operation te_operation\n",
+                "    answer ptr[out, te_answer]\n",
+                "}\n",
+                "te_closesession {\n",
+                "    session_id te_session_id\n",
+                "    answer ptr[out, te_answer]\n",
+                "}\n",
+                "te_answer {\n",
+                "    result int32\n",
+                "    session_id te_session_id\n",
+                "}\n",
+                "te_launchop {\n",
+                "    session_id te_session_id\n",
+                "    operation te_operation\n",
+                "    answer int64\n",
+                "}\n",
+                "te_operation {\n",
+                "    list_head ptr[in, te_oper_param]\n",
+                "}\n",
+                "te_oper_param {\n",
+                "    type flags[te_oper_param_type_flags, int32]\n",
+                "    next_ptr_user ptr[in, te_oper_param, opt]\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+
+        let descs = parse_syscall_descs_from_path(&dir).unwrap();
+        let generatable = crate::program::transitively_generatable_syscalls(&descs);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(descs.len(), 4);
+        assert_eq!(generatable.enabled, vec![0, 1, 2, 3]);
+        assert!(generatable.disabled.is_empty());
+        match &descs[1].args[2] {
+            ArgType::Ptr { inner, .. } => match inner.as_ref() {
+                ArgType::Struct { fields, .. } => match &fields[0] {
+                    ArgType::Struct { fields, .. } => match &fields[0] {
+                        ArgType::Ptr { inner, .. } => match inner.as_ref() {
+                            ArgType::Struct { fields, .. } => match &fields[0] {
+                                ArgType::Const { values, .. } => assert_eq!(values, &vec![0, 1]),
+                                other => panic!("unexpected te_oper_param type field: {:?}", other),
+                            },
+                            other => panic!("unexpected te_oper_param pointee: {:?}", other),
+                        },
+                        other => panic!("unexpected list_head field: {:?}", other),
+                    },
+                    other => panic!("unexpected te_operation field: {:?}", other),
+                },
+                other => panic!("unexpected te_opensession inner type: {:?}", other),
+            },
+            other => panic!("unexpected ioctl open arg: {:?}", other),
         }
     }
 

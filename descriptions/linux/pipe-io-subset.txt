@@ -1,0 +1,10 @@
+resource fd[4] = -1, 0, 1, 2, 3, 4
+
+type iovec {
+    base ptr[in; array[int8; 4:8]]
+    len len[base, intptr]
+} [size[16]]
+
+pipe2(fds ptr[out, array[fd, 2]], flags const[0]) int
+writev(fd fd, iov ptr[in, array[iovec, 1:2]], iovcnt len[iov, intptr]) int
+close(fd fd) int

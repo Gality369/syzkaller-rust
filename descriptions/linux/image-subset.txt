@@ -1,0 +1,1 @@
+syz_read_part_table(size len[img], img ptr[in, compressed_image]) (timeout[200], no_generate, no_minimize)

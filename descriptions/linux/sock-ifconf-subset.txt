@@ -1,0 +1,15 @@
+const AF_INET = 2
+const SOCK_DGRAM = 2
+const SIOCGIFCONF = 35090
+
+resource fd[4] = -1, 0, 1, 2, 3, 4
+resource sock[fd]
+
+type ifconf_buf {
+    ifc_len len[ifcu_buf, int32]
+    ifcu_buf ptr[inout, array[int8, 40:160]]
+} [size[16]]
+
+socket$inet(domain const[AF_INET], type const[SOCK_DGRAM, int32], proto const[0, int32]) sock
+ioctl$sock_SIOCGIFCONF@960(fd sock, cmd const[SIOCGIFCONF, intptr], arg ptr[inout, ifconf_buf]) int
+close(fd fd) int

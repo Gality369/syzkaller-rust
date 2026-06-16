@@ -3,12 +3,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use crate::special;
+
 // ============================================================
 // Syscall metadata for Linux/amd64 minimal subset
 // ============================================================
 
 /// Argument type for syscall parameters.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArgType {
     /// Integer constant or flags.
     Const {
@@ -49,6 +51,7 @@ pub enum ArgType {
         type_name: Option<String>,
         fields: Vec<ArgType>,
         field_names: Vec<String>,
+        field_dirs: Vec<Option<PtrDir>>,
         size: usize,
         varlen: bool,
         packed: bool,
@@ -61,6 +64,7 @@ pub enum ArgType {
         type_name: Option<String>,
         fields: Vec<ArgType>,
         field_names: Vec<String>,
+        field_dirs: Vec<Option<PtrDir>>,
         size: usize,
         varlen: bool,
         packed: bool,
@@ -98,20 +102,20 @@ pub enum ArgType {
     Filename,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PtrDir {
     In,
     Out,
     InOut,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScalarEndian {
     Native,
     Big,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BufferDir {
     Plain,
     In,
@@ -119,7 +123,7 @@ pub enum BufferDir {
     InOut,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LengthKind {
     Auto,
     Bytes,
@@ -128,13 +132,13 @@ pub enum LengthKind {
 
 pub const PROC_DEFAULT_VALUE: u64 = u64::MAX;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LengthTarget {
     pub root: LengthTargetRoot,
     pub fields: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LengthTargetRoot {
     Arg(String),
     Current,
@@ -142,7 +146,7 @@ pub enum LengthTargetRoot {
     Type(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SyscallAttrs {
     pub automatic_helper: bool,
     pub no_generate: bool,
@@ -160,17 +164,19 @@ pub struct SyscallAttrs {
 }
 
 /// Syscall descriptor.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyscallDesc {
     pub name: String,
     pub id: u64, // syzkaller internal ID (index into executor's syscalls[] table for linux/amd64)
     pub arg_names: Vec<String>,
     pub args: Vec<ArgType>,
+    #[serde(default)]
     pub ret: ReturnType,
+    #[serde(default)]
     pub attrs: SyscallAttrs,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceDesc {
     pub kind: String,
     pub size: usize,
@@ -192,8 +198,9 @@ impl ResourceDesc {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ReturnType {
+    #[default]
     None,
     Resource(ResourceDesc),
     Int,
@@ -1811,13 +1818,8 @@ pub fn resource_outputs(desc: &SyscallDesc) -> Vec<ResourceOutput> {
         });
     }
     for (arg_idx, arg_type) in desc.args.iter().enumerate() {
-        if let ArgType::Ptr {
-            inner,
-            dir: PtrDir::Out | PtrDir::InOut,
-            ..
-        } = arg_type
-        {
-            collect_pointer_resource_outputs(inner, arg_idx, &mut outputs);
+        if let ArgType::Ptr { inner, dir, .. } = arg_type {
+            collect_pointer_resource_outputs(inner, arg_idx, *dir, &mut outputs);
         }
     }
     outputs
@@ -1827,7 +1829,7 @@ pub fn input_resources(desc: &SyscallDesc) -> Vec<ResourceDesc> {
     let mut resources = Vec::new();
     let mut seen = HashSet::new();
     for arg in &desc.args {
-        collect_input_resources(arg, &mut seen, &mut resources);
+        collect_input_resources(arg, PtrDir::In, &mut seen, &mut resources);
     }
     resources
 }
@@ -2408,6 +2410,7 @@ pub fn validate_program(prog: &Program, descs: &[SyscallDesc]) -> Result<(), Val
 fn collect_pointer_resource_outputs(
     arg_type: &ArgType,
     arg_idx: usize,
+    current_dir: PtrDir,
     outputs: &mut Vec<ResourceOutput>,
 ) {
     let mut next_element_idx = 0usize;
@@ -2418,8 +2421,59 @@ fn collect_pointer_resource_outputs(
         0,
         &mut next_element_idx,
         &mut pointer_chain,
+        current_dir,
         outputs,
     );
+}
+
+fn effective_field_dir(current_dir: PtrDir, explicit_dir: Option<PtrDir>) -> PtrDir {
+    explicit_dir.unwrap_or(current_dir)
+}
+
+fn overlay_field_dir(
+    current_dir: PtrDir,
+    overlay_start: Option<usize>,
+    field_idx: usize,
+) -> PtrDir {
+    if let Some(overlay_start) = overlay_start {
+        if current_dir != PtrDir::Out {
+            return if field_idx < overlay_start {
+                PtrDir::In
+            } else {
+                PtrDir::Out
+            };
+        }
+    }
+    current_dir
+}
+
+fn arg_type_has_explicit_output_markers(arg_type: &ArgType) -> bool {
+    match arg_type {
+        ArgType::Array { inner, .. } => arg_type_has_explicit_output_markers(inner),
+        ArgType::Struct {
+            fields,
+            field_dirs,
+            overlay_start,
+            ..
+        } => {
+            overlay_start.is_some()
+                || fields.iter().enumerate().any(|(idx, field)| {
+                    matches!(field_dirs[idx], Some(PtrDir::Out | PtrDir::InOut))
+                        || arg_type_has_explicit_output_markers(field)
+                })
+        }
+        ArgType::Union {
+            fields, field_dirs, ..
+        } => fields.iter().enumerate().any(|(idx, field)| {
+            matches!(field_dirs[idx], Some(PtrDir::Out | PtrDir::InOut))
+                || arg_type_has_explicit_output_markers(field)
+        }),
+        ArgType::Ptr { inner, dir, .. } => {
+            matches!(dir, PtrDir::Out | PtrDir::InOut)
+                || arg_type_has_explicit_output_markers(inner)
+        }
+        _ => false,
+    }
 }
 
 fn collect_pointer_resource_outputs_inner(
@@ -2428,10 +2482,14 @@ fn collect_pointer_resource_outputs_inner(
     base_offset: usize,
     next_element_idx: &mut usize,
     pointer_chain: &mut Vec<usize>,
+    current_dir: PtrDir,
     outputs: &mut Vec<ResourceOutput>,
 ) {
     match arg_type {
         ArgType::Resource(resource) | ArgType::OptionalResource(resource) => {
+            if current_dir == PtrDir::In {
+                return;
+            }
             outputs.push(ResourceOutput {
                 resource: resource.clone(),
                 source: ResourceSource::PointerElement {
@@ -2447,23 +2505,39 @@ fn collect_pointer_resource_outputs_inner(
             inner,
             min_len,
             max_len,
-        } if min_len == max_len => {
-            let Some(element_size) = arg_type_fixed_size(inner) else {
+        } => {
+            let element_count = if min_len == max_len {
+                *min_len
+            } else if current_dir != PtrDir::In && *max_len > 0 {
+                1
+            } else {
+                0
+            };
+            if element_count == 0 {
+                return;
+            }
+            let element_size = if element_count == 1 {
+                0
+            } else if let Some(size) = arg_type_fixed_size(inner) {
+                size
+            } else {
                 return;
             };
-            for element_idx in 0..*min_len {
+            for element_idx in 0..element_count {
                 collect_pointer_resource_outputs_inner(
                     inner,
                     arg_idx,
                     base_offset + (element_idx * element_size),
                     next_element_idx,
                     pointer_chain,
+                    current_dir,
                     outputs,
                 );
             }
         }
         ArgType::Struct {
             fields,
+            field_dirs,
             varlen,
             packed,
             overlay_start,
@@ -2481,27 +2555,51 @@ fn collect_pointer_resource_outputs_inner(
                     base_offset + field_offset,
                     next_element_idx,
                     pointer_chain,
+                    effective_field_dir(
+                        overlay_field_dir(current_dir, *overlay_start, idx),
+                        field_dirs[idx],
+                    ),
                     outputs,
                 );
             }
         }
-        ArgType::Union { fields, .. } => {
-            for field in fields {
+        ArgType::Union {
+            fields, field_dirs, ..
+        } => {
+            for (idx, field) in fields.iter().enumerate() {
                 collect_pointer_resource_outputs_inner(
                     field,
                     arg_idx,
                     base_offset,
                     next_element_idx,
                     pointer_chain,
+                    effective_field_dir(current_dir, field_dirs[idx]),
                     outputs,
                 );
             }
         }
-        ArgType::Ptr {
-            inner,
-            dir: PtrDir::Out | PtrDir::InOut,
-            ..
-        } => {
+        ArgType::Ptr { inner, dir, .. } => {
+            let nested_dir = if current_dir == PtrDir::Out {
+                PtrDir::Out
+            } else {
+                *dir
+            };
+            if nested_dir == PtrDir::In {
+                if current_dir != PtrDir::In && arg_type_has_explicit_output_markers(inner) {
+                    pointer_chain.push(base_offset);
+                    collect_pointer_resource_outputs_inner(
+                        inner,
+                        arg_idx,
+                        0,
+                        next_element_idx,
+                        pointer_chain,
+                        PtrDir::In,
+                        outputs,
+                    );
+                    pointer_chain.pop();
+                }
+                return;
+            }
             pointer_chain.push(base_offset);
             collect_pointer_resource_outputs_inner(
                 inner,
@@ -2509,6 +2607,7 @@ fn collect_pointer_resource_outputs_inner(
                 0,
                 next_element_idx,
                 pointer_chain,
+                nested_dir,
                 outputs,
             );
             pointer_chain.pop();
@@ -2519,45 +2618,105 @@ fn collect_pointer_resource_outputs_inner(
 
 fn collect_input_resources(
     arg_type: &ArgType,
+    current_dir: PtrDir,
     seen: &mut HashSet<String>,
     resources: &mut Vec<ResourceDesc>,
 ) {
     match arg_type {
         ArgType::Resource(resource) => {
+            if current_dir == PtrDir::Out {
+                return;
+            }
             if seen.insert(resource.kind.clone()) {
                 resources.push(resource.clone());
             }
         }
         ArgType::OptionalResource(_) => {}
-        ArgType::Array { inner, .. } => collect_input_resources(inner, seen, resources),
-        ArgType::Struct { fields, .. } => {
-            for field in fields {
-                collect_input_resources(field, seen, resources);
-            }
+        ArgType::Array { inner, .. } => {
+            collect_input_resources(inner, current_dir, seen, resources)
         }
-        ArgType::Union { fields, .. } => {
-            for field in fields {
-                collect_input_resources(field, seen, resources);
-            }
-        }
-        ArgType::Ptr {
-            inner,
-            dir: PtrDir::In | PtrDir::InOut,
+        ArgType::Struct {
+            fields,
+            field_dirs,
+            overlay_start,
             ..
-        } => collect_input_resources(inner, seen, resources),
+        } => {
+            for (idx, field) in fields.iter().enumerate() {
+                collect_input_resources(
+                    field,
+                    effective_field_dir(
+                        overlay_field_dir(current_dir, *overlay_start, idx),
+                        field_dirs[idx],
+                    ),
+                    seen,
+                    resources,
+                );
+            }
+        }
+        ArgType::Union {
+            fields, field_dirs, ..
+        } => {
+            for (idx, field) in fields.iter().enumerate() {
+                collect_input_resources(
+                    field,
+                    effective_field_dir(current_dir, field_dirs[idx]),
+                    seen,
+                    resources,
+                );
+            }
+        }
+        ArgType::Ptr { inner, dir, .. } => {
+            let nested_dir = if current_dir == PtrDir::Out {
+                PtrDir::Out
+            } else {
+                *dir
+            };
+            if nested_dir != PtrDir::Out {
+                collect_input_resources(inner, nested_dir, seen, resources);
+            }
+        }
         _ => {}
     }
 }
 
 fn arg_type_contains_resource_input(arg_type: &ArgType) -> bool {
+    arg_type_contains_resource_input_dir(arg_type, PtrDir::In)
+}
+
+fn arg_type_contains_resource_input_dir(arg_type: &ArgType, current_dir: PtrDir) -> bool {
     match arg_type {
-        ArgType::Resource(_) => true,
+        ArgType::Resource(_) => current_dir != PtrDir::Out,
         ArgType::OptionalResource(_) => false,
-        ArgType::Array { inner, .. } => arg_type_contains_resource_input(inner),
-        ArgType::Struct { fields, .. } => fields.iter().any(arg_type_contains_resource_input),
-        ArgType::Union { fields, .. } => fields.iter().any(arg_type_contains_resource_input),
+        ArgType::Array { inner, .. } => arg_type_contains_resource_input_dir(inner, current_dir),
+        ArgType::Struct {
+            fields,
+            field_dirs,
+            overlay_start,
+            ..
+        } => fields.iter().enumerate().any(|(idx, field)| {
+            arg_type_contains_resource_input_dir(
+                field,
+                effective_field_dir(
+                    overlay_field_dir(current_dir, *overlay_start, idx),
+                    field_dirs[idx],
+                ),
+            )
+        }),
+        ArgType::Union {
+            fields, field_dirs, ..
+        } => fields.iter().enumerate().any(|(idx, field)| {
+            arg_type_contains_resource_input_dir(
+                field,
+                effective_field_dir(current_dir, field_dirs[idx]),
+            )
+        }),
         ArgType::Ptr { inner, dir, .. } => {
-            *dir != PtrDir::Out && arg_type_contains_resource_input(inner)
+            let nested_dir = if current_dir == PtrDir::Out {
+                PtrDir::Out
+            } else {
+                *dir
+            };
+            nested_dir != PtrDir::Out && arg_type_contains_resource_input_dir(inner, nested_dir)
         }
         _ => false,
     }
@@ -2569,6 +2728,106 @@ fn const_has_no_valid_values(values: &[u64], range: Option<(u64, u64)>, allow_an
 
 fn proc_has_no_valid_values(values_per_proc: u64) -> bool {
     values_per_proc == 0
+}
+
+fn arg_type_input_limitation_dir(arg_type: &ArgType, current_dir: PtrDir) -> Option<String> {
+    match arg_type {
+        ArgType::Const {
+            values,
+            range,
+            allow_any,
+            bitfield_bits: _,
+            ..
+        } => {
+            if current_dir != PtrDir::Out && const_has_no_valid_values(values, *range, *allow_any) {
+                Some("contains a constant with no valid values on this target".to_string())
+            } else {
+                None
+            }
+        }
+        ArgType::Proc {
+            values_per_proc, ..
+        } => {
+            if current_dir != PtrDir::Out && proc_has_no_valid_values(*values_per_proc) {
+                Some(
+                    "contains a per-process scalar with no valid values on this target".to_string(),
+                )
+            } else {
+                None
+            }
+        }
+        ArgType::Array { inner, min_len, .. } => {
+            if current_dir == PtrDir::Out || *min_len == 0 {
+                None
+            } else {
+                arg_type_input_limitation_dir(inner, current_dir)
+            }
+        }
+        ArgType::Struct {
+            fields,
+            field_dirs,
+            overlay_start,
+            ..
+        } => {
+            for (idx, field) in fields.iter().enumerate() {
+                if let Some(reason) = arg_type_input_limitation_dir(
+                    field,
+                    effective_field_dir(
+                        overlay_field_dir(current_dir, *overlay_start, idx),
+                        field_dirs[idx],
+                    ),
+                ) {
+                    return Some(reason);
+                }
+            }
+            None
+        }
+        ArgType::Union {
+            fields, field_dirs, ..
+        } => {
+            let mut first_reason = None;
+            for (idx, field) in fields.iter().enumerate() {
+                match arg_type_input_limitation_dir(
+                    field,
+                    effective_field_dir(current_dir, field_dirs[idx]),
+                ) {
+                    None => return None,
+                    Some(reason) if first_reason.is_none() => first_reason = Some(reason),
+                    Some(_) => {}
+                }
+            }
+            first_reason
+        }
+        ArgType::Ptr {
+            inner,
+            dir,
+            optional,
+        } => {
+            if *optional {
+                return None;
+            }
+            let nested_dir = if current_dir == PtrDir::Out {
+                PtrDir::Out
+            } else {
+                *dir
+            };
+            if nested_dir == PtrDir::Out {
+                None
+            } else {
+                arg_type_input_limitation_dir(inner, nested_dir)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn syscall_input_limitation(desc: &SyscallDesc) -> Option<String> {
+    for arg in &desc.args {
+        if let Some(reason) = arg_type_input_limitation_dir(arg, PtrDir::In) {
+            return Some(reason);
+        }
+    }
+    None
 }
 
 pub(crate) fn arg_type_generation_limitation(arg_type: &ArgType) -> Option<String> {
@@ -2605,12 +2864,9 @@ pub(crate) fn arg_type_generation_limitation(arg_type: &ArgType) -> Option<Strin
             varlen: _,
             packed: _,
             align: _,
-            overlay_start,
+            overlay_start: _,
             ..
         } => {
-            if overlay_start.is_some() {
-                return Some("contains out_overlay struct fields".to_string());
-            }
             for field in fields {
                 if let Some(reason) = arg_type_generation_limitation(field) {
                     return Some(reason);
@@ -2687,18 +2943,20 @@ fn disabled_syscall_reason(
 fn syscall_unavailable_reason(desc: &SyscallDesc, generatable_only: bool) -> Option<String> {
     if desc.attrs.disabled {
         Some("marked disabled".to_string())
-    } else if generatable_only && desc.attrs.no_generate {
+    } else if let Some(reason) = syscall_input_limitation(desc) {
+        Some(reason)
+    } else if !generatable_only {
+        None
+    } else if let Some(reason) =
+        special::non_fuzzer_helper_reason(&desc.name, desc.attrs.kfuzz_test)
+    {
+        Some(reason.to_string())
+    } else if desc.attrs.no_generate && !special::has_builtin_generation_support(&desc.name) {
         Some("marked no_generate".to_string())
-    } else if generatable_only && desc.attrs.fsck_command.is_some() {
+    } else if desc.attrs.fsck_command.is_some()
+        && !special::has_builtin_generation_support(&desc.name)
+    {
         Some("requires fsck helper support".to_string())
-    } else if generatable_only && desc.attrs.snapshot {
-        Some("requires snapshot-mode support".to_string())
-    } else if generatable_only && desc.attrs.no_squash {
-        Some("requires no_squash executor support".to_string())
-    } else if generatable_only && desc.attrs.remote_cover {
-        Some("requires remote coverage support".to_string())
-    } else if generatable_only && desc.attrs.kfuzz_test {
-        Some("requires kfuzz_test support".to_string())
     } else if generatable_only {
         syscall_generation_limitation(desc)
             .map(|reason| format!("{reason}, which generation does not support yet"))
@@ -3444,19 +3702,11 @@ fn validate_pointer_bytes(
     desc: &SyscallDesc,
     arg_idx: usize,
     inner: &ArgType,
-    dir: PtrDir,
+    _dir: PtrDir,
     data: &[u8],
     pointers: Option<&[InlinePointerValue]>,
     struct_layouts: Option<&[InlineStructLayout]>,
 ) -> Result<(), ValidationError> {
-    if dir == PtrDir::Out {
-        return Err(invalid_arg(
-            call_idx,
-            desc,
-            arg_idx,
-            "pure output pointers should reserve storage instead of supplying input bytes",
-        ));
-    }
     match inner {
         ArgType::Buffer {
             min_size, max_size, ..
@@ -4110,11 +4360,6 @@ pub(crate) fn struct_layout_prefix_size(
                     .ok_or_else(|| "struct size overflow".to_string())?;
             }
             None => {
-                if !packed && idx + 1 != fields.len() {
-                    return Err(
-                        "only trailing variable-sized struct fields are supported".to_string()
-                    );
-                }
                 saw_var_field = true;
             }
         }
@@ -4611,6 +4856,43 @@ mod tests {
     }
 
     #[test]
+    fn variable_output_resource_arrays_expose_first_element_and_enable_consumers() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                resource handle[4] = -1
+                syscall make@1 -> int(ids ptr[out, array[handle]])
+                syscall use_handle@2 -> int(id handle)
+            "#,
+        )
+        .expect("variable output array target should parse");
+        let outputs = resource_outputs(&descs[0]);
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].resource.kind, "handle");
+        match outputs[0].source {
+            ResourceSource::PointerElement {
+                arg_idx,
+                element_idx,
+                offset,
+                ref pointer_chain,
+            } => {
+                assert_eq!(arg_idx, 0);
+                assert_eq!(element_idx, 0);
+                assert_eq!(offset, 0);
+                assert!(pointer_chain.is_empty());
+            }
+            ref other => panic!("unexpected output source: {:?}", other),
+        }
+
+        let enabled = transitively_enabled_syscalls(&descs);
+        let generatable = transitively_generatable_syscalls(&descs);
+
+        assert_eq!(enabled.enabled, vec![0, 1]);
+        assert_eq!(generatable.enabled, vec![0, 1]);
+        assert!(generatable.disabled.is_empty());
+    }
+
+    #[test]
     fn derived_resource_can_flow_into_parent_consumer() {
         let fd = ResourceDesc {
             kind: "fd".to_string(),
@@ -4708,6 +4990,84 @@ mod tests {
     }
 
     #[test]
+    fn enabled_availability_excludes_syscalls_with_unavailable_input_constants() {
+        let descs = vec![
+            SyscallDesc {
+                name: "stable".to_string(),
+                id: 1,
+                arg_names: Vec::new(),
+                args: Vec::new(),
+                ret: ReturnType::Int,
+                attrs: SyscallAttrs::default(),
+            },
+            SyscallDesc {
+                name: "bad".to_string(),
+                id: 2,
+                arg_names: vec!["cmd".to_string()],
+                args: vec![ArgType::Const {
+                    size: 4,
+                    values: Vec::new(),
+                    range: None,
+                    endian: ScalarEndian::Native,
+                    allow_any: false,
+                    bitfield_bits: None,
+                }],
+                ret: ReturnType::Int,
+                attrs: SyscallAttrs::default(),
+            },
+        ];
+
+        let availability = transitively_enabled_syscalls(&descs);
+
+        assert_eq!(availability.enabled, vec![0]);
+        assert_eq!(
+            availability
+                .disabled
+                .get(&1)
+                .expect("unsupported constant input should disable syscall"),
+            "contains a constant with no valid values on this target"
+        );
+    }
+
+    #[test]
+    fn enabled_availability_allows_unavailable_output_only_constants() {
+        let descs = vec![SyscallDesc {
+            name: "probe".to_string(),
+            id: 1,
+            arg_names: vec!["out".to_string()],
+            args: vec![ArgType::Ptr {
+                inner: Box::new(ArgType::Struct {
+                    type_name: None,
+                    fields: vec![ArgType::Const {
+                        size: 4,
+                        values: Vec::new(),
+                        range: None,
+                        endian: ScalarEndian::Native,
+                        allow_any: false,
+                        bitfield_bits: None,
+                    }],
+                    field_names: vec!["value".to_string()],
+                    field_dirs: vec![None],
+                    size: 4,
+                    varlen: false,
+                    packed: false,
+                    align: None,
+                    overlay_start: None,
+                }),
+                dir: PtrDir::Out,
+                optional: false,
+            }],
+            ret: ReturnType::Int,
+            attrs: SyscallAttrs::default(),
+        }];
+
+        let availability = transitively_enabled_syscalls(&descs);
+
+        assert_eq!(availability.enabled, vec![0]);
+        assert!(availability.disabled.is_empty());
+    }
+
+    #[test]
     fn optional_resource_inputs_do_not_block_self_constructing_resources() {
         let descs = crate::description::parse_syscall_descs(
             r#"
@@ -4717,6 +5077,77 @@ mod tests {
             "#,
         )
         .expect("optional resource target should parse");
+
+        let enabled = transitively_enabled_syscalls(&descs);
+        let generatable = transitively_generatable_syscalls(&descs);
+
+        assert_eq!(enabled.enabled, vec![0, 1]);
+        assert_eq!(generatable.enabled, vec![0, 1]);
+        assert!(generatable.disabled.is_empty());
+    }
+
+    #[test]
+    fn field_level_out_resources_become_constructors_without_becoming_inputs() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                resource handle[4] = -1
+                type alloc_arg {
+                    flags int32
+                    out_id handle (out)
+                }
+                syscall alloc@1 -> int(arg ptr[in, alloc_arg])
+                syscall use_handle@2 -> int(id handle)
+            "#,
+        )
+        .expect("field-level out target should parse");
+
+        assert!(input_resources(&descs[0]).is_empty());
+        let outputs = resource_outputs(&descs[0]);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].resource.kind, "handle");
+
+        let enabled = transitively_enabled_syscalls(&descs);
+        let generatable = transitively_generatable_syscalls(&descs);
+
+        assert_eq!(enabled.enabled, vec![0, 1]);
+        assert_eq!(generatable.enabled, vec![0, 1]);
+        assert!(generatable.disabled.is_empty());
+    }
+
+    #[test]
+    fn nested_in_pointers_can_expose_explicit_out_resource_fields() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                resource handle[4] = -1
+                type payload {
+                    out_id handle (out)
+                }
+                type wrapper {
+                    payload ptr[in, payload]
+                }
+                syscall alloc@1 -> int(arg ptr[inout, wrapper])
+                syscall use_handle@2 -> int(id handle)
+            "#,
+        )
+        .expect("nested explicit-out target should parse");
+
+        assert!(input_resources(&descs[0]).is_empty());
+        let outputs = resource_outputs(&descs[0]);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].resource.kind, "handle");
+        match outputs[0].source {
+            ResourceSource::PointerElement {
+                arg_idx,
+                offset,
+                ref pointer_chain,
+                ..
+            } => {
+                assert_eq!(arg_idx, 0);
+                assert_eq!(offset, 0);
+                assert_eq!(pointer_chain, &vec![0]);
+            }
+            ref other => panic!("unexpected output source: {:?}", other),
+        }
 
         let enabled = transitively_enabled_syscalls(&descs);
         let generatable = transitively_generatable_syscalls(&descs);
@@ -4755,6 +5186,30 @@ mod tests {
             .get(&2)
             .expect("close should not be generatable without a live fd constructor")
             .contains("constructors are not transitively enabled: eventfd2"));
+    }
+
+    #[test]
+    fn generatable_availability_accepts_seed_backed_image_helpers() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                syz_read_part_table(size len[img], img ptr[in, compressed_image]) (no_generate)
+                syz_mount_image$tmpfs(fs ptr[in, string["tmpfs"]], dir ptr[in, filename], flags int64, opts ptr[in, string], chdir bool8, size const[0], img ptr[in, compressed_image]) (no_generate)
+                syz_mount_image$ext4(fs ptr[in, string["ext4"]], dir ptr[in, filename], flags int64, opts ptr[in, string], chdir bool8, size len[img], img ptr[in, compressed_image]) (no_generate, fsck["fsck.ext4 -n"])
+                syscall fake_kfuzz@99 -> int() (kfuzz_test, no_generate)
+            "#,
+        )
+        .expect("seed-backed helper target should parse");
+
+        let generatable = transitively_generatable_syscalls(&descs);
+
+        assert_eq!(generatable.enabled, vec![0, 1, 2]);
+        assert_eq!(
+            generatable
+                .disabled
+                .get(&3)
+                .expect("kfuzz helper should remain excluded"),
+            "specialized kfuzz_test helper"
+        );
     }
 
     #[test]
@@ -4830,7 +5285,7 @@ mod tests {
     }
 
     #[test]
-    fn generatable_availability_excludes_unimplemented_syscall_attrs() {
+    fn generatable_availability_only_excludes_attrs_with_missing_host_support() {
         let descs = crate::description::parse_syscall_descs(
             r#"
                 syscall stable@1 -> int()
@@ -4849,34 +5304,16 @@ mod tests {
         let generatable = transitively_generatable_syscalls(&descs);
 
         assert_eq!(enabled.enabled, vec![0, 1, 2, 3, 4, 5, 6, 7]);
-        assert_eq!(generatable.enabled, vec![0, 2, 7]);
-        assert_eq!(
-            generatable
-                .disabled
-                .get(&1)
-                .expect("snapshot syscall should be excluded"),
-            "requires snapshot-mode support"
-        );
-        assert_eq!(
-            generatable
-                .disabled
-                .get(&3)
-                .expect("no_squash syscall should be excluded"),
-            "requires no_squash executor support"
-        );
-        assert_eq!(
-            generatable
-                .disabled
-                .get(&4)
-                .expect("remote_cover syscall should be excluded"),
-            "requires remote coverage support"
-        );
+        assert_eq!(generatable.enabled, vec![0, 1, 2, 3, 4, 7]);
+        assert!(!generatable.disabled.contains_key(&1));
+        assert!(!generatable.disabled.contains_key(&3));
+        assert!(!generatable.disabled.contains_key(&4));
         assert_eq!(
             generatable
                 .disabled
                 .get(&5)
                 .expect("kfuzz_test syscall should be excluded"),
-            "requires kfuzz_test support"
+            "specialized kfuzz_test helper"
         );
         assert_eq!(
             generatable
@@ -4907,7 +5344,7 @@ mod tests {
     }
 
     #[test]
-    fn out_overlay_structs_compute_layouts_but_are_not_generatable_yet() {
+    fn out_overlay_structs_compute_layouts_and_are_generatable() {
         let descs = crate::description::parse_syscall_descs(
             r#"
                 type overlay_args {
@@ -4923,14 +5360,8 @@ mod tests {
         let enabled = transitively_enabled_syscalls(&descs);
         let generatable = transitively_generatable_syscalls(&descs);
         assert_eq!(enabled.enabled, vec![0]);
-        assert!(generatable.enabled.is_empty());
-        assert_eq!(
-            generatable
-                .disabled
-                .get(&0)
-                .expect("overlay syscall should be excluded from generation"),
-            "contains out_overlay struct fields, which generation does not support yet"
-        );
+        assert_eq!(generatable.enabled, vec![0]);
+        assert!(!generatable.disabled.contains_key(&0));
 
         let overlay = match &descs[0].args[0] {
             ArgType::Ptr { inner, .. } => inner.as_ref(),
@@ -4967,6 +5398,43 @@ mod tests {
                 );
             }
             other => panic!("unexpected overlay type: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn out_overlay_resource_roles_split_inputs_and_outputs() {
+        let descs = crate::description::parse_syscall_descs(
+            r#"
+                resource handle[int32] = -1
+                type overlay_res {
+                    in_handle handle
+                    out_handle handle (out_overlay)
+                } [size[4]]
+                syscall use_overlay_res@1 -> int(arg ptr[inout, overlay_res])
+            "#,
+        )
+        .expect("overlay resource target should parse");
+
+        let inputs = input_resources(&descs[0]);
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].kind, "handle");
+
+        let outputs = resource_outputs(&descs[0]);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].resource.kind, "handle");
+        match outputs[0].source {
+            ResourceSource::PointerElement {
+                arg_idx,
+                element_idx,
+                offset,
+                ref pointer_chain,
+            } => {
+                assert_eq!(arg_idx, 0);
+                assert_eq!(element_idx, 0);
+                assert_eq!(offset, 0);
+                assert!(pointer_chain.is_empty());
+            }
+            ref other => panic!("unexpected output source: {:?}", other),
         }
     }
 

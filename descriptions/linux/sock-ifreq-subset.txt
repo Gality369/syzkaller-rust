@@ -1,0 +1,22 @@
+const AF_INET = 2
+const SOCK_DGRAM = 2
+const SIOCGIFINDEX = 35123
+const SIOCGIFMTU = 35105
+
+resource fd[4] = -1, 0, 1, 2, 3, 4
+resource sock[fd]
+
+devnames = "", "lo"
+
+type devname string[devnames, 16]
+
+type ifreq_word {
+    ifr_name devname
+    ifr_word int32
+    pad array[int8, 20]
+} [size[40]]
+
+socket$inet(domain const[AF_INET], type const[SOCK_DGRAM, int32], proto const[0, int32]) sock
+ioctl$sock_SIOCGIFINDEX@960(fd sock, cmd const[SIOCGIFINDEX, intptr], arg ptr[inout, ifreq_word]) int
+ioctl$sock_SIOCGIFMTU@960(fd sock, cmd const[SIOCGIFMTU, intptr], arg ptr[inout, ifreq_word]) int
+close(fd fd) int
